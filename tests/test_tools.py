@@ -7,7 +7,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from tools import write_file, read_file, delete_file, list_files, execute_command, replace_in_file
+from tools import write_file, read_file, delete_file, list_files, execute_command, replace_in_file, move_file, search_in_files
 from config import WORKSPACE_DIR
 
 TEST_SUBDIR = "test_tools_workspace"
@@ -48,6 +48,8 @@ def setup_teardown():
     globals()["list_files"] = tools.list_files
     globals()["execute_command"] = tools.execute_command
     globals()["replace_in_file"] = tools.replace_in_file
+    globals()["move_file"] = tools.move_file
+    globals()["search_in_files"] = tools.search_in_files
     globals()["WORKSPACE_DIR_OVERRIDE"] = test_dir
 
     yield
@@ -61,6 +63,8 @@ def setup_teardown():
     globals()["list_files"] = tools.list_files
     globals()["execute_command"] = tools.execute_command
     globals()["replace_in_file"] = tools.replace_in_file
+    globals()["move_file"] = tools.move_file
+    globals()["search_in_files"] = tools.search_in_files
 
 
 def test_write_and_read():
@@ -170,3 +174,104 @@ def test_path_traversal_protection():
     result = delete_file("../secret.txt")
     assert "error" in result
     assert "超出" in result["error"]
+
+
+def test_move_file_success():
+    """正常移动：文件移动后src不存在，dst存在且内容一致"""
+    write_file("source.txt", "test content")
+    result = move_file("source.txt", "destination.txt")
+    assert "success" in result
+    
+    # 验证src不存在
+    result = read_file("source.txt")
+    assert "error" in result
+    
+    # 验证dst存在且内容一致
+    result = read_file("destination.txt")
+    assert result["content"] == "test content"
+
+
+def test_move_file_to_subdir():
+    """移动到子目录：dst父目录自动创建"""
+    write_file("file.txt", "content")
+    result = move_file("file.txt", "deep/nested/dir/file.txt")
+    assert "success" in result
+    
+    # 验证文件在新位置
+    result = read_file("deep/nested/dir/file.txt")
+    assert result["content"] == "content"
+    
+    # 验证原位置不存在
+    result = read_file("file.txt")
+    assert "error" in result
+
+
+def test_move_file_src_not_exist():
+    """src不存在：返回错误"""
+    result = move_file("nonexistent.txt", "destination.txt")
+    assert "error" in result
+    assert "does not exist" in result["error"]
+
+
+def test_move_file_path_traversal():
+    """路径越界：src或dst含../返回错误"""
+    write_file("test.txt", "content")
+    
+    # src越界
+    result = move_file("../outside.txt", "inside.txt")
+    assert "error" in result
+    assert "exceeds workspace" in result["error"]
+    
+    # dst越界
+    result = move_file("test.txt", "../outside.txt")
+    assert "error" in result
+    assert "exceeds workspace" in result["error"]
+
+
+def test_search_basic():
+    """普通字符串匹配：验证返回文件名、行号、内容正确"""
+    write_file("test1.py", "def hello():\n    print('world')\n    return 42")
+    write_file("test2.py", "# No match here\npass")
+    
+    result = search_in_files("print", workspace=globals()["WORKSPACE_DIR_OVERRIDE"])
+    assert result["total"] == 1
+    assert len(result["matches"]) == 1
+    
+    match = result["matches"][0]
+    assert match["file"] == "test1.py"
+    assert match["line"] == 2
+    assert "print('world')" in match["content"]
+
+
+def test_search_no_match():
+    """搜索不存在的字符串：验证 total=0"""
+    write_file("file.py", "def foo():\n    pass")
+    
+    result = search_in_files("nonexistent_string", workspace=globals()["WORKSPACE_DIR_OVERRIDE"])
+    assert result["total"] == 0
+    assert result["matches"] == []
+
+
+def test_search_regex():
+    """正则模式匹配：验证能找到函数定义"""
+    write_file("code.py", "def hello():\n    pass\ndef world():\n    pass\nclass Test:\n    pass")
+    
+    result = search_in_files(r"def \w+", workspace=globals()["WORKSPACE_DIR_OVERRIDE"], regex=True)
+    assert result["total"] == 2
+    assert len(result["matches"]) == 2
+    
+    # 验证找到两个函数定义
+    lines = [m["line"] for m in result["matches"]]
+    assert 1 in lines
+    assert 3 in lines
+
+
+def test_search_extension_filter():
+    """扩展名过滤：只搜 .py 文件，验证 .txt 文件中的匹配被排除"""
+    write_file("script.py", "target_word in python")
+    write_file("note.txt", "target_word in text")
+    write_file("readme.md", "target_word in markdown")
+    
+    result = search_in_files("target_word", workspace=globals()["WORKSPACE_DIR_OVERRIDE"], extensions=[".py"])
+    assert result["total"] == 1
+    assert result["matches"][0]["file"] == "script.py"
