@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import subprocess
 import shutil
 from pathlib import Path
@@ -151,13 +152,17 @@ def execute_command(command):
     import threading
 
     try:
+        env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
         process = subprocess.Popen(
             command,
             shell=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             cwd=WORKSPACE_DIR,
+            env=env,
         )
 
         stdout_lines = []
@@ -165,7 +170,8 @@ def execute_command(command):
 
         def _read_stdout():
             for line in process.stdout:
-                print(line, end='', flush=True)
+                # batch 模式下 stdout 保留给 --json 输出，实时打印走 stderr
+                print(line, end='', flush=True, file=sys.stderr if _BATCH_MODE else sys.stdout)
                 stdout_lines.append(line)
 
         def _read_stderr():

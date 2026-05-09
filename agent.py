@@ -290,7 +290,7 @@ def finish_task_log(success, attempts, test_result=None):
         err = test_result.get("stderr", "") or test_result.get("stdout", "")
         _current_task_log["error"] = err[:300]
     _LOG_DIR.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     (_LOG_DIR / f"{ts}.jsonl").write_text(
         json.dumps(_current_task_log, ensure_ascii=False), encoding="utf-8"
     )
@@ -611,6 +611,8 @@ def plan(requirement):
 - test_command：测试命令
 
 注意目录结构：实现文件放workspace/根目录（如add.py），测试文件必须放workspace/tests/目录（如tests/test_add.py）。
+filename 字段只填相对路径，不要加 "workspace/" 前缀，正确示例：hello.py、tests/test_hello.py；错误示例：workspace/hello.py。
+test_command 禁止使用 python -c 内联执行（会被安全策略拦截），应使用 python filename.py 方式。
 
 {cmd_hint}{project_hint}
 
@@ -649,6 +651,12 @@ def code(plan, mode="auto"):
         if not filename:
             continue
 
+        # 剥离 LLM 偶尔错误添加的 workspace/ 前缀
+        for _pfx in (WORKSPACE_DIR + "/", WORKSPACE_DIR + "\\"):
+            if filename.startswith(_pfx):
+                filename = filename[len(_pfx):]
+                break
+
         filepath = _os.path.join(WORKSPACE_DIR, filename)
         file_exists = _os.path.exists(filepath)
 
@@ -681,7 +689,7 @@ def code(plan, mode="auto"):
 
 需求/修改意图：{intent}
 
-注意：测试文件必须放在tests/目录下，且测试文件开头需要加sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))来正确导入实现模块。"""
+注意：必须使用 write_file 写入文件，文件名严格使用 `{filename}`，不要修改路径或添加目录前缀。"""
 
         # 构建消息
         user_content = f"当前文件：{filename}\n修改意图：{intent}"
@@ -693,11 +701,17 @@ def code(plan, mode="auto"):
             {"role": "user", "content": user_content}
         ]
 
-        # 多轮工具调用循环
+        # 多轮工具调用循环；新文件第一轮强制调用 write_file
         attempts_left = 5
+        first_call = True
         while attempts_left > 0:
             attempts_left -= 1
-            response = call_llm(msgs, tools=TOOLS, tool_choice="auto")
+            if first_call and not file_exists:
+                tc = {"type": "function", "function": {"name": "write_file"}}
+            else:
+                tc = "auto"
+            first_call = False
+            response = call_llm(msgs, tools=TOOLS, tool_choice=tc)
             response_message = response.choices[0].message
             msgs.append(response_message)
 
@@ -708,6 +722,11 @@ def code(plan, mode="auto"):
 
                     if func_name == "write_file":
                         fname = func_args.get("filename", "")
+                        for _pfx in (WORKSPACE_DIR + "/", WORKSPACE_DIR + "\\"):
+                            if fname.startswith(_pfx):
+                                fname = fname[len(_pfx):]
+                                func_args["filename"] = fname
+                                break
                         import os as _os2
                         overwrite = _os2.path.exists(_os2.path.join(WORKSPACE_DIR, fname))
                         if mode == "auto" and overwrite:
@@ -823,6 +842,11 @@ def fix(test_result, plan):
                 func_args = json.loads(tool_call.function.arguments)
                 
                 if func_name == "write_file":
+                    _fn = func_args.get("filename", "")
+                    for _pfx in (WORKSPACE_DIR + "/", WORKSPACE_DIR + "\\"):
+                        if _fn.startswith(_pfx):
+                            func_args["filename"] = _fn[len(_pfx):]
+                            break
                     result = write_file(**func_args)
                     console.print(f"修复 {func_args.get('filename')}")
                     if "success" in result:
@@ -1055,9 +1079,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     ]
 
     rounds = 3
+    first_round = True
     while rounds > 0:
         rounds -= 1
-        response = call_llm(msgs, tools=TOOLS, tool_choice="auto")
+        tc = {"type": "function", "function": {"name": "write_file"}} if first_round else "auto"
+        first_round = False
+        response = call_llm(msgs, tools=TOOLS, tool_choice=tc)
         msg = response.choices[0].message
         msgs.append(msg)
         if msg.tool_calls:
@@ -1065,6 +1092,16 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
                 fname = tc.function.name
                 args = json.loads(tc.function.arguments)
                 if fname == "write_file":
+                    _fn = args.get("filename", "")
+                    for _pfx in (WORKSPACE_DIR + "/", WORKSPACE_DIR + "\\"):
+                        if _fn.startswith(_pfx):
+                            _fn = _fn[len(_pfx):]
+                            break
+                    # 确保测试文件写入 tests/ 子目录
+                    _base = Path(_fn).name
+                    if _base.startswith("test_") and "/" not in _fn and "\\" not in _fn:
+                        _fn = "tests/" + _base
+                    args["filename"] = _fn
                     result = write_file(**args)
                     console.print(f"[自动测试] 生成: {args.get('filename')}", highlight=False)
                     if "success" in result:
