@@ -1,7 +1,7 @@
 import sys
 import agent
 from rich.console import Console
-from agent import run, classify_input, chat, add_to_history, maybe_compress_history, compress_history, show_context, clear_history, detect_project_type, load_history
+from agent import run, classify_input, chat, add_to_history, maybe_compress_history, compress_history, show_context, clear_history, detect_project_type, load_history, get_latest_snapshot, restore_snapshot, cleanup_snapshot, show_recent_logs
 import interrupt
 
 console = Console()
@@ -79,6 +79,20 @@ def main():
 
         if user_input == "/clear":
             clear_history()
+            continue
+
+        if user_input == "/revert":
+            snap = get_latest_snapshot()
+            if snap is None:
+                console.print("没有可用的快照", highlight=False)
+            else:
+                n = restore_snapshot(snap)
+                console.print(f"[已回滚] 恢复 {n} 个文件", highlight=False)
+                cleanup_snapshot(snap)
+            continue
+
+        if user_input == "/log":
+            show_recent_logs()
             continue
 
         # 判断是新任务还是闲聊

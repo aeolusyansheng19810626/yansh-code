@@ -1,6 +1,9 @@
 import json
+import shutil
 import threading
 import difflib
+import time as _time
+from datetime import datetime
 from openai import OpenAI
 from rich.console import Console
 from pathlib import Path
@@ -13,6 +16,16 @@ console = Console()
 # #27 项目类型（由 main.py 调用 detect_project_type() 后写入）
 _PROJECT_TYPE = None
 _PROJECT_TEST_CMD = None
+
+# #37 快照 / #38 日志 目录
+_YANSH_DIR     = Path(WORKSPACE_DIR) / ".yansh"
+_SNAPSHOT_DIR  = _YANSH_DIR / "snapshots"
+_LOG_DIR       = _YANSH_DIR / "logs"
+
+# #38 当前任务日志状态（模块级，_run() 期间填充）
+_current_task_log: dict = {}
+_task_tool_calls: list  = []
+_task_files_modified: list = []
 
 # 对话历史管理
 conversation_history = []
@@ -149,6 +162,123 @@ def clear_history():
     except Exception:
         pass
     console.print("[上下文已清除]", highlight=False)
+
+# ---------- #37 快照 / 回滚 ----------
+
+def create_snapshot(file_list):
+    """备份 file_list 中在 workspace 已存在的文件，返回快照目录（无文件可备份时返回 None）"""
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    snap_dir = _SNAPSHOT_DIR / timestamp
+    snap_dir.mkdir(parents=True, exist_ok=True)
+    backed = []
+    for filename in file_list:
+        src = Path(WORKSPACE_DIR) / filename
+        if src.exists() and src.is_file():
+            dst = snap_dir / filename
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(src), str(dst))
+            backed.append(filename)
+    if not backed:
+        snap_dir.rmdir()
+        return None
+    (snap_dir / "meta.json").write_text(
+        json.dumps({"files": backed, "timestamp": timestamp}, ensure_ascii=False),
+        encoding="utf-8"
+    )
+    return snap_dir
+
+def restore_snapshot(snap_dir):
+    """从快照目录恢复文件，返回恢复数量"""
+    meta_file = snap_dir / "meta.json"
+    if not meta_file.exists():
+        return 0
+    meta = json.loads(meta_file.read_text(encoding="utf-8"))
+    restored = 0
+    for filename in meta.get("files", []):
+        src = snap_dir / filename
+        dst = Path(WORKSPACE_DIR) / filename
+        if src.exists():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(src), str(dst))
+            restored += 1
+    return restored
+
+def cleanup_snapshot(snap_dir):
+    """删除快照目录"""
+    if snap_dir and snap_dir.exists():
+        shutil.rmtree(str(snap_dir))
+
+def get_latest_snapshot():
+    """返回最新快照目录，不存在返回 None"""
+    if not _SNAPSHOT_DIR.exists():
+        return None
+    candidates = sorted(
+        (s for s in _SNAPSHOT_DIR.iterdir() if s.is_dir() and (s / "meta.json").exists()),
+        reverse=True
+    )
+    return candidates[0] if candidates else None
+
+# ---------- #38 任务日志 ----------
+
+def init_task_log(requirement, mode):
+    global _current_task_log, _task_tool_calls, _task_files_modified
+    _task_tool_calls = []
+    _task_files_modified = []
+    _current_task_log = {
+        "timestamp": datetime.now().isoformat(),
+        "requirement": requirement,
+        "mode": mode,
+        "model": QUALITY_CASCADE[0] if QUALITY_CASCADE else "unknown",
+        "plan": [],
+        "files_modified": [],
+        "tool_calls": [],
+        "test_command": "",
+        "test_result": "unknown",
+        "attempts": 0,
+        "error": None,
+        "duration_seconds": 0.0,
+        "_start": _time.time(),
+    }
+
+def finish_task_log(success, attempts, test_result=None):
+    global _current_task_log
+    if not _current_task_log:
+        return
+    _current_task_log["test_result"] = "pass" if success else "fail"
+    _current_task_log["attempts"] = attempts
+    _current_task_log["tool_calls"] = _task_tool_calls[:]
+    _current_task_log["files_modified"] = list(dict.fromkeys(_task_files_modified))
+    _current_task_log["duration_seconds"] = round(_time.time() - _current_task_log.pop("_start"), 2)
+    if test_result and not success:
+        err = test_result.get("stderr", "") or test_result.get("stdout", "")
+        _current_task_log["error"] = err[:300]
+    _LOG_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    (_LOG_DIR / f"{ts}.jsonl").write_text(
+        json.dumps(_current_task_log, ensure_ascii=False), encoding="utf-8"
+    )
+    _current_task_log = {}
+
+def show_recent_logs():
+    """打印最近 5 条日志摘要"""
+    if not _LOG_DIR.exists():
+        console.print("暂无日志", highlight=False)
+        return
+    logs = sorted(_LOG_DIR.glob("*.jsonl"), reverse=True)[:5]
+    if not logs:
+        console.print("暂无日志", highlight=False)
+        return
+    for f in logs:
+        try:
+            e = json.loads(f.read_text(encoding="utf-8"))
+            ts  = e.get("timestamp", "")[:19]
+            req = e.get("requirement", "")[:60]
+            res = "✓" if e.get("test_result") == "pass" else "✗"
+            dur = e.get("duration_seconds", 0)
+            att = e.get("attempts", 0)
+            console.print(f"{ts} | {res} | {dur}s | {att}次 | {req}", highlight=False)
+        except Exception:
+            continue
 
 # ---------- #25 彩色 diff ----------
 
@@ -509,8 +639,21 @@ def code(plan, mode="auto"):
                     func_args = json.loads(tool_call.function.arguments)
 
                     if func_name == "write_file":
-                        result = write_file(**func_args)
-                        console.print(f"写入 {func_args.get('filename')}")
+                        fname = func_args.get("filename", "")
+                        import os as _os2
+                        overwrite = _os2.path.exists(_os2.path.join(WORKSPACE_DIR, fname))
+                        if mode == "auto" and overwrite:
+                            confirm = console.input(f"write_file 将覆盖已有文件 {fname}，确认？(y/n) ").strip().lower()
+                            if confirm != "y":
+                                result = {"error": "用户已跳过文件覆盖"}
+                            else:
+                                result = write_file(**func_args)
+                                console.print(f"写入(覆盖) {fname}")
+                        else:
+                            result = write_file(**func_args)
+                            console.print(f"写入 {fname}")
+                        if "success" in result:
+                            _task_files_modified.append(fname)
                     elif func_name == "read_file":
                         result = read_file(**func_args)
                     elif func_name == "replace_in_file":
@@ -529,6 +672,7 @@ def code(plan, mode="auto"):
                             result = replace_in_file(**func_args)
                             if "success" in result:
                                 console.print(f"replace_in_file OK: {result.get('filename')}", highlight=False)
+                                _task_files_modified.append(func_args.get("filename", ""))
                             else:
                                 console.print(f"替换失败: {result.get('error')}", highlight=False)
                     elif func_name == "execute_command":
@@ -550,9 +694,12 @@ def code(plan, mode="auto"):
                             result = move_file(**func_args)
                     elif func_name == "apply_patch":
                         result = apply_patch(**func_args)
+                        if "success" in result:
+                            _task_files_modified.append(func_args.get("file_path", ""))
                     else:
                         result = {"error": "未预期的调用"}
 
+                    _task_tool_calls.append({"name": func_name, "args": {k: v for k, v in func_args.items() if k not in ("content", "new_str")}})
                     msgs.append({
                         "tool_call_id": tool_call.id,
                         "role": "tool",
@@ -604,10 +751,14 @@ def fix(test_result, plan):
                 if func_name == "write_file":
                     result = write_file(**func_args)
                     console.print(f"修复 {func_args.get('filename')}")
+                    if "success" in result:
+                        _task_files_modified.append(func_args.get("filename", ""))
                 elif func_name == "read_file":
                     result = read_file(**func_args)
                 elif func_name == "replace_in_file":
                     result = replace_in_file(**func_args)
+                    if "success" in result:
+                        _task_files_modified.append(func_args.get("filename", ""))
                 elif func_name == "execute_command":
                     result = execute_command(**func_args)
                 elif func_name == "list_files":
@@ -620,9 +771,12 @@ def fix(test_result, plan):
                     result = move_file(**func_args)
                 elif func_name == "apply_patch":
                     result = apply_patch(**func_args)
+                    if "success" in result:
+                        _task_files_modified.append(func_args.get("file_path", ""))
                 else:
                     result = {"error": "未预期的调用"}
-                
+
+                _task_tool_calls.append({"name": func_name, "args": {k: v for k, v in func_args.items() if k not in ("content", "new_str")}})
                 messages.append({
                     "tool_call_id": tool_call.id,
                     "role": "tool",
@@ -668,10 +822,13 @@ def run(requirement, mode="auto"):
 
 def _run(requirement, mode):
     original_requirement = requirement
+    init_task_log(requirement, mode)
 
     # 阶段1：制定计划
     console.print("阶段1：制定计划")
     plan_result = plan(requirement)
+    _current_task_log["plan"] = plan_result.get("files", [])
+    _current_task_log["test_command"] = plan_result.get("test_command", "")
 
     # 格式化计划输出
     def print_plan(plan_result):
@@ -688,6 +845,7 @@ def _run(requirement, mode):
 
     # plan 模式：只输出计划，直接返回
     if mode == "plan":
+        finish_task_log(True, 0)
         return {"success": True, "test_result": {"returncode": 0, "stdout": "", "stderr": ""}}
 
     # auto 模式：等待用户确认，支持修改重试
@@ -702,6 +860,7 @@ def _run(requirement, mode):
                 break
             elif user_confirm == 'n':
                 console.print("已取消")
+                finish_task_log(False, 0)
                 return {"success": False, "test_result": {"returncode": -1, "stdout": "", "stderr": "用户取消"}}
             else:
                 if retry_count >= max_retries:
@@ -711,6 +870,14 @@ def _run(requirement, mode):
                 plan_result = plan(f"{requirement}\n\n修改意见：{user_confirm}")
                 print_plan(plan_result)
                 retry_count += 1
+
+    # #37 任务开始前快照已有文件
+    file_list = [
+        (f.get("filename") if isinstance(f, dict) else f)
+        for f in plan_result.get("files", [])
+    ]
+    file_list = [f for f in file_list if f]
+    current_snapshot = create_snapshot(file_list)
 
     # code / auto（确认后）：生成代码 + 测试
     console.print("\n阶段2：生成代码")
@@ -731,11 +898,13 @@ def _run(requirement, mode):
         test_result = test(plan_result.get("test_command", ""))
         if judge(test_result):
             console.print("测试通过！")
+            cleanup_snapshot(current_snapshot)  # #37 成功后清理快照
             files = plan_result.get("files", [])
             file_names = [f.get("filename") if isinstance(f, dict) else str(f) for f in files]
             file_names = [name for name in file_names if name]
             summary = f"执行了任务：{original_requirement}。创建/修改了文件：{', '.join(file_names)}"
             add_to_history(original_requirement, summary)
+            finish_task_log(True, attempts, test_result)
             return report(True, test_result)
         else:
             console.print(f"测试失败 (尝试 {attempts + 1}/{MAX_ATTEMPTS})")
@@ -744,7 +913,21 @@ def _run(requirement, mode):
             attempts += 1
 
     console.print("达到最大尝试次数，任务失败")
+    # #37 失败时提示回滚
+    if current_snapshot:
+        try:
+            answer = console.input("是否回滚到任务开始前的状态？(y/n) ").strip().lower()
+        except EOFError:
+            answer = "n"
+        if answer == "y":
+            n = restore_snapshot(current_snapshot)
+            console.print(f"[已回滚] 恢复 {n} 个文件", highlight=False)
+            cleanup_snapshot(current_snapshot)
+        else:
+            cleanup_snapshot(current_snapshot)
+
     add_to_history(original_requirement, f"任务失败：{original_requirement}")
+    finish_task_log(False, attempts, test_result)
     return report(False, test_result)
 
 

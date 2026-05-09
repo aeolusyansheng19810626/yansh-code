@@ -27,6 +27,36 @@ _DANGEROUS_PATTERNS = [
     (r"\bnetsh\s+.*firewall\b",                                   "netsh firewall"),
     (r"\bpowershell\b.*-e(nc)?\b",                               "powershell -enc"),
     (r"\biex\b|\bInvoke-Expression\b",                            "iex/Invoke-Expression"),
+    # #39 新增 deny
+    (r"\bpython\s+-c\b",                                          "python -c (内联执行)"),
+    (r"\bfind\b.*-delete\b",                                      "find -delete"),
+    (r"\bgit\s+clean\b.*-f\b",                                    "git clean -f"),
+    (r"\brm\s+-r\b",                                              "rm -r"),
+    (r"\bsh\s+-c\b",                                              "sh -c"),
+]
+
+# 直接执行，无需确认
+_SAFE_PATTERNS = [
+    r"^pytest(\s|$)",
+    r"^python\s+-m\s+pytest\b",
+    r"^ruff\s+(check|format)\b",
+    r"^mypy\b",
+    r"^npm\s+test(\s|$)",
+    r"^npm\s+run\s+lint\b",
+    r"^go\s+test\b",
+    r"^cargo\s+test\b",
+    r"^(ls|dir)(\s|$)",
+    r"^(cat|type)\s+\S",
+    r"^echo\b",
+    r"^python\s+\S+\.py(\s|$)",
+]
+
+# 执行前需用户确认
+_CONFIRM_PATTERNS = [
+    (r"^pip\s+(install|uninstall)\b",  "pip install/uninstall"),
+    (r"^npm\s+install\b",              "npm install"),
+    (r"^git\s+checkout\b",             "git checkout"),
+    (r"^git\s+reset\b",                "git reset"),
 ]
 
 def _validate_path(filename):
@@ -76,10 +106,31 @@ def read_file(filename):
         return {"error": str(e)}
 
 def execute_command(command):
-    """在workspace目录下执行命令，30秒超时，两线程并发读stdout/stderr防死锁"""
+    """在workspace目录下执行命令，30秒超时，三级命令策略（deny/safe/confirm）"""
+    # Level 1: deny
     danger = _check_dangerous(command)
     if danger:
         return danger
+
+    cmd_stripped = command.strip()
+
+    # Level 2: safe — 直接执行
+    is_safe = any(re.match(p, cmd_stripped, re.IGNORECASE) for p in _SAFE_PATTERNS)
+
+    # Level 3: confirm — 提示用户
+    if not is_safe:
+        for pattern, label in _CONFIRM_PATTERNS:
+            if re.search(pattern, cmd_stripped, re.IGNORECASE):
+                from rich.console import Console as _C
+                _c = _C()
+                _c.print(f"[确认] 即将执行: {command}", highlight=False)
+                try:
+                    answer = _c.input("继续？(y/n) ").strip().lower()
+                except EOFError:
+                    answer = "n"
+                if answer != "y":
+                    return {"error": "用户取消执行", "returncode": -1, "stdout": "", "stderr": ""}
+                break
 
     import threading
 
