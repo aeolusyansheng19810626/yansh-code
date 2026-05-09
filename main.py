@@ -1,21 +1,13 @@
 import sys
 from rich.console import Console
-from agent import run, classify_input, chat, add_to_history
+from agent import run, classify_input, chat, add_to_history, maybe_compress_history, compress_history, show_context, clear_history
+import interrupt
 
 console = Console()
 
-def main():
-    console.print("yansh-code CLI")
-    
-    # 处理初始需求
-    requirement = sys.argv[1] if len(sys.argv) > 1 else console.input("请输入需求：")
-    if not requirement.strip():
-        console.print("错误：需求不能为空")
-        sys.exit(1)
-    
-    console.print("正在处理需求...")
-    result = run(requirement)
-    
+VALID_MODES = {"plan", "code", "auto"}
+
+def handle_task_result(result):
     if result["success"]:
         console.print("任务完成")
     else:
@@ -27,33 +19,64 @@ def main():
         if test_result.get("stderr"):
             console.print("错误信息：")
             console.print(test_result["stderr"])
-    
-    # 进入对话循环
+
+def main():
+    console.print("yansh-code CLI")
+
+    current_mode = "auto"
+    interrupt.start_listener()
+
+    # 若命令行带了参数，直接处理第一条需求
+    if len(sys.argv) > 1:
+        first_input = sys.argv[1].strip()
+        if first_input:
+            interrupt.reset()
+            console.print("正在处理需求...")
+            handle_task_result(run(first_input, mode=current_mode))
+
+    # 主循环
     while True:
         user_input = console.input("\n> ").strip()
-        
+
         if not user_input:
             continue
-        
+
         # 检查退出命令
         if user_input.lower() in ["exit", "quit"]:
             console.print("再见！")
             break
-        
+
+        # 检查模式切换命令
+        if user_input.startswith("/mode"):
+            parts = user_input.split()
+            if len(parts) == 2 and parts[1] in VALID_MODES:
+                current_mode = parts[1]
+                console.print(f"已切换到 {current_mode} 模式")
+            else:
+                console.print(f"用法：/mode [plan|code|auto]")
+            continue
+
+        if user_input == "/compress":
+            compress_history()
+            continue
+
+        if user_input == "/context":
+            show_context()
+            continue
+
+        if user_input == "/clear":
+            clear_history()
+            continue
+
         # 判断是新任务还是闲聊
         input_type = classify_input(user_input)
-        
+
+        maybe_compress_history()
+
         if input_type == "task":
             console.print("正在处理新任务...")
-            result = run(user_input)
-            if result["success"]:
-                console.print("任务完成")
-            else:
-                console.print("任务失败")
-                test_result = result["test_result"]
-                if test_result.get("stderr"):
-                    console.print("错误信息：")
-                    console.print(test_result["stderr"])
+            interrupt.reset()
+            handle_task_result(run(user_input, mode=current_mode))
         else:
             # 闲聊模式
             response = chat(user_input)

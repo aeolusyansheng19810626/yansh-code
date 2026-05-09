@@ -1,8 +1,10 @@
 import json
+import threading
 from openai import OpenAI
 from rich.console import Console
 from config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL, QUALITY_CASCADE, MAX_ATTEMPTS
 from tools import write_file, read_file, execute_command, list_files, replace_in_file
+import interrupt
 
 console = Console()
 
@@ -10,6 +12,8 @@ console = Console()
 conversation_history = []
 MAX_HISTORY = 20
 CHAT_CONTEXT_ROUNDS = 5
+COMPRESS_THRESHOLD = 6000
+COMPRESS_MODEL = "meta-llama/llama-3.1-8b-instant"
 
 # 初始化OpenAI客户端（兼容OpenRouter）
 client = OpenAI(
@@ -31,6 +35,83 @@ def add_to_history(user_msg, assistant_msg):
 def get_recent_history(rounds=CHAT_CONTEXT_ROUNDS):
     """获取最近N轮对话历史"""
     return conversation_history[-(rounds * 2):] if conversation_history else []
+
+KEEP_RECENT_TURNS = 3  # 压缩时保留最近 N 轮不压缩
+
+def maybe_compress_history():
+    """历史字符数超过阈值时，压缩旧轮次，保留最近 KEEP_RECENT_TURNS 轮原文"""
+    global conversation_history
+    total_chars = sum(len(m["content"]) for m in conversation_history)
+    if total_chars <= COMPRESS_THRESHOLD:
+        return
+
+    keep_count = KEEP_RECENT_TURNS * 2  # 每轮 user+assistant 共2条
+    if len(conversation_history) <= keep_count:
+        return  # 消息太少，不压缩
+
+    old_msgs = conversation_history[:-keep_count]
+    recent_msgs = conversation_history[-keep_count:]
+
+    history_text = "\n".join(f"[{m['role']}]: {m['content']}" for m in old_msgs)
+    prompt = (
+        f"请将以下对话历史压缩成摘要：\n\n{history_text}\n\n"
+        "严格按以下格式输出，不添加其他内容：\n"
+        '【已完成任务】\n- ...\n\n【关键文件】\n- ...\n\n【未解决问题】\n- ...（没有则写"无"）'
+    )
+    try:
+        response = client.chat.completions.create(
+            model=COMPRESS_MODEL,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        summary = response.choices[0].message.content
+    except Exception as e:
+        console.print(f"[警告] 上下文压缩失败: {e}")
+        return
+
+    conversation_history = [{"role": "assistant", "content": summary}] + recent_msgs
+    console.print("[上下文已自动压缩]")
+
+def compress_history():
+    """手动压缩：复用同一逻辑，但使用不同的提示文案"""
+    global conversation_history
+    total_chars = sum(len(m["content"]) for m in conversation_history)
+    keep_count = KEEP_RECENT_TURNS * 2
+    if total_chars <= COMPRESS_THRESHOLD or len(conversation_history) <= keep_count:
+        console.print("[上下文较短，无需压缩]")
+        return
+
+    old_msgs = conversation_history[:-keep_count]
+    recent_msgs = conversation_history[-keep_count:]
+    history_text = "\n".join(f"[{m['role']}]: {m['content']}" for m in old_msgs)
+    prompt = (
+        f"请将以下对话历史压缩成摘要：\n\n{history_text}\n\n"
+        "严格按以下格式输出，不添加其他内容：\n"
+        '【已完成任务】\n- ...\n\n【关键文件】\n- ...\n\n【未解决问题】\n- ...（没有则写"无"）'
+    )
+    try:
+        response = client.chat.completions.create(
+            model=COMPRESS_MODEL,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        summary = response.choices[0].message.content
+    except Exception as e:
+        console.print(f"[警告] 上下文压缩失败: {e}")
+        return
+    conversation_history = [{"role": "assistant", "content": summary}] + recent_msgs
+    console.print("[上下文已手动压缩]")
+
+def show_context():
+    """打印当前上下文大小"""
+    turns = len(conversation_history) // 2
+    total_chars = sum(len(m["content"]) for m in conversation_history)
+    hint = "  （建议压缩）" if total_chars > COMPRESS_THRESHOLD else ""
+    console.print(f"[上下文状态] 共 {turns} 轮，总字符数：{total_chars} / {COMPRESS_THRESHOLD}{hint}")
+
+def clear_history():
+    """清空对话历史"""
+    global conversation_history
+    conversation_history = []
+    console.print("[上下文已清除]")
 
 # 定义可用工具
 TOOLS = [
@@ -104,25 +185,36 @@ TOOLS = [
 ]
 
 def call_llm(messages, tools=None, tool_choice=None, response_format=None):
-    """尝试QUALITY_CASCADE中的模型，依次降级调用"""
-    for model in QUALITY_CASCADE:
-        try:
-            kwargs = {
-                "model": model,
-                "messages": messages
-            }
-            if tools is not None:
-                kwargs["tools"] = tools
-            if tool_choice is not None:
-                kwargs["tool_choice"] = tool_choice
-            if response_format is not None:
-                kwargs["response_format"] = response_format
-            response = client.chat.completions.create(**kwargs)
-            return response
-        except Exception as e:
-            print(f"模型 {model} 调用失败: {e}")
-            continue
-    raise RuntimeError("所有模型调用均失败")
+    """尝试QUALITY_CASCADE中的模型，依次降级调用。在子线程中执行，每100ms检查一次ESC中断。"""
+    result_holder = [None]
+    exc_holder = [None]
+
+    def _worker():
+        for model in QUALITY_CASCADE:
+            try:
+                kwargs = {"model": model, "messages": messages}
+                if tools is not None:
+                    kwargs["tools"] = tools
+                if tool_choice is not None:
+                    kwargs["tool_choice"] = tool_choice
+                if response_format is not None:
+                    kwargs["response_format"] = response_format
+                result_holder[0] = client.chat.completions.create(**kwargs)
+                return
+            except Exception as e:
+                exc_holder[0] = e
+                continue
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    while t.is_alive():
+        if interrupt.is_interrupted():
+            raise interrupt.Interrupted()
+        t.join(timeout=0.1)
+
+    if result_holder[0] is None:
+        raise RuntimeError(f"所有模型调用均失败: {exc_holder[0]}")
+    return result_holder[0]
 
 
 def plan(requirement):
@@ -168,6 +260,9 @@ def code(plan):
     console.print(f"计划处理 {len(files)} 个文件...")
 
     for file_entry in files:
+        if interrupt.is_interrupted():
+            raise interrupt.Interrupted()
+
         if isinstance(file_entry, dict):
             filename = file_entry.get("filename", "")
             intent = file_entry.get("intent", file_entry.get("description", ""))
@@ -293,7 +388,7 @@ def fix(test_result, plan):
         response = call_llm(messages, tools=TOOLS, tool_choice="auto")
         response_message = response.choices[0].message
         messages.append(response_message)
-        
+
         if response_message.tool_calls:
             console.print(f"执行 {len(response_message.tool_calls)} 个修复操作...")
             for tool_call in response_message.tool_calls:
@@ -342,59 +437,69 @@ def report(success, test_result):
         "test_result": test_result
     }
 
-def run(requirement):
-    """主运行流程"""
-    # 保存原始需求用于生成摘要
+def _interrupted_result():
+    console.print("已中断")
+    return {"success": False, "test_result": {"returncode": -1, "stdout": "", "stderr": "已中断"}}
+
+
+def run(requirement, mode="auto"):
+    """主运行流程。mode: auto（默认）| plan（只出计划）| code（跳过确认直接执行）"""
+    try:
+        return _run(requirement, mode)
+    except interrupt.Interrupted:
+        return _interrupted_result()
+
+
+def _run(requirement, mode):
     original_requirement = requirement
-    
-    # 1. 制定计划（支持修改重试）
+
+    # 阶段1：制定计划
     console.print("阶段1：制定计划")
     plan_result = plan(requirement)
-    
-    retry_count = 0
-    max_retries = 3
-    
-    while retry_count <= max_retries:
-        # 格式化计划输出
+
+    # 格式化计划输出
+    def print_plan(plan_result):
         files = plan_result.get("files", [])
         test_cmd = plan_result.get("test_command", "")
         total_steps = len(files) + (1 if test_cmd else 0)
-        
         for idx, file_entry in enumerate(files, 1):
-            if isinstance(file_entry, dict):
-                filename = file_entry.get("filename", "")
-            else:
-                filename = file_entry
+            filename = file_entry.get("filename", "") if isinstance(file_entry, dict) else file_entry
             console.print(f"[{idx}/{total_steps}] write_file: {filename}")
-        
         if test_cmd:
             console.print(f"[{total_steps}/{total_steps}] execute: {test_cmd}")
-        
-        # 询问用户确认
-        user_confirm = console.input("\n确认执行？(y/n/修改) ").strip().lower()
-        
-        if user_confirm == 'y':
-            break  # 确认执行，跳出循环
-        elif user_confirm == 'n':
-            console.print("已取消")
-            return {"success": False, "test_result": {"returncode": -1, "stdout": "", "stderr": "用户取消"}}
-        else:
-            # 用户输入修改意见
-            if retry_count >= max_retries:
-                console.print(f"已达到最大重试次数 ({max_retries})，使用当前计划")
+
+    print_plan(plan_result)
+
+    # plan 模式：只输出计划，直接返回
+    if mode == "plan":
+        return {"success": True, "test_result": {"returncode": 0, "stdout": "", "stderr": ""}}
+
+    # auto 模式：等待用户确认，支持修改重试
+    if mode == "auto":
+        retry_count = 0
+        max_retries = 3
+        while retry_count <= max_retries:
+            user_confirm = console.input("\n确认执行？(y/n/修改) ").strip().lower()
+            if interrupt.is_interrupted():
+                raise interrupt.Interrupted()
+            if user_confirm == 'y':
                 break
-            
-            console.print(f"正在根据修改意见重新生成计划... (尝试 {retry_count + 1}/{max_retries})")
-            # 将修改意见作为新需求重新生成计划
-            modified_requirement = f"{requirement}\n\n修改意见：{user_confirm}"
-            plan_result = plan(modified_requirement)
-            retry_count += 1
-    
-    # 2. 生成代码
+            elif user_confirm == 'n':
+                console.print("已取消")
+                return {"success": False, "test_result": {"returncode": -1, "stdout": "", "stderr": "用户取消"}}
+            else:
+                if retry_count >= max_retries:
+                    console.print(f"已达到最大重试次数 ({max_retries})，使用当前计划")
+                    break
+                console.print(f"正在根据修改意见重新生成计划... (尝试 {retry_count + 1}/{max_retries})")
+                plan_result = plan(f"{requirement}\n\n修改意见：{user_confirm}")
+                print_plan(plan_result)
+                retry_count += 1
+
+    # code / auto（确认后）：生成代码 + 测试
     console.print("\n阶段2：生成代码")
     code(plan_result)
-    
-    # 3. 测试循环
+
     console.print("\n阶段3：测试与修复")
     attempts = 0
     test_result = None
@@ -402,26 +507,20 @@ def run(requirement):
         test_result = test(plan_result.get("test_command", ""))
         if judge(test_result):
             console.print("测试通过！")
-            
-            # 生成任务摘要并保存到历史
             files = plan_result.get("files", [])
             file_names = [f.get("filename") if isinstance(f, dict) else str(f) for f in files]
-            file_names = [name for name in file_names if name]  # 过滤空值
+            file_names = [name for name in file_names if name]
             summary = f"执行了任务：{original_requirement}。创建/修改了文件：{', '.join(file_names)}"
             add_to_history(original_requirement, summary)
-            
             return report(True, test_result)
         else:
             console.print(f"测试失败 (尝试 {attempts + 1}/{MAX_ATTEMPTS})")
             if attempts < MAX_ATTEMPTS - 1:
                 fix(test_result, plan_result)
             attempts += 1
-    
+
     console.print("达到最大尝试次数，任务失败")
-    
-    # 任务失败也记录到历史
     add_to_history(original_requirement, f"任务失败：{original_requirement}")
-    
     return report(False, test_result)
 
 
