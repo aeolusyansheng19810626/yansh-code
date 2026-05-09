@@ -1,12 +1,18 @@
 import json
 import threading
+import difflib
 from openai import OpenAI
 from rich.console import Console
-from config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL, QUALITY_CASCADE, MAX_ATTEMPTS
-from tools import write_file, read_file, execute_command, list_files, replace_in_file
+from pathlib import Path
+from config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL, QUALITY_CASCADE, MAX_ATTEMPTS, WORKSPACE_DIR
+from tools import write_file, read_file, execute_command, list_files, replace_in_file, get_symbol_definition
 import interrupt
 
 console = Console()
+
+# #27 项目类型（由 main.py 调用 detect_project_type() 后写入）
+_PROJECT_TYPE = None
+_PROJECT_TEST_CMD = None
 
 # 对话历史管理
 conversation_history = []
@@ -21,16 +27,42 @@ client = OpenAI(
     base_url=OPENROUTER_BASE_URL,
 )
 
+_HISTORY_FILE = Path(WORKSPACE_DIR) / ".yansh_history.json"
+
+def save_history():
+    """将 conversation_history 序列化到文件"""
+    try:
+        _HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _HISTORY_FILE.write_text(json.dumps(conversation_history, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+def load_history():
+    """从文件加载历史，返回轮数（0 表示未加载）"""
+    global conversation_history
+    if not _HISTORY_FILE.exists():
+        return 0
+    try:
+        data = json.loads(_HISTORY_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            conversation_history = data
+            return len(data) // 2
+    except Exception:
+        pass
+    return 0
+
 def add_to_history(user_msg, assistant_msg):
     """添加对话到历史，超过最大长度时删除最早的"""
     global conversation_history
     conversation_history.append({"role": "user", "content": user_msg})
     conversation_history.append({"role": "assistant", "content": assistant_msg})
-    
+
     # 保持历史在最大长度内
     while len(conversation_history) > MAX_HISTORY * 2:
         conversation_history.pop(0)
         conversation_history.pop(0)
+
+    save_history()
 
 def get_recent_history(rounds=CHAT_CONTEXT_ROUNDS):
     """获取最近N轮对话历史"""
@@ -65,11 +97,11 @@ def maybe_compress_history():
         )
         summary = response.choices[0].message.content
     except Exception as e:
-        console.print(f"[警告] 上下文压缩失败: {e}")
+        console.print(f"[警告] 上下文压缩失败: {e}", highlight=False)
         return
 
     conversation_history = [{"role": "assistant", "content": summary}] + recent_msgs
-    console.print("[上下文已自动压缩]")
+    console.print("[上下文已自动压缩]", highlight=False)
 
 def compress_history():
     """手动压缩：复用同一逻辑，但使用不同的提示文案"""
@@ -77,7 +109,7 @@ def compress_history():
     total_chars = sum(len(m["content"]) for m in conversation_history)
     keep_count = KEEP_RECENT_TURNS * 2
     if total_chars <= COMPRESS_THRESHOLD or len(conversation_history) <= keep_count:
-        console.print("[上下文较短，无需压缩]")
+        console.print("[上下文较短，无需压缩]", highlight=False)
         return
 
     old_msgs = conversation_history[:-keep_count]
@@ -95,23 +127,86 @@ def compress_history():
         )
         summary = response.choices[0].message.content
     except Exception as e:
-        console.print(f"[警告] 上下文压缩失败: {e}")
+        console.print(f"[警告] 上下文压缩失败: {e}", highlight=False)
         return
     conversation_history = [{"role": "assistant", "content": summary}] + recent_msgs
-    console.print("[上下文已手动压缩]")
+    console.print("[上下文已手动压缩]", highlight=False)
 
 def show_context():
     """打印当前上下文大小"""
     turns = len(conversation_history) // 2
     total_chars = sum(len(m["content"]) for m in conversation_history)
     hint = "  （建议压缩）" if total_chars > COMPRESS_THRESHOLD else ""
-    console.print(f"[上下文状态] 共 {turns} 轮，总字符数：{total_chars} / {COMPRESS_THRESHOLD}{hint}")
+    console.print(f"[上下文状态] 共 {turns} 轮，总字符数：{total_chars} / {COMPRESS_THRESHOLD}{hint}", highlight=False)
 
 def clear_history():
-    """清空对话历史"""
+    """清空对话历史（内存 + 文件）"""
     global conversation_history
     conversation_history = []
-    console.print("[上下文已清除]")
+    try:
+        if _HISTORY_FILE.exists():
+            _HISTORY_FILE.unlink()
+    except Exception:
+        pass
+    console.print("[上下文已清除]", highlight=False)
+
+# ---------- #25 彩色 diff ----------
+
+def _show_diff(filename, old_str, new_str):
+    old_lines = old_str.splitlines(keepends=True)
+    new_lines = new_str.splitlines(keepends=True)
+    diff = list(difflib.unified_diff(
+        old_lines, new_lines,
+        fromfile=f"a/{filename}", tofile=f"b/{filename}", lineterm=""
+    ))
+    if not diff:
+        return
+    console.print(f"\n--- diff: {filename} ---", highlight=False)
+    for line in diff:
+        if line.startswith("---") or line.startswith("+++"):
+            console.print(line, style="bold", highlight=False)
+        elif line.startswith("-"):
+            console.print(line, style="red", highlight=False)
+        elif line.startswith("+"):
+            console.print(line, style="green", highlight=False)
+        elif line.startswith("@@"):
+            console.print(line, style="cyan", highlight=False)
+        else:
+            console.print(line, highlight=False)
+
+# ---------- #26 Linter ----------
+
+def run_linter():
+    """静默运行 ruff check，有错误返回结果 dict，否则返回 None"""
+    import shutil
+    if not shutil.which("ruff"):
+        return None
+    result = execute_command("ruff check .")
+    if result.get("returncode", 0) == 0:
+        return None
+    return result
+
+# ---------- #27 项目类型检测 ----------
+
+def detect_project_type():
+    """扫描 workspace 目录识别项目类型，返回 (type_str, test_cmd)"""
+    from pathlib import Path
+    from config import WORKSPACE_DIR
+    ws = Path(WORKSPACE_DIR)
+    if not ws.exists():
+        return None, None
+    all_names = {f.name for f in ws.rglob("*") if f.is_file()}
+    if any(n in all_names for n in ("requirements.txt", "pyproject.toml")) or any(n.endswith(".py") for n in all_names):
+        return "Python", "pytest"
+    if "package.json" in all_names:
+        return "Node.js", "npm test"
+    if "go.mod" in all_names:
+        return "Go", "go test ./..."
+    if "Cargo.toml" in all_names:
+        return "Rust", "cargo test"
+    if "pom.xml" in all_names:
+        return "Java/Maven", "mvn test"
+    return None, None
 
 # 定义可用工具
 TOOLS = [
@@ -163,7 +258,7 @@ TOOLS = [
         "function": {
             "name": "list_files",
             "description": "列出workspace目录下的所有文件",
-            "parameters": {"type": "object", "properties": {}}
+            "parameters": {"type": "object", "properties": {}, "required": []}
         }
     },
     {
@@ -179,6 +274,21 @@ TOOLS = [
                     "new_str": {"type": "string", "description": "替换后的新字符串"}
                 },
                 "required": ["filename", "old_str", "new_str"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_symbol_definition",
+            "description": "用 AST 精确查找函数或类的定义，返回所在文件、起始行号、完整代码。比读整个文件更高效，适合定位某个函数/类时使用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol_name": {"type": "string", "description": "要查找的函数名或类名"},
+                    "file_path": {"type": "string", "description": "指定搜索文件（相对于workspace，可选），不填则搜索整个workspace"}
+                },
+                "required": ["symbol_name"]
             }
         }
     }
@@ -217,27 +327,48 @@ def call_llm(messages, tools=None, tool_choice=None, response_format=None):
     return result_holder[0]
 
 
+_ARCHITECT_ROLE = """【角色：架构师 Agent】
+你专注于分析需求和制定实现计划。
+职责：只输出计划，不写代码；重点考虑风险点和文件依赖顺序；确保计划完整可执行。
+"""
+
+_CODER_ROLE = """【角色：码农 Agent】
+你专注于根据计划生成高质量代码。
+职责：严格按计划执行，不自行发挥额外功能；注重代码质量和边界处理；已有文件用 replace_in_file 精确修改，不得整体重写。
+"""
+
+_TESTER_ROLE = """【角色：测试 Agent】
+你专注于分析测试失败原因并指导修复。
+职责：只关注测试结果和错误信息；给出精准、最小化的修复建议；避免引入不相关改动。
+"""
+
 def plan(requirement):
     """制定计划：生成文件列表和测试命令"""
     import platform
-    
+
     # 检测系统并生成命令提示
     system_name = platform.system()
     if system_name == "Windows":
         cmd_hint = "当前运行环境是 Windows，使用 Windows 命令：查看文件用 type，列目录用 dir，禁止使用 cat、ls、grep。"
     else:
         cmd_hint = "当前运行环境是 Linux/Mac，使用 Unix 命令：查看文件用 cat，列目录用 ls。"
-    
+
     # 先获取当前 workspace 文件结构，注入到 LLM 上下文中避免重复创建
     ws_files = list_files()
     files_list = "\n".join(f"- {f}" for f in ws_files.get("files", []))
-    system_prompt = f"""你是一个代码规划助手。根据用户需求，返回JSON格式的计划，包含：
+    project_hint = (
+        f"\n当前项目类型：{_PROJECT_TYPE}，默认测试命令：{_PROJECT_TEST_CMD}。"
+        if _PROJECT_TYPE else ""
+    )
+    console.print("[Agent: Architect]", highlight=False)
+    system_prompt = f"""{_ARCHITECT_ROLE}
+你是一个代码规划助手。根据用户需求，返回JSON格式的计划，包含：
 - files：数组，每个元素为 {{"filename": "文件名", "description": "修改意图/需求说明"}}；对于已有文件只需填写修改意图，不要重复列出完整内容
 - test_command：测试命令
 
 注意目录结构：实现文件放workspace/根目录（如add.py），测试文件必须放workspace/tests/目录（如tests/test_add.py）。
 
-{cmd_hint}
+{cmd_hint}{project_hint}
 
 当前workspace已有文件：
 {files_list if files_list else "(空)"}
@@ -250,13 +381,14 @@ def plan(requirement):
     response = call_llm(messages, response_format={"type": "json_object"})
     return json.loads(response.choices[0].message.content)
 
-def code(plan):
+def code(plan, mode="auto"):
     """根据计划逐个文件生成/修改代码。文件已存在优先用replace_in_file做精确修改；不存在则用write_file新建。"""
     import os as _os
     from tools import write_file, read_file, replace_in_file
     from config import WORKSPACE_DIR
 
     files = plan.get("files", [])
+    console.print("[Agent: Coder]", highlight=False)
     console.print(f"计划处理 {len(files)} 个文件...")
 
     for file_entry in files:
@@ -284,7 +416,8 @@ def code(plan):
             existing_content = existing.get("content", "")
             console.print(f"{filename} 已存在，读取现有内容进行增量修改...")
 
-            sys_prompt = """你是一个代码修改助手。对已有文件进行精确修改。
+            sys_prompt = f"""{_CODER_ROLE}
+你是一个代码修改助手。对已有文件进行精确修改。
 
 可用操作：
 1. replace_in_file(filename, old_str, new_str) — 对已有文件做精确替换
@@ -296,7 +429,8 @@ def code(plan):
 - 每次调用 replace_in_file 只修改一处，如有多处修改需要多次调用"""
         else:
             console.print(f"{filename} 是新建文件...")
-            sys_prompt = f"""你是一个代码生成助手。请生成文件 `{filename}` 的完整代码。
+            sys_prompt = f"""{_CODER_ROLE}
+你是一个代码生成助手。请生成文件 `{filename}` 的完整代码。
 
 可用操作：
 1. write_file(filename, content) — 写入新文件
@@ -334,17 +468,29 @@ def code(plan):
                     elif func_name == "read_file":
                         result = read_file(**func_args)
                     elif func_name == "replace_in_file":
-                        result = replace_in_file(**func_args)
-                        if "success" in result:
-                            console.print(f"replace_in_file: {result.get('filename')}")
-                            console.print(f"- {result.get('old_str')}")
-                            console.print(f"+ {result.get('new_str')}")
-                        else:
-                            console.print(f"替换失败: {result.get('error')}")
+                        _show_diff(
+                            func_args.get("filename", ""),
+                            func_args.get("old_str", ""),
+                            func_args.get("new_str", ""),
+                        )
+                        skip = False
+                        if mode == "auto":
+                            confirm = console.input("应用此修改？(y/n) ").strip().lower()
+                            if confirm != "y":
+                                result = {"error": "用户已跳过此修改"}
+                                skip = True
+                        if not skip:
+                            result = replace_in_file(**func_args)
+                            if "success" in result:
+                                console.print(f"replace_in_file OK: {result.get('filename')}", highlight=False)
+                            else:
+                                console.print(f"替换失败: {result.get('error')}", highlight=False)
                     elif func_name == "execute_command":
                         result = execute_command(**func_args)
                     elif func_name == "list_files":
                         result = list_files()
+                    elif func_name == "get_symbol_definition":
+                        result = get_symbol_definition(**func_args)
                     else:
                         result = {"error": "未预期的调用"}
 
@@ -361,6 +507,7 @@ def code(plan):
 
 def fix(test_result, plan):
     """根据测试错误修复代码（多轮工具调用）"""
+    console.print("[Agent: Tester]", highlight=False)
     console.print("开始修复代码...")
     
     # 优先使用 stderr，如果为空则使用截断的 stdout
@@ -380,7 +527,7 @@ def fix(test_result, plan):
     content = f"测试失败！\n错误输出：\n{error_info}\n\n计划：{json.dumps(plan)}"
     
     messages = [
-        {"role": "system", "content": "你是代码修复助手。根据错误信息修复代码，使用write_file工具重写文件。"},
+        {"role": "system", "content": f"{_TESTER_ROLE}\n你是代码修复助手。根据错误信息精准修复代码，优先使用 replace_in_file 做最小化修改，必要时才用 write_file 重写整个文件。"},
         {"role": "user", "content": content}
     ]
     
@@ -404,6 +551,8 @@ def fix(test_result, plan):
                     result = execute_command(**func_args)
                 elif func_name == "list_files":
                     result = list_files()
+                elif func_name == "get_symbol_definition":
+                    result = get_symbol_definition(**func_args)
                 else:
                     result = {"error": "未预期的调用"}
                 
@@ -498,11 +647,19 @@ def _run(requirement, mode):
 
     # code / auto（确认后）：生成代码 + 测试
     console.print("\n阶段2：生成代码")
-    code(plan_result)
+    code(plan_result, mode=mode)
 
     console.print("\n阶段3：测试与修复")
     attempts = 0
     test_result = None
+
+    # #26 Linter：先跑 ruff，有错误走修复循环
+    linter_result = run_linter()
+    if linter_result:
+        console.print(f"Linter 发现错误，开始修复 (尝试 {attempts + 1}/{MAX_ATTEMPTS})", highlight=False)
+        fix(linter_result, plan_result)
+        attempts += 1
+
     while attempts < MAX_ATTEMPTS:
         test_result = test(plan_result.get("test_command", ""))
         if judge(test_result):
