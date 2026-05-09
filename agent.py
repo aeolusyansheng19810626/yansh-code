@@ -1,4 +1,5 @@
 import json
+import sys
 import shutil
 import threading
 import difflib
@@ -7,11 +8,16 @@ from datetime import datetime
 from openai import OpenAI
 from rich.console import Console
 from pathlib import Path
-from config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL, QUALITY_CASCADE, MAX_ATTEMPTS, WORKSPACE_DIR
-from tools import write_file, read_file, execute_command, list_files, replace_in_file, get_symbol_definition, search_in_files, move_file, apply_patch
+from config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL, QUALITY_CASCADE, WORKSPACE_DIR, get_config
+from tools import write_file, read_file, execute_command, list_files, replace_in_file, get_symbol_definition, search_in_files, move_file, apply_patch, list_symbols, replace_symbol
 import interrupt
+import tools as _tools_mod
 
 console = Console()
+
+# #40 批处理模式标志
+_BATCH_MODE = False
+_last_task_log: dict = {}  # 最近一次任务日志，供 --json 输出
 
 # #27 项目类型（由 main.py 调用 detect_project_type() 后写入）
 _PROJECT_TYPE = None
@@ -31,8 +37,36 @@ _task_files_modified: list = []
 conversation_history = []
 MAX_HISTORY = 20
 CHAT_CONTEXT_ROUNDS = 5
-COMPRESS_THRESHOLD = 6000
 COMPRESS_MODEL = "meta-llama/llama-3.1-8b-instant"
+
+
+def _cfg(key):
+    """读取生效配置值"""
+    return get_config().get(key)
+
+
+def set_batch_mode(enabled: bool, json_output: bool = False):
+    """设置批处理模式；json_output=True 时将 console 重定向到 stderr"""
+    global _BATCH_MODE, console
+    _BATCH_MODE = enabled
+    _tools_mod.set_batch_mode(enabled)
+    if json_output:
+        console = Console(file=sys.stderr)
+
+
+def get_last_task_log() -> dict:
+    return dict(_last_task_log)
+
+
+def _prompt(msg: str, default: str = "y") -> str:
+    """批处理模式自动返回 default；交互模式调用 console.input"""
+    if _BATCH_MODE:
+        console.print(f"{msg}[batch: {default}]", highlight=False)
+        return default
+    try:
+        return console.input(msg).strip().lower()
+    except EOFError:
+        return default
 
 # 初始化OpenAI客户端（兼容OpenRouter）
 client = OpenAI(
@@ -81,18 +115,18 @@ def get_recent_history(rounds=CHAT_CONTEXT_ROUNDS):
     """获取最近N轮对话历史"""
     return conversation_history[-(rounds * 2):] if conversation_history else []
 
-KEEP_RECENT_TURNS = 3  # 压缩时保留最近 N 轮不压缩
-
 def maybe_compress_history():
-    """历史字符数超过阈值时，压缩旧轮次，保留最近 KEEP_RECENT_TURNS 轮原文"""
+    """历史字符数超过阈值时，压缩旧轮次，保留最近 keep_recent_turns 轮原文"""
     global conversation_history
+    compress_threshold = _cfg("compress_threshold") or 6000
+    keep_recent_turns  = _cfg("keep_recent_turns")  or 3
     total_chars = sum(len(m["content"]) for m in conversation_history)
-    if total_chars <= COMPRESS_THRESHOLD:
+    if total_chars <= compress_threshold:
         return
 
-    keep_count = KEEP_RECENT_TURNS * 2  # 每轮 user+assistant 共2条
+    keep_count = keep_recent_turns * 2
     if len(conversation_history) <= keep_count:
-        return  # 消息太少，不压缩
+        return
 
     old_msgs = conversation_history[:-keep_count]
     recent_msgs = conversation_history[-keep_count:]
@@ -117,11 +151,13 @@ def maybe_compress_history():
     console.print("[上下文已自动压缩]", highlight=False)
 
 def compress_history():
-    """手动压缩：复用同一逻辑，但使用不同的提示文案"""
+    """手动压缩：复用同一逻辑"""
     global conversation_history
+    compress_threshold = _cfg("compress_threshold") or 6000
+    keep_recent_turns  = _cfg("keep_recent_turns")  or 3
     total_chars = sum(len(m["content"]) for m in conversation_history)
-    keep_count = KEEP_RECENT_TURNS * 2
-    if total_chars <= COMPRESS_THRESHOLD or len(conversation_history) <= keep_count:
+    keep_count = keep_recent_turns * 2
+    if total_chars <= compress_threshold or len(conversation_history) <= keep_count:
         console.print("[上下文较短，无需压缩]", highlight=False)
         return
 
@@ -147,10 +183,11 @@ def compress_history():
 
 def show_context():
     """打印当前上下文大小"""
+    compress_threshold = _cfg("compress_threshold") or 6000
     turns = len(conversation_history) // 2
     total_chars = sum(len(m["content"]) for m in conversation_history)
-    hint = "  （建议压缩）" if total_chars > COMPRESS_THRESHOLD else ""
-    console.print(f"[上下文状态] 共 {turns} 轮，总字符数：{total_chars} / {COMPRESS_THRESHOLD}{hint}", highlight=False)
+    hint = "  （建议压缩）" if total_chars > compress_threshold else ""
+    console.print(f"[上下文状态] 共 {turns} 轮，总字符数：{total_chars} / {compress_threshold}{hint}", highlight=False)
 
 def clear_history():
     """清空对话历史（内存 + 文件）"""
@@ -241,7 +278,7 @@ def init_task_log(requirement, mode):
     }
 
 def finish_task_log(success, attempts, test_result=None):
-    global _current_task_log
+    global _current_task_log, _last_task_log
     if not _current_task_log:
         return
     _current_task_log["test_result"] = "pass" if success else "fail"
@@ -257,6 +294,7 @@ def finish_task_log(success, attempts, test_result=None):
     (_LOG_DIR / f"{ts}.jsonl").write_text(
         json.dumps(_current_task_log, ensure_ascii=False), encoding="utf-8"
     )
+    _last_task_log = dict(_current_task_log)
     _current_task_log = {}
 
 def show_recent_logs():
@@ -467,6 +505,36 @@ TOOLS = [
                 "required": ["patch_text"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_symbols",
+            "description": "列出文件中所有函数和类（名称、类型、行号），用于了解文件结构再做精确修改",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string", "description": "文件路径（相对于workspace）"}
+                },
+                "required": ["file_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "replace_symbol",
+            "description": "替换指定函数或类的完整实现（用 AST 定位，不依赖字符串精确匹配，比 replace_in_file 更稳）",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol_name": {"type": "string", "description": "要替换的函数名或类名"},
+                    "new_code": {"type": "string", "description": "新的完整实现代码"},
+                    "file_path": {"type": "string", "description": "文件路径（相对于workspace）"}
+                },
+                "required": ["symbol_name", "new_code", "file_path"]
+            }
+        }
     }
 ]
 
@@ -643,7 +711,7 @@ def code(plan, mode="auto"):
                         import os as _os2
                         overwrite = _os2.path.exists(_os2.path.join(WORKSPACE_DIR, fname))
                         if mode == "auto" and overwrite:
-                            confirm = console.input(f"write_file 将覆盖已有文件 {fname}，确认？(y/n) ").strip().lower()
+                            confirm = _prompt(f"write_file 将覆盖已有文件 {fname}，确认？(y/n) ")
                             if confirm != "y":
                                 result = {"error": "用户已跳过文件覆盖"}
                             else:
@@ -664,7 +732,7 @@ def code(plan, mode="auto"):
                         )
                         skip = False
                         if mode == "auto":
-                            confirm = console.input("应用此修改？(y/n) ").strip().lower()
+                            confirm = _prompt("应用此修改？(y/n) ")
                             if confirm != "y":
                                 result = {"error": "用户已跳过此修改"}
                                 skip = True
@@ -685,7 +753,7 @@ def code(plan, mode="auto"):
                         result = search_in_files(**func_args)
                     elif func_name == "move_file":
                         if mode == "auto":
-                            confirm = console.input(f"移动文件 {func_args.get('src')} → {func_args.get('dst')}？(y/n) ").strip().lower()
+                            confirm = _prompt(f"移动文件 {func_args.get('src')} → {func_args.get('dst')}？(y/n) ")
                             if confirm != "y":
                                 result = {"error": "用户已跳过文件移动"}
                             else:
@@ -694,6 +762,12 @@ def code(plan, mode="auto"):
                             result = move_file(**func_args)
                     elif func_name == "apply_patch":
                         result = apply_patch(**func_args)
+                        if "success" in result:
+                            _task_files_modified.append(func_args.get("file_path", ""))
+                    elif func_name == "list_symbols":
+                        result = list_symbols(**func_args)
+                    elif func_name == "replace_symbol":
+                        result = replace_symbol(**func_args)
                         if "success" in result:
                             _task_files_modified.append(func_args.get("file_path", ""))
                     else:
@@ -773,10 +847,16 @@ def fix(test_result, plan):
                     result = apply_patch(**func_args)
                     if "success" in result:
                         _task_files_modified.append(func_args.get("file_path", ""))
+                elif func_name == "list_symbols":
+                    result = list_symbols(**func_args)
+                elif func_name == "replace_symbol":
+                    result = replace_symbol(**func_args)
+                    if "success" in result:
+                        _task_files_modified.append(func_args.get("file_path", ""))
                 else:
                     result = {"error": "未预期的调用"}
 
-                _task_tool_calls.append({"name": func_name, "args": {k: v for k, v in func_args.items() if k not in ("content", "new_str")}})
+                _task_tool_calls.append({"name": func_name, "args": {k: v for k, v in func_args.items() if k not in ("content", "new_str", "new_code")}})
                 messages.append({
                     "tool_call_id": tool_call.id,
                     "role": "tool",
@@ -848,12 +928,12 @@ def _run(requirement, mode):
         finish_task_log(True, 0)
         return {"success": True, "test_result": {"returncode": 0, "stdout": "", "stderr": ""}}
 
-    # auto 模式：等待用户确认，支持修改重试
+    # auto 模式：等待用户确认，支持修改重试（批处理模式自动确认）
     if mode == "auto":
         retry_count = 0
         max_retries = 3
         while retry_count <= max_retries:
-            user_confirm = console.input("\n确认执行？(y/n/修改) ").strip().lower()
+            user_confirm = _prompt("\n确认执行？(y/n/修改) ")
             if interrupt.is_interrupted():
                 raise interrupt.Interrupted()
             if user_confirm == 'y':
@@ -886,19 +966,29 @@ def _run(requirement, mode):
     console.print("\n阶段3：测试与修复")
     attempts = 0
     test_result = None
+    max_attempts = _cfg("max_attempts") or 3
+
+    # #42 如果 workspace 中没有测试文件，自动生成
+    ws = Path(WORKSPACE_DIR)
+    has_tests = bool(
+        [f for f in ws.rglob("test_*.py") if ".yansh" not in f.parts]
+        + [f for f in ws.rglob("*_test.py") if ".yansh" not in f.parts]
+    )
+    if not has_tests:
+        _auto_generate_tests(plan_result, _task_files_modified[:])
 
     # #26 Linter：先跑 ruff，有错误走修复循环
     linter_result = run_linter()
     if linter_result:
-        console.print(f"Linter 发现错误，开始修复 (尝试 {attempts + 1}/{MAX_ATTEMPTS})", highlight=False)
+        console.print(f"Linter 发现错误，开始修复 (尝试 {attempts + 1}/{max_attempts})", highlight=False)
         fix(linter_result, plan_result)
         attempts += 1
 
-    while attempts < MAX_ATTEMPTS:
+    while attempts < max_attempts:
         test_result = test(plan_result.get("test_command", ""))
         if judge(test_result):
             console.print("测试通过！")
-            cleanup_snapshot(current_snapshot)  # #37 成功后清理快照
+            cleanup_snapshot(current_snapshot)
             files = plan_result.get("files", [])
             file_names = [f.get("filename") if isinstance(f, dict) else str(f) for f in files]
             file_names = [name for name in file_names if name]
@@ -907,18 +997,15 @@ def _run(requirement, mode):
             finish_task_log(True, attempts, test_result)
             return report(True, test_result)
         else:
-            console.print(f"测试失败 (尝试 {attempts + 1}/{MAX_ATTEMPTS})")
-            if attempts < MAX_ATTEMPTS - 1:
+            console.print(f"测试失败 (尝试 {attempts + 1}/{max_attempts})")
+            if attempts < max_attempts - 1:
                 fix(test_result, plan_result)
             attempts += 1
 
     console.print("达到最大尝试次数，任务失败")
     # #37 失败时提示回滚
     if current_snapshot:
-        try:
-            answer = console.input("是否回滚到任务开始前的状态？(y/n) ").strip().lower()
-        except EOFError:
-            answer = "n"
+        answer = _prompt("是否回滚到任务开始前的状态？(y/n) ", default="n")
         if answer == "y":
             n = restore_snapshot(current_snapshot)
             console.print(f"[已回滚] 恢复 {n} 个文件", highlight=False)
@@ -929,6 +1016,64 @@ def _run(requirement, mode):
     add_to_history(original_requirement, f"任务失败：{original_requirement}")
     finish_task_log(False, attempts, test_result)
     return report(False, test_result)
+
+
+def _auto_generate_tests(plan_result, modified_files):
+    """#42 无测试文件时，自动为本次修改的 .py 文件生成最小测试"""
+    non_test_srcs = [
+        f for f in modified_files
+        if f and f.endswith(".py")
+        and not Path(f).name.startswith("test_")
+        and not Path(f).stem.endswith("_test")
+    ]
+    if not non_test_srcs:
+        return
+
+    console.print("[自动生成测试] 未发现测试文件，自动生成最小测试...", highlight=False)
+
+    file_contents = []
+    for src in non_test_srcs:
+        r = read_file(src)
+        if "content" in r:
+            file_contents.append(f"# {src}\n{r['content']}")
+
+    if not file_contents:
+        return
+
+    combined = "\n\n".join(file_contents)
+    test_targets = ", ".join(f"tests/test_{Path(f).name}" for f in non_test_srcs)
+
+    msgs = [
+        {"role": "system", "content": f"""{_CODER_ROLE}
+你是测试生成助手。根据源代码生成最小测试文件，覆盖正常路径、边界值、异常输入三种case。
+测试文件放在 tests/ 目录下，文件名格式：test_<原文件名>.py。
+测试文件开头必须加：
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+使用 write_file 工具写入测试文件，不要用其他工具。"""},
+        {"role": "user", "content": f"为以下源文件生成测试（目标文件：{test_targets}）：\n\n{combined}"}
+    ]
+
+    rounds = 3
+    while rounds > 0:
+        rounds -= 1
+        response = call_llm(msgs, tools=TOOLS, tool_choice="auto")
+        msg = response.choices[0].message
+        msgs.append(msg)
+        if msg.tool_calls:
+            for tc in msg.tool_calls:
+                fname = tc.function.name
+                args = json.loads(tc.function.arguments)
+                if fname == "write_file":
+                    result = write_file(**args)
+                    console.print(f"[自动测试] 生成: {args.get('filename')}", highlight=False)
+                    if "success" in result:
+                        _task_files_modified.append(args.get("filename", ""))
+                else:
+                    result = {"error": "测试生成阶段只允许 write_file"}
+                msgs.append({"tool_call_id": tc.id, "role": "tool", "name": fname, "content": json.dumps(result)})
+        else:
+            break
 
 
 def classify_input(user_input):

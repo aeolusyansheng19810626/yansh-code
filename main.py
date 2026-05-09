@@ -1,12 +1,21 @@
 import sys
+import json
+import argparse
 import agent
 from rich.console import Console
-from agent import run, classify_input, chat, add_to_history, maybe_compress_history, compress_history, show_context, clear_history, detect_project_type, load_history, get_latest_snapshot, restore_snapshot, cleanup_snapshot, show_recent_logs
+from agent import (
+    run, classify_input, chat, add_to_history, maybe_compress_history,
+    compress_history, show_context, clear_history, detect_project_type,
+    load_history, get_latest_snapshot, restore_snapshot, cleanup_snapshot,
+    show_recent_logs, set_batch_mode, get_last_task_log,
+)
+from config import load_project_config, get_config, override_config
 import interrupt
 
 console = Console()
 
 VALID_MODES = {"plan", "code", "auto"}
+
 
 def handle_task_result(result):
     if result["success"]:
@@ -21,31 +30,79 @@ def handle_task_result(result):
             console.print("错误信息：")
             console.print(test_result["stderr"])
 
+
+def show_config():
+    """#43 打印当前生效配置"""
+    cfg = get_config()
+    console.print("[当前生效配置]", highlight=False)
+    for k, v in cfg.items():
+        console.print(f"  {k}: {v}", highlight=False)
+
+
 def main():
+    # ---------- #40 argparse ----------
+    parser = argparse.ArgumentParser(prog="yansh-code", add_help=True)
+    parser.add_argument("--task", type=str, default=None, help="直接执行任务（批处理模式）")
+    parser.add_argument("--mode", type=str, default=None, choices=list(VALID_MODES), help="运行模式")
+    parser.add_argument("--json", action="store_true", dest="json_output", help="JSON 输出到 stdout，其余输出到 stderr")
+    args, unknown = parser.parse_known_args()
+
+    # 如果没有 --task 但有位置参数，兼容旧用法（sys.argv[1:]）
+    positional_task = " ".join(unknown).strip() if unknown else None
+
+    # ---------- #43 加载项目配置 ----------
+    load_project_config()
+
+    # CLI 参数优先级高于配置文件
+    if args.mode:
+        override_config(mode=args.mode)
+
+    # ---------- #40 批处理模式初始化 ----------
+    batch_task = args.task or positional_task
+    if batch_task:
+        set_batch_mode(True, json_output=args.json_output)
+        current_mode = get_config().get("mode", "auto")
+        if args.mode:
+            current_mode = args.mode
+
+        result = run(batch_task, mode=current_mode)
+        log = get_last_task_log()
+
+        if args.json_output:
+            output = {
+                "success": result["success"],
+                "requirement": batch_task,
+                "plan": log.get("plan", []),
+                "files_modified": log.get("files_modified", []),
+                "test_result": log.get("test_result", "unknown"),
+                "attempts": log.get("attempts", 0),
+                "duration_seconds": log.get("duration_seconds", 0.0),
+                "error": log.get("error", None),
+            }
+            print(json.dumps(output, ensure_ascii=False), flush=True)
+        else:
+            handle_task_result(result)
+        return
+
+    # ---------- 交互模式 ----------
     console.print("yansh-code CLI")
 
-    # #28 加载历史会话
+    # 加载历史会话
     restored = load_history()
     if restored:
         console.print(f"[已恢复会话] 共 {restored} 轮历史", highlight=False)
 
-    # #27 项目类型检测
+    # 项目类型检测
     proj_type, proj_cmd = detect_project_type()
     if proj_type:
         agent._PROJECT_TYPE = proj_type
         agent._PROJECT_TEST_CMD = proj_cmd
         console.print(f"[项目类型] {proj_type} | 测试命令：{proj_cmd}", highlight=False)
 
-    current_mode = "auto"
+    current_mode = get_config().get("mode", "auto")
+    if args.mode:
+        current_mode = args.mode
     interrupt.start_listener()
-
-    # 若命令行带了参数，直接处理第一条需求
-    if len(sys.argv) > 1:
-        first_input = " ".join(sys.argv[1:]).strip()
-        if first_input:
-            interrupt.reset()
-            console.print("正在处理需求...")
-            handle_task_result(run(first_input, mode=current_mode))
 
     # 主循环
     while True:
@@ -54,12 +111,10 @@ def main():
         if not user_input:
             continue
 
-        # 检查退出命令
         if user_input.lower() in ["exit", "quit"]:
             console.print("再见！")
             break
 
-        # 检查模式切换命令
         if user_input.startswith("/mode"):
             parts = user_input.split()
             if len(parts) == 2 and parts[1] in VALID_MODES:
@@ -95,9 +150,11 @@ def main():
             show_recent_logs()
             continue
 
-        # 判断是新任务还是闲聊
-        input_type = classify_input(user_input)
+        if user_input == "/config":
+            show_config()
+            continue
 
+        input_type = classify_input(user_input)
         maybe_compress_history()
 
         if input_type == "task":
@@ -105,9 +162,9 @@ def main():
             interrupt.reset()
             handle_task_result(run(user_input, mode=current_mode))
         else:
-            # 闲聊模式
             response = chat(user_input)
             console.print(response)
+
 
 if __name__ == "__main__":
     main()

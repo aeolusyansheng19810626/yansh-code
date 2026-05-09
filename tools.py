@@ -7,6 +7,21 @@ from config import WORKSPACE_DIR
 
 _WORKSPACE_ROOT = Path(WORKSPACE_DIR).resolve()
 
+# #40 批处理模式标志（由 agent.set_batch_mode() 设置）
+_BATCH_MODE = False
+
+
+def set_batch_mode(enabled: bool):
+    global _BATCH_MODE
+    _BATCH_MODE = enabled
+
+
+def _con():
+    """返回 Console 实例；批处理/JSON 模式下输出到 stderr"""
+    from rich.console import Console
+    import sys
+    return Console(file=sys.stderr) if _BATCH_MODE else Console()
+
 _DANGEROUS_PATTERNS = [
     (r"rm\s+(-[a-zA-Z]*r[a-zA-Z]*f|-[a-zA-Z]*f[a-zA-Z]*r|-f\b)", "rm -rf / rm -f"),
     (r"\bsudo\b",                                                  "sudo"),
@@ -76,8 +91,7 @@ def _check_dangerous(command):
     """检查命令是否包含危险模式。返回 None 表示安全，否则返回 error_dict。"""
     for pattern, label in _DANGEROUS_PATTERNS:
         if re.search(pattern, command, re.IGNORECASE | re.DOTALL):
-            from rich.console import Console
-            Console().print(f"[安全拦截] 检测到危险命令：{label}", highlight=False)
+            _con().print(f"[安全拦截] 检测到危险命令：{label}", highlight=False)
             return {"error": f"安全拦截：检测到危险命令（{label}），已阻止执行",
                     "returncode": -2, "stdout": "", "stderr": ""}
     return None
@@ -117,19 +131,21 @@ def execute_command(command):
     # Level 2: safe — 直接执行
     is_safe = any(re.match(p, cmd_stripped, re.IGNORECASE) for p in _SAFE_PATTERNS)
 
-    # Level 3: confirm — 提示用户
+    # Level 3: confirm — 批处理模式自动确认，交互模式提示用户
     if not is_safe:
         for pattern, label in _CONFIRM_PATTERNS:
             if re.search(pattern, cmd_stripped, re.IGNORECASE):
-                from rich.console import Console as _C
-                _c = _C()
-                _c.print(f"[确认] 即将执行: {command}", highlight=False)
-                try:
-                    answer = _c.input("继续？(y/n) ").strip().lower()
-                except EOFError:
-                    answer = "n"
-                if answer != "y":
-                    return {"error": "用户取消执行", "returncode": -1, "stdout": "", "stderr": ""}
+                if _BATCH_MODE:
+                    _con().print(f"[batch] 自动确认执行: {command}", highlight=False)
+                else:
+                    _c = _con()
+                    _c.print(f"[确认] 即将执行: {command}", highlight=False)
+                    try:
+                        answer = _c.input("继续？(y/n) ").strip().lower()
+                    except EOFError:
+                        answer = "n"
+                    if answer != "y":
+                        return {"error": "用户取消执行", "returncode": -1, "stdout": "", "stderr": ""}
                 break
 
     import threading
@@ -463,5 +479,107 @@ def apply_patch(patch_text, file_path=None):
     try:
         resolved.write_text(''.join(result), encoding='utf-8')
         return {"success": f"patch 应用成功: {file_path}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ---------- #41 符号级编辑 ----------
+
+def _load_ts_parser():
+    try:
+        import tree_sitter_python as tspython
+        from tree_sitter import Language, Parser
+        py_lang = Language(tspython.language())
+        parser = Parser(py_lang)
+        return parser, None
+    except ImportError:
+        return None, {"error": "tree-sitter 未安装，请运行: pip install tree-sitter tree-sitter-python"}
+
+
+def list_symbols(file_path):
+    """列出文件中所有函数和类，返回 name/type/line 列表"""
+    parser, err = _load_ts_parser()
+    if err:
+        return err
+    resolved, err = _validate_path(file_path)
+    if err:
+        return err
+    try:
+        src_bytes = resolved.read_bytes()
+    except Exception as e:
+        return {"error": str(e)}
+
+    tree = parser.parse(src_bytes)
+    symbols = []
+
+    def _collect(node):
+        if node.type in ("function_definition", "class_definition"):
+            for ch in node.children:
+                if ch.type == "identifier":
+                    symbols.append({
+                        "name": ch.text.decode("utf-8"),
+                        "type": "function" if node.type == "function_definition" else "class",
+                        "line": node.start_point[0] + 1,
+                    })
+                    break
+        for ch in node.children:
+            _collect(ch)
+
+    _collect(tree.root_node)
+    return {"symbols": symbols, "total": len(symbols)}
+
+
+def replace_symbol(symbol_name, new_code, file_path):
+    """用 tree-sitter 定位符号起止行，整体替换其实现"""
+    parser, err = _load_ts_parser()
+    if err:
+        return err
+    resolved, err = _validate_path(file_path)
+    if err:
+        return err
+    try:
+        src_bytes = resolved.read_bytes()
+        content = resolved.read_text(encoding="utf-8")
+    except Exception as e:
+        return {"error": str(e)}
+
+    tree = parser.parse(src_bytes)
+
+    def _find(node, parent_type=None):
+        if node.type == "decorated_definition":
+            for ch in node.children:
+                if ch.type in ("function_definition", "class_definition"):
+                    for grandch in ch.children:
+                        if grandch.type == "identifier" and grandch.text.decode("utf-8") == symbol_name:
+                            return node
+                    break
+        elif node.type in ("function_definition", "class_definition") and parent_type != "decorated_definition":
+            for ch in node.children:
+                if ch.type == "identifier" and ch.text.decode("utf-8") == symbol_name:
+                    return node
+        for ch in node.children:
+            r = _find(ch, parent_type=node.type)
+            if r:
+                return r
+        return None
+
+    target = _find(tree.root_node)
+    if target is None:
+        return {"error": f"未找到符号 '{symbol_name}'"}
+
+    start_line = target.start_point[0]   # 0-based
+    end_line   = target.end_point[0]     # 0-based, inclusive
+
+    lines = content.splitlines(keepends=True)
+    if not new_code.endswith("\n"):
+        new_code += "\n"
+    new_lines = lines[:start_line] + [new_code] + lines[end_line + 1:]
+    try:
+        resolved.write_text("".join(new_lines), encoding="utf-8")
+        return {
+            "success": f"符号 '{symbol_name}' 替换成功",
+            "file": file_path,
+            "lines_replaced": end_line - start_line + 1,
+        }
     except Exception as e:
         return {"error": str(e)}
