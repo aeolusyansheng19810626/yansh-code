@@ -1,51 +1,89 @@
 import os
+import re
 import subprocess
 import shutil
 from pathlib import Path
 from config import WORKSPACE_DIR
 
+_WORKSPACE_ROOT = Path(WORKSPACE_DIR).resolve()
+
+_DANGEROUS_PATTERNS = [
+    (r"rm\s+(-[a-zA-Z]*r[a-zA-Z]*f|-[a-zA-Z]*f[a-zA-Z]*r|-f\b)", "rm -rf / rm -f"),
+    (r"\bsudo\b",                                                  "sudo"),
+    (r"(curl|wget)\s+.*\|\s*(ba)?sh",                             "curl/wget | sh"),
+    (r"chmod\s+(-R\s+)?777",                                       "chmod 777"),
+    (r"\bmkfs\b",                                                  "mkfs"),
+    (r"\bdd\s+if=",                                               "dd if="),
+    (r":\(\)\s*\{.*:\|:.*\}",                                     "fork bomb"),
+    # Windows 危险命令
+    (r"\brd\s+/s",                                                "rd /s /q"),
+    (r"\brmdir\s+/s",                                             "rmdir /s"),
+    (r"\bdel\s+(/[a-zA-Z]+\s+)+",                                "del /f /s /q"),
+    (r"\bformat\s+[a-zA-Z]:",                                     "format c:"),
+    (r"\breg\s+delete\b",                                         "reg delete"),
+    (r"\bbcdedit\b",                                              "bcdedit"),
+    (r"\bshutdown\s+/[rs]\b",                                     "shutdown /r|/s"),
+    (r"\btaskkill\s+/f\b",                                        "taskkill /f"),
+    (r"\bnetsh\s+.*firewall\b",                                   "netsh firewall"),
+    (r"\bpowershell\b.*-e(nc)?\b",                               "powershell -enc"),
+    (r"\biex\b|\bInvoke-Expression\b",                            "iex/Invoke-Expression"),
+]
+
+def _validate_path(filename):
+    """校验 filename 是否合法（非绝对路径、非越界、无符号链接逃逸）。
+    返回 (resolved_path, None) 或 (None, error_dict)。"""
+    p = Path(filename)
+    if p.is_absolute():
+        return None, {"error": "路径越界：不允许访问workspace外的文件"}
+    if ".." in p.parts:
+        return None, {"error": "路径越界：不允许访问workspace外的文件"}
+    candidate = (_WORKSPACE_ROOT / p).resolve()
+    if not candidate.is_relative_to(_WORKSPACE_ROOT):
+        return None, {"error": "路径越界：不允许访问workspace外的文件"}
+    return candidate, None
+
+def _check_dangerous(command):
+    """检查命令是否包含危险模式。返回 None 表示安全，否则返回 error_dict。"""
+    for pattern, label in _DANGEROUS_PATTERNS:
+        if re.search(pattern, command, re.IGNORECASE | re.DOTALL):
+            from rich.console import Console
+            Console().print(f"[安全拦截] 检测到危险命令：{label}", highlight=False)
+            return {"error": f"安全拦截：检测到危险命令（{label}），已阻止执行",
+                    "returncode": -2, "stdout": "", "stderr": ""}
+    return None
+
 def write_file(filename, content):
     """在workspace目录下写入文件"""
+    resolved, err = _validate_path(filename)
+    if err:
+        return err
     os.makedirs(WORKSPACE_DIR, exist_ok=True)
-    filepath = os.path.join(WORKSPACE_DIR, filename)
-    
-    # 安全检查：确保路径在workspace内
-    abs_workspace = os.path.abspath(WORKSPACE_DIR)
-    abs_filepath = os.path.abspath(filepath)
-    if not abs_filepath.startswith(abs_workspace):
-        return {"error": "文件路径超出workspace目录"}
-    
     try:
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        with open(filepath, 'w', encoding='utf-8') as f:
-            f.write(content)
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        resolved.write_text(content, encoding='utf-8')
         return {"success": f"文件 {filename} 写入成功"}
     except Exception as e:
         return {"error": str(e)}
 
 def read_file(filename):
     """读取workspace目录下的文件"""
-    filepath = os.path.join(WORKSPACE_DIR, filename)
-    
-    abs_workspace = os.path.abspath(WORKSPACE_DIR)
-    abs_filepath = os.path.abspath(filepath)
-    if not abs_filepath.startswith(abs_workspace):
-        return {"error": "文件路径超出workspace目录"}
-    
+    resolved, err = _validate_path(filename)
+    if err:
+        return err
     try:
-        with open(filepath, 'r', encoding='utf-8') as f:
-            content = f.read()
-        return {"content": content}
+        return {"content": resolved.read_text(encoding='utf-8')}
     except Exception as e:
         return {"error": str(e)}
 
 def execute_command(command):
-    """在workspace目录下执行命令，30秒超时，实时输出"""
-    import sys
-    import time
-    
+    """在workspace目录下执行命令，30秒超时，两线程并发读stdout/stderr防死锁"""
+    danger = _check_dangerous(command)
+    if danger:
+        return danger
+
+    import threading
+
     try:
-        # 使用 Popen 实现流式输出
         process = subprocess.Popen(
             command,
             shell=True,
@@ -53,40 +91,34 @@ def execute_command(command):
             stderr=subprocess.PIPE,
             text=True,
             cwd=WORKSPACE_DIR,
-            bufsize=1  # 行缓冲
         )
-        
+
         stdout_lines = []
         stderr_lines = []
-        start_time = time.time()
-        
-        # 实时读取输出
-        while True:
-            # 检查超时
-            if time.time() - start_time > 30:
-                process.kill()
-                return {"error": "命令执行超时（30秒）"}
-            
-            # 读取 stdout
-            line = process.stdout.readline()
-            if line:
-                print(line, end='', flush=True)  # 实时打印
+
+        def _read_stdout():
+            for line in process.stdout:
+                print(line, end='', flush=True)
                 stdout_lines.append(line)
-            
-            # 检查进程是否结束
-            if process.poll() is not None:
-                # 读取剩余输出
-                remaining = process.stdout.read()
-                if remaining:
-                    print(remaining, end='', flush=True)
-                    stdout_lines.append(remaining)
-                break
-        
-        # 读取 stderr
-        stderr_output = process.stderr.read()
-        if stderr_output:
-            stderr_lines.append(stderr_output)
-        
+
+        def _read_stderr():
+            for line in process.stderr:
+                stderr_lines.append(line)
+
+        t_out = threading.Thread(target=_read_stdout, daemon=True)
+        t_err = threading.Thread(target=_read_stderr, daemon=True)
+        t_out.start()
+        t_err.start()
+
+        try:
+            process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            return {"error": "命令执行超时（30秒）"}
+
+        t_out.join()
+        t_err.join()
+
         return {
             "stdout": ''.join(stdout_lines),
             "stderr": ''.join(stderr_lines),
@@ -97,15 +129,11 @@ def execute_command(command):
 
 def delete_file(filename):
     """删除workspace目录下的文件"""
-    filepath = os.path.join(WORKSPACE_DIR, filename)
-    
-    abs_workspace = os.path.abspath(WORKSPACE_DIR)
-    abs_filepath = os.path.abspath(filepath)
-    if not abs_filepath.startswith(abs_workspace):
-        return {"error": "文件路径超出workspace目录"}
-    
+    resolved, err = _validate_path(filename)
+    if err:
+        return err
     try:
-        os.remove(filepath)
+        resolved.unlink()
         return {"success": f"文件 {filename} 删除成功"}
     except FileNotFoundError:
         return {"error": f"文件 {filename} 不存在"}
@@ -114,16 +142,12 @@ def delete_file(filename):
 
 def replace_in_file(filename, old_str, new_str):
     """在workspace文件中精确替换字符串。old_str必须唯一匹配，否则返回错误"""
-    filepath = os.path.join(WORKSPACE_DIR, filename)
-
-    abs_workspace = os.path.abspath(WORKSPACE_DIR)
-    abs_filepath = os.path.abspath(filepath)
-    if not abs_filepath.startswith(abs_workspace):
-        return {"error": "文件路径超出workspace目录"}
+    resolved, err = _validate_path(filename)
+    if err:
+        return err
 
     try:
-        with open(filepath, 'r', encoding='utf-8') as f:
-            content = f.read()
+        content = resolved.read_text(encoding='utf-8')
     except FileNotFoundError:
         return {"error": f"文件 {filename} 不存在"}
     except Exception as e:
@@ -137,8 +161,7 @@ def replace_in_file(filename, old_str, new_str):
 
     content = content.replace(old_str, new_str, 1)
     try:
-        with open(filepath, 'w', encoding='utf-8') as f:
-            f.write(content)
+        resolved.write_text(content, encoding='utf-8')
         return {
             "success": f"文件 {filename} 替换成功",
             "filename": filename,
@@ -163,25 +186,13 @@ def move_file(src, dst):
     - src不存在返回错误
     - 路径越界返回错误
     """
-    # 构建完整路径
-    src_path = Path(WORKSPACE_DIR) / src
-    dst_path = Path(WORKSPACE_DIR) / dst
-    
-    # 安全检查：确保路径在workspace内
-    abs_workspace = Path(WORKSPACE_DIR).resolve()
-    abs_src = src_path.resolve()
-    abs_dst = dst_path.resolve()
-    
-    try:
-        if not abs_src.is_relative_to(abs_workspace):
-            return {"error": "Source file path exceeds workspace directory"}
-        if not abs_dst.is_relative_to(abs_workspace):
-            return {"error": "Destination file path exceeds workspace directory"}
-    except ValueError:
-        # is_relative_to may throw ValueError in some cases
-        return {"error": "File path exceeds workspace directory"}
-    
-    # Check if src exists
+    src_path, err = _validate_path(src)
+    if err:
+        return err
+    dst_path, err = _validate_path(dst)
+    if err:
+        return err
+
     if not src_path.exists():
         return {"error": f"Source file {src} does not exist"}
     
@@ -267,3 +278,139 @@ def search_in_files(pattern, workspace=None, regex=False, extensions=None):
             continue
     
     return {"matches": matches, "total": len(matches)}
+
+def get_symbol_definition(symbol_name, file_path=None):
+    """用 tree-sitter 精确查找函数或类定义，返回文件、行号、完整代码。
+    file_path 可选；不填则搜索整个 workspace 的 .py 文件。"""
+    try:
+        import tree_sitter_python as tspython
+        from tree_sitter import Language, Parser
+    except ImportError:
+        return {"error": "tree-sitter 未安装，请运行: pip install tree-sitter tree-sitter-python"}
+
+    py_lang = Language(tspython.language())
+    parser = Parser(py_lang)
+
+    def _collect(node, src_bytes, parent_type=None):
+        hits = []
+        if node.type == "decorated_definition":
+            for ch in node.children:
+                if ch.type in ("function_definition", "class_definition"):
+                    for grandch in ch.children:
+                        if grandch.type == "identifier" and grandch.text.decode("utf-8") == symbol_name:
+                            start_line = node.start_point[0] + 1
+                            code = src_bytes[node.start_byte:node.end_byte].decode("utf-8")
+                            hits.append({"line": start_line, "code": code})
+                            break
+                    break
+        elif node.type in ("function_definition", "class_definition"):
+            if parent_type != "decorated_definition":
+                for ch in node.children:
+                    if ch.type == "identifier" and ch.text.decode("utf-8") == symbol_name:
+                        start_line = node.start_point[0] + 1
+                        code = src_bytes[node.start_byte:node.end_byte].decode("utf-8")
+                        hits.append({"line": start_line, "code": code})
+                        break
+        for ch in node.children:
+            hits.extend(_collect(ch, src_bytes, parent_type=node.type))
+        return hits
+
+    def _search_file(abs_path):
+        try:
+            src_bytes = abs_path.read_bytes()
+            tree = parser.parse(src_bytes)
+            hits = _collect(tree.root_node, src_bytes)
+            rel = str(abs_path.relative_to(_WORKSPACE_ROOT)).replace("\\", "/")
+            return [{"file": rel, "line": h["line"], "code": h["code"]} for h in hits]
+        except Exception:
+            return []
+
+    results = []
+    if file_path:
+        resolved, err = _validate_path(file_path)
+        if err:
+            return err
+        results = _search_file(resolved)
+    else:
+        for py_file in _WORKSPACE_ROOT.rglob("*.py"):
+            if ".git" in py_file.parts:
+                continue
+            results.extend(_search_file(py_file))
+
+    if not results:
+        return {"error": f"未找到符号 '{symbol_name}'"}
+    return {"matches": results, "total": len(results)}
+
+def apply_patch(patch_text, file_path=None):
+    """应用 unified diff 格式的 patch 到文件"""
+    import re
+
+    lines = patch_text.splitlines(keepends=True)
+
+    # 从 patch 推断目标文件
+    if file_path is None:
+        for line in lines:
+            if line.startswith("+++ "):
+                path = line[4:].strip()
+                if path.startswith("b/"):
+                    path = path[2:]
+                file_path = path
+                break
+        if file_path is None:
+            return {"error": "无法从 patch 推断目标文件路径，请指定 file_path"}
+
+    resolved, err = _validate_path(file_path)
+    if err:
+        return err
+
+    try:
+        file_lines = resolved.read_text(encoding='utf-8').splitlines(keepends=True)
+    except FileNotFoundError:
+        return {"error": f"文件 {file_path} 不存在"}
+    except Exception as e:
+        return {"error": str(e)}
+
+    hunk_re = re.compile(r'^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@')
+    hunks = []
+    current = None
+
+    for line in lines:
+        m = hunk_re.match(line)
+        if m:
+            if current is not None:
+                hunks.append(current)
+            current = {
+                'old_start': int(m.group(1)) - 1,  # 转为 0-based
+                'lines': []
+            }
+        elif current is not None and not line.startswith(('--- ', '+++ ')):
+            current['lines'].append(line)
+
+    if current is not None:
+        hunks.append(current)
+
+    if not hunks:
+        return {"error": "patch 中未找到有效的 hunk"}
+
+    result = list(file_lines)
+    offset = 0  # 已应用 hunk 导致的行号偏移
+
+    for hunk in hunks:
+        old_lines, new_lines = [], []
+        for line in hunk['lines']:
+            if line.startswith(' '):
+                old_lines.append(line[1:])
+                new_lines.append(line[1:])
+            elif line.startswith('-'):
+                old_lines.append(line[1:])
+            elif line.startswith('+'):
+                new_lines.append(line[1:])
+        start = hunk['old_start'] + offset
+        result[start:start + len(old_lines)] = new_lines
+        offset += len(new_lines) - len(old_lines)
+
+    try:
+        resolved.write_text(''.join(result), encoding='utf-8')
+        return {"success": f"patch 应用成功: {file_path}"}
+    except Exception as e:
+        return {"error": str(e)}

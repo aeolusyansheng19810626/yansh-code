@@ -5,7 +5,7 @@ from openai import OpenAI
 from rich.console import Console
 from pathlib import Path
 from config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL, QUALITY_CASCADE, MAX_ATTEMPTS, WORKSPACE_DIR
-from tools import write_file, read_file, execute_command, list_files, replace_in_file, get_symbol_definition
+from tools import write_file, read_file, execute_command, list_files, replace_in_file, get_symbol_definition, search_in_files, move_file, apply_patch
 import interrupt
 
 console = Console()
@@ -291,6 +291,52 @@ TOOLS = [
                 "required": ["symbol_name"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_in_files",
+            "description": "在workspace内搜索匹配字符串，返回文件名、行号和匹配内容",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "搜索模式（字符串或正则）"},
+                    "regex": {"type": "boolean", "description": "是否使用正则表达式匹配（默认false）"},
+                    "extensions": {"type": "array", "items": {"type": "string"}, "description": "文件扩展名过滤列表，如 [\".py\", \".md\"]"}
+                },
+                "required": ["pattern"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "move_file",
+            "description": "移动文件从src到dst（相对于workspace），自动创建目标父目录",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "src": {"type": "string", "description": "源文件路径（相对于workspace）"},
+                    "dst": {"type": "string", "description": "目标文件路径（相对于workspace）"}
+                },
+                "required": ["src", "dst"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "apply_patch",
+            "description": "应用 unified diff 格式的 patch 到文件，比 replace_in_file 更适合多处批量修改",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "patch_text": {"type": "string", "description": "unified diff 格式的 patch 字符串"},
+                    "file_path": {"type": "string", "description": "目标文件路径（相对于workspace，可从 patch 自动推断）"}
+                },
+                "required": ["patch_text"]
+            }
+        }
     }
 ]
 
@@ -491,6 +537,19 @@ def code(plan, mode="auto"):
                         result = list_files()
                     elif func_name == "get_symbol_definition":
                         result = get_symbol_definition(**func_args)
+                    elif func_name == "search_in_files":
+                        result = search_in_files(**func_args)
+                    elif func_name == "move_file":
+                        if mode == "auto":
+                            confirm = console.input(f"移动文件 {func_args.get('src')} → {func_args.get('dst')}？(y/n) ").strip().lower()
+                            if confirm != "y":
+                                result = {"error": "用户已跳过文件移动"}
+                            else:
+                                result = move_file(**func_args)
+                        else:
+                            result = move_file(**func_args)
+                    elif func_name == "apply_patch":
+                        result = apply_patch(**func_args)
                     else:
                         result = {"error": "未预期的调用"}
 
@@ -547,12 +606,20 @@ def fix(test_result, plan):
                     console.print(f"修复 {func_args.get('filename')}")
                 elif func_name == "read_file":
                     result = read_file(**func_args)
+                elif func_name == "replace_in_file":
+                    result = replace_in_file(**func_args)
                 elif func_name == "execute_command":
                     result = execute_command(**func_args)
                 elif func_name == "list_files":
                     result = list_files()
                 elif func_name == "get_symbol_definition":
                     result = get_symbol_definition(**func_args)
+                elif func_name == "search_in_files":
+                    result = search_in_files(**func_args)
+                elif func_name == "move_file":
+                    result = move_file(**func_args)
+                elif func_name == "apply_patch":
+                    result = apply_patch(**func_args)
                 else:
                     result = {"error": "未预期的调用"}
                 

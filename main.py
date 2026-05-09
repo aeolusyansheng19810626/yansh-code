@@ -1,6 +1,7 @@
 import sys
+import agent
 from rich.console import Console
-from agent import run, classify_input, chat, add_to_history, maybe_compress_history, compress_history, show_context, clear_history
+from agent import run, classify_input, chat, add_to_history, maybe_compress_history, compress_history, show_context, clear_history, detect_project_type, load_history
 import interrupt
 
 console = Console()
@@ -23,12 +24,24 @@ def handle_task_result(result):
 def main():
     console.print("yansh-code CLI")
 
+    # #28 加载历史会话
+    restored = load_history()
+    if restored:
+        console.print(f"[已恢复会话] 共 {restored} 轮历史", highlight=False)
+
+    # #27 项目类型检测
+    proj_type, proj_cmd = detect_project_type()
+    if proj_type:
+        agent._PROJECT_TYPE = proj_type
+        agent._PROJECT_TEST_CMD = proj_cmd
+        console.print(f"[项目类型] {proj_type} | 测试命令：{proj_cmd}", highlight=False)
+
     current_mode = "auto"
     interrupt.start_listener()
 
     # 若命令行带了参数，直接处理第一条需求
     if len(sys.argv) > 1:
-        first_input = sys.argv[1].strip()
+        first_input = " ".join(sys.argv[1:]).strip()
         if first_input:
             interrupt.reset()
             console.print("正在处理需求...")
