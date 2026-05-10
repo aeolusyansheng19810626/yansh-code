@@ -100,8 +100,8 @@ def main():
         if not user_input:
             continue
 
-        if user_input.lower() in ["exit", "quit"]:
-            console.print("再记！")
+        if user_input.lower() in ["exit", "quit", "/exit", "/quit"]:
+            console.print("再见！")
             break
 
         if user_input.startswith("/mode"):
