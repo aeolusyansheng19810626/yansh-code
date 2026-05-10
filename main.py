@@ -81,18 +81,15 @@ def main():
 
     interrupt.start_listener()
 
-    # 主循环
+    # 主循环：multiline=True，Enter 换行，Meta+Enter（Alt+Enter）提交
     kb = KeyBindings()
-    try:
-        @kb.add('s-enter')
-        def _(event):
-            event.current_buffer.insert_text('\n')
-    except (ValueError, KeyError):
-        kb = None
+    @kb.add('escape', 'enter')
+    def _submit(event):
+        event.current_buffer.validate_and_handle()
 
     while True:
         try:
-            user_input = prompt('> ', key_bindings=kb).strip()
+            user_input = prompt('> ', key_bindings=kb, multiline=True).strip()
         except (EOFError, KeyboardInterrupt):
             console.print("再见！")
             break
