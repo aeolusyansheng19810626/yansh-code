@@ -4,7 +4,7 @@ import argparse
 from rich.console import Console
 import agent
 from agent import (
-    classify_input, chat, run, compress_history, show_context, clear_history,
+    classify_input, chat, run, compress_history, show_context, clear_history, maybe_compress_history,
     get_latest_snapshot, restore_snapshot, cleanup_snapshot, show_recent_logs,
     detect_project_type, _PROJECT_TYPE, _PROJECT_TEST_CMD, _LOG_DIR
 )
