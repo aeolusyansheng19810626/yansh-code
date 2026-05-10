@@ -1,6 +1,6 @@
 """#23 路径校验 + #24 危险命令拦截 测试"""
 import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
 import tools
 

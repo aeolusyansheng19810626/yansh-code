@@ -23,6 +23,11 @@ QUALITY_CASCADE = [TIER_TOP, TIER_UPPER_MID, TIER_MID, TIER_LOW, TIER_DEBUG]
 MAX_ATTEMPTS = 3
 WORKSPACE_DIR = "workspace"
 
+# ---------- #62 Token 价格配置 (按 Groq llama-4-scout) ----------
+# 按 $1M Tokens 计算
+TOKEN_PRICE_INPUT  = 0.20  # $0.20 / 1M input tokens
+TOKEN_PRICE_OUTPUT = 0.60  # $0.60 / 1M output tokens
+
 # ---------- #43 项目级配置文件 ----------
 
 _CONFIG_FILE = Path(WORKSPACE_DIR) / ".yansh" / "config.json"
@@ -35,6 +40,7 @@ _DEFAULTS = {
     "safe_mode": True,
     "compress_threshold": 6000,
     "keep_recent_turns": 3,
+    "human_in_loop": os.getenv("HUMAN_IN_LOOP", "false").lower() == "true",
 }
 
 _effective_config: dict = dict(_DEFAULTS)

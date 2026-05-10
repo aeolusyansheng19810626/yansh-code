@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 import shutil
 import threading
@@ -8,12 +9,24 @@ from datetime import datetime
 from openai import OpenAI
 from rich.console import Console
 from pathlib import Path
-from config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL, QUALITY_CASCADE, WORKSPACE_DIR, get_config
-from tools import write_file, read_file, execute_command, list_files, replace_in_file, get_symbol_definition, search_in_files, move_file, apply_patch, list_symbols, replace_symbol
+from config import (
+    OPENROUTER_API_KEY, OPENROUTER_BASE_URL, QUALITY_CASCADE, WORKSPACE_DIR, get_config,
+    TOKEN_PRICE_INPUT, TOKEN_PRICE_OUTPUT
+)
+from tools import (
+    write_file, read_file, execute_command, list_files, replace_in_file,
+    get_symbol_definition, search_in_files, move_file, apply_patch,
+    list_symbols, replace_symbol, fetch_webpage, search_docs, append_to_file,
+    find_references
+)
 import interrupt
 import tools as _tools_mod
 
 console = Console()
+
+# #62 Token 统计
+_session_tokens = {"prompt": 0, "completion": 0}
+_last_request_tokens = {"prompt": 0, "completion": 0}
 
 # #40 批处理模式标志
 _BATCH_MODE = False
@@ -23,10 +36,11 @@ _last_task_log: dict = {}  # 最近一次任务日志，供 --json 输出
 _PROJECT_TYPE = None
 _PROJECT_TEST_CMD = None
 
-# #37 快照 / #38 日志 目录
+# #37 快照 / #38 日志 / #61 回放 目录
 _YANSH_DIR     = Path(WORKSPACE_DIR) / ".yansh"
 _SNAPSHOT_DIR  = _YANSH_DIR / "snapshots"
 _LOG_DIR       = _YANSH_DIR / "logs"
+_REPLAY_DIR    = _YANSH_DIR / "replay"
 
 # #38 当前任务日志状态（模块级，_run() 期间填充）
 _current_task_log: dict = {}
@@ -39,10 +53,262 @@ MAX_HISTORY = 20
 CHAT_CONTEXT_ROUNDS = 5
 COMPRESS_MODEL = "meta-llama/llama-3.1-8b-instant"
 
+# #57 session 级别上下文文件
+_context_files: dict = {}  # {display_path: content}
+_MAX_CONTEXT_FILE_SIZE = 100 * 1024  # 100KB
+
+# #58 HIL（人工介入）本轮"全部接受"标志，每次 _run() 开始时重置
+_HIL_AUTO_ACCEPT = False
+
+# #50 多模态视觉：当前轮次待注入的图片，plan()/chat() 消费后清空
+_pending_images: list = []
+
 
 def _cfg(key):
     """读取生效配置值"""
     return get_config().get(key)
+
+
+def _load_context_file(raw_path: str):
+    """将文件加载到 _context_files，含大小和文本格式校验。"""
+    global _context_files
+    p = Path(raw_path)
+    if not p.is_absolute():
+        p = (Path(os.getcwd()) / p).resolve()
+    else:
+        p = p.resolve()
+
+    if not p.exists() or not p.is_file():
+        console.print(f"[上下文] 文件不存在: {raw_path}", style="yellow", highlight=False)
+        return
+
+    if p.stat().st_size > _MAX_CONTEXT_FILE_SIZE:
+        console.print(f"[上下文] 文件过大（>100KB），已跳过: {raw_path}", style="yellow", highlight=False)
+        return
+
+    try:
+        content = p.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        console.print(f"[上下文] 非文本文件，已跳过: {raw_path}", style="yellow", highlight=False)
+        return
+    except Exception as e:
+        console.print(f"[上下文] 读取失败: {raw_path} ({e})", style="red", highlight=False)
+        return
+
+    try:
+        display_path = str(p.relative_to(Path(os.getcwd())))
+    except ValueError:
+        display_path = str(p)
+
+    lines = content.count("\n") + 1
+    _context_files[display_path] = content
+    console.print(f"✓ 已加载: {display_path} ({lines} 行)", highlight=False)
+
+
+def _parse_context_cmds(user_input: str) -> str:
+    """解析 @add_file <path> 和 @clear_files，更新 _context_files，返回去除指令后的文本。"""
+    import re
+    global _context_files
+
+    if "@clear_files" in user_input:
+        _context_files.clear()
+        console.print("[上下文] 已清空所有上下文文件", highlight=False)
+        user_input = re.sub(r"@clear_files\b", "", user_input).strip()
+
+    pattern = r'@add_file\s+(?:"([^"]+)"|\'([^\']+)\'|(\S+))'
+    for m in re.finditer(pattern, user_input):
+        raw_path = m.group(1) or m.group(2) or m.group(3)
+        _load_context_file(raw_path)
+    user_input = re.sub(pattern, "", user_input).strip()
+    return user_input
+
+
+def _get_context_files_block() -> str:
+    """构建上下文文件注入块。"""
+    if not _context_files:
+        return ""
+    parts = ["=== 附加上下文文件 ==="]
+    for path, content in _context_files.items():
+        parts.append(f"--- 文件: {path} ---")
+        parts.append(content)
+    return "\n".join(parts)
+
+
+# ---------- #50 多模态视觉 ----------
+
+def _process_pil_image(img, display: str) -> dict:
+    """将 PIL Image 转为 base64 PNG dict，超过 2048px 时自动缩放。"""
+    import base64, io
+    MAX_SIDE = 2048
+    orig_w, orig_h = img.size
+    if max(orig_w, orig_h) > MAX_SIDE:
+        ratio = MAX_SIDE / max(orig_w, orig_h)
+        new_w = max(1, int(orig_w * ratio))
+        new_h = max(1, int(orig_h * ratio))
+        from PIL import Image
+        img = img.resize((new_w, new_h), Image.LANCZOS)
+        console.print(f"[图片] 已缩放: {orig_w}x{orig_h} → {new_w}x{new_h}", highlight=False)
+    final_w, final_h = img.size
+    if img.mode not in ('RGB', 'RGBA', 'L'):
+        img = img.convert('RGBA')
+    buf = io.BytesIO()
+    img.save(buf, format='PNG')
+    b64 = base64.b64encode(buf.getvalue()).decode('ascii')
+    console.print(f"✓ 已加载图片: {display} ({final_w}x{final_h} px)", highlight=False)
+    return {"base64": b64, "mime_type": "image/png", "width": final_w, "height": final_h, "source": display}
+
+
+def _load_image_file(path_str: str) -> dict:
+    """从本地路径加载图片，超大自动缩放。支持 PNG/JPEG/GIF/WEBP。"""
+    try:
+        from PIL import Image
+    except ImportError:
+        return {"error": "需要安装 Pillow: pip install Pillow>=10.0.0"}
+    p = Path(path_str)
+    if not p.is_absolute():
+        p = (Path(os.getcwd()) / p).resolve()
+    else:
+        p = p.resolve()
+    if not p.exists() or not p.is_file():
+        return {"error": f"文件不存在: {path_str}"}
+    if p.suffix.lower() not in {'.png', '.jpg', '.jpeg', '.gif', '.webp'}:
+        return {"error": f"不支持的图片格式: {p.suffix}，支持 PNG/JPEG/GIF/WEBP"}
+    try:
+        img = Image.open(str(p))
+        img.load()
+        try:
+            img.seek(0)  # GIF 取第一帧
+        except (AttributeError, EOFError):
+            pass
+        img = img.copy()
+    except Exception as e:
+        return {"error": f"图片读取失败: {e}"}
+    try:
+        display = str(p.relative_to(Path(os.getcwd())))
+    except ValueError:
+        display = p.name
+    return _process_pil_image(img, display)
+
+
+def _load_image_url(url: str) -> dict:
+    """从 URL 下载图片并处理。"""
+    try:
+        from PIL import Image
+    except ImportError:
+        return {"error": "需要安装 Pillow: pip install Pillow>=10.0.0"}
+    try:
+        import requests, io as _io
+        resp = requests.get(url, timeout=15)
+        resp.raise_for_status()
+        if len(resp.content) > 20 * 1024 * 1024:
+            return {"error": "图片文件过大（>20MB）"}
+        img = Image.open(_io.BytesIO(resp.content))
+        img = img.copy()
+    except Exception as e:
+        return {"error": f"图片下载失败: {url} ({e})"}
+    result = _process_pil_image(img, url)
+    return result
+
+
+def _load_clipboard_image() -> dict:
+    """从剪贴板读取图片（Windows via PIL.ImageGrab）。"""
+    try:
+        from PIL import ImageGrab
+    except ImportError:
+        return {"error": "需要安装 Pillow: pip install Pillow>=10.0.0"}
+    try:
+        img = ImageGrab.grabclipboard()
+    except Exception as e:
+        return {"error": f"读取剪贴板失败: {e}"}
+    if img is None:
+        return {"error": "剪贴板中没有图片，请先截图或复制图片"}
+    return _process_pil_image(img, "clipboard")
+
+
+def _parse_image_cmds(user_input: str):
+    """解析 @image <路径/URL> 和 @paste，返回 (清理后文本, 图片列表)。"""
+    import re
+    images = []
+    if "@paste" in user_input:
+        result = _load_clipboard_image()
+        if "error" in result:
+            console.print(f"[图片] {result['error']}", style="yellow", highlight=False)
+        else:
+            images.append(result)
+        user_input = re.sub(r"@paste\b", "", user_input)
+    pattern = r'@image\s+(?:"([^"]+)"|\'([^\']+)\'|(\S+))'
+    for m in re.finditer(pattern, user_input):
+        raw = m.group(1) or m.group(2) or m.group(3)
+        if raw.startswith(("http://", "https://")):
+            result = _load_image_url(raw)
+        else:
+            result = _load_image_file(raw)
+        if "error" in result:
+            console.print(f"[图片] {result['error']}", style="yellow", highlight=False)
+        else:
+            images.append(result)
+    user_input = re.sub(pattern, "", user_input).strip()
+    return user_input, images
+
+
+def _build_vision_content(text: str, images: list) -> list:
+    """构造 OpenAI vision content 数组：图片在前，文字在后。"""
+    content = []
+    for img in images:
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{img['mime_type']};base64,{img['base64']}"}
+        })
+    content.append({"type": "text", "text": text})
+    return content
+
+
+def _process_at_files(user_input):
+    """解析 @filename 语法并注入文件内容"""
+    import re
+    from tools import _validate_path
+    
+    # 匹配 @文件名（支持路径字符，但不包含空格）
+    # 排除结尾的标点符号
+    pattern = r"@([\w\.\-/]+)"
+    matches = re.finditer(pattern, user_input)
+    
+    injected_texts = []
+    found_files = []
+    
+    for m in matches:
+        filename = m.group(1)
+        resolved, err = _validate_path(filename)
+        if err:
+            console.print(f"[警告] 注入文件失败: {filename} ({err['error']})", style="yellow")
+            continue
+        
+        if not resolved.exists() or not resolved.is_file():
+            console.print(f"[警告] 注入文件不存在: {filename}", style="yellow")
+            continue
+            
+        try:
+            content = resolved.read_text(encoding="utf-8", errors="replace")
+            # 简单的语言识别
+            ext = resolved.suffix[1:] if resolved.suffix else "text"
+            lang_map = {"py": "python", "js": "javascript", "ts": "typescript", "html": "html", "css": "css", "md": "markdown", "json": "json"}
+            lang = lang_map.get(ext, ext)
+            
+            injected_texts.append(f"\n[文件上下文: {filename}]\n```{lang}\n{content}\n```")
+            found_files.append(filename)
+        except Exception as e:
+            console.print(f"[错误] 读取注入文件失败: {filename} ({e})", style="red")
+
+    if not found_files:
+        return user_input
+
+    # 检查 token 阈值警告
+    total_len = sum(len(t) for t in injected_texts) + len(user_input)
+    threshold = _cfg("compress_threshold") or 6000
+    if total_len > threshold:
+        console.print(f"[警告] 本次请求注入内容较多 ({total_len} 字符)，可能导致上下文提前压缩。", style="yellow")
+
+    return user_input + "\n" + "\n".join(injected_texts)
 
 
 def set_batch_mode(enabled: bool, json_output: bool = False):
@@ -200,13 +466,115 @@ def clear_history():
         pass
     console.print("[上下文已清除]", highlight=False)
 
+
+# ---------- #61 失败案例回放包 ----------
+
+def create_replay_package(failure_reason):
+    """当任务失败时，自动打包现场供回放调试"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    replay_dir = _REPLAY_DIR / f"replay_{timestamp}"
+    replay_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 1. 完整对话历史
+    (replay_dir / "conversation.json").write_text(
+        json.dumps(conversation_history, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
+    
+    # 2. workspace 快照
+    snap_dir = replay_dir / "workspace_snapshot"
+    snap_dir.mkdir()
+    for root, _, files in os.walk(WORKSPACE_DIR):
+        if any(p in root for p in (".git", ".yansh", "__pycache__", "venv", "node_modules")):
+            continue
+        for f in files:
+            src = Path(root) / f
+            rel = src.relative_to(WORKSPACE_DIR)
+            dst = snap_dir / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copy2(str(src), str(dst))
+            except Exception:
+                pass
+                
+    # 3. 复制 agent 日志 (最近一个)
+    if _LOG_DIR.exists():
+        logs = sorted(_LOG_DIR.glob("*.jsonl"), reverse=True)
+        if logs:
+            shutil.copy2(str(logs[0]), str(replay_dir / "agent.log"))
+            
+    # 4. 元数据
+    meta = {
+        "failure_reason": failure_reason,
+        "timestamp": timestamp,
+        "model": QUALITY_CASCADE[0] if QUALITY_CASCADE else "unknown",
+        "tokens": _session_tokens.copy()
+    }
+    (replay_dir / "meta.json").write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
+    
+    console.print(f"\n💾 [bold]失败案例已保存[/bold]: replay/{replay_dir.name}", highlight=False)
+    return replay_dir.name
+
+def list_replays():
+    """列出所有回放包"""
+    if not _REPLAY_DIR.exists():
+        console.print("无回放包", highlight=False)
+        return
+    dirs = sorted([d for d in _REPLAY_DIR.iterdir() if d.is_dir()], reverse=True)
+    if not dirs:
+        console.print("无回放包", highlight=False)
+        return
+    for d in dirs:
+        meta_file = d / "meta.json"
+        reason = "未知原因"
+        if meta_file.exists():
+            try:
+                reason = json.loads(meta_file.read_text(encoding="utf-8")).get("failure_reason", reason)
+            except Exception: pass
+        console.print(f"- {d.name} | {reason[:40]}", highlight=False)
+
+def load_replay(replay_id):
+    """加载回放包的对话历史"""
+    target = _REPLAY_DIR / replay_id
+    if not target.exists():
+        # 尝试模糊匹配 (replay_YYYYMMDD_HHMMSS)
+        target = _REPLAY_DIR / f"replay_{replay_id}"
+        if not target.exists():
+            console.print(f"[错误] 回放包 {replay_id} 不存在", style="red")
+            return
+            
+    conv_file = target / "conversation.json"
+    if not conv_file.exists():
+        console.print("[错误] 回放包中未找到历史记录", style="red")
+        return
+        
+    try:
+        global conversation_history
+        conversation_history = json.loads(conv_file.read_text(encoding="utf-8"))
+        save_history()
+        console.print(f"[成功] 已加载回放包 {target.name} 的对话历史 (共 {len(conversation_history)//2} 轮)", highlight=False)
+    except Exception as e:
+        console.print(f"[错误] 加载失败: {e}", style="red")
+
 # ---------- #37 快照 / 回滚 ----------
 
 def create_snapshot(file_list):
-    """备份 file_list 中在 workspace 已存在的文件，返回快照目录（无文件可备份时返回 None）"""
+    """备份 file_list 中在 workspace 已存在的文件，记录完整文件列表用于回滚，返回快照目录"""
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     snap_dir = _SNAPSHOT_DIR / timestamp
     snap_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 记录当前 workspace 所有文件列表，用于恢复时删除新建文件
+    workspace_files = []
+    for root, _, files in os.walk(WORKSPACE_DIR):
+        if ".git" in root: continue
+        for filename in files:
+            rel_path = os.path.relpath(os.path.join(root, filename), WORKSPACE_DIR)
+            workspace_files.append(rel_path.replace("\\", "/"))
+
     backed = []
     for filename in file_list:
         src = Path(WORKSPACE_DIR) / filename
@@ -215,21 +583,26 @@ def create_snapshot(file_list):
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(str(src), str(dst))
             backed.append(filename)
-    if not backed:
-        snap_dir.rmdir()
-        return None
+    
+    # 如果没有任何备份且没有任何文件（极少见），也要记录 meta
     (snap_dir / "meta.json").write_text(
-        json.dumps({"files": backed, "timestamp": timestamp}, ensure_ascii=False),
+        json.dumps({
+            "files": backed, 
+            "workspace_files": workspace_files, 
+            "timestamp": timestamp
+        }, ensure_ascii=False),
         encoding="utf-8"
     )
     return snap_dir
 
 def restore_snapshot(snap_dir):
-    """从快照目录恢复文件，返回恢复数量"""
+    """从快照目录恢复文件，并删除快照后新建的文件，返回恢复数量"""
     meta_file = snap_dir / "meta.json"
     if not meta_file.exists():
         return 0
     meta = json.loads(meta_file.read_text(encoding="utf-8"))
+    
+    # 1. 恢复备份的文件
     restored = 0
     for filename in meta.get("files", []):
         src = snap_dir / filename
@@ -238,6 +611,25 @@ def restore_snapshot(snap_dir):
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(str(src), str(dst))
             restored += 1
+            
+    # 2. 删除快照后新建的文件
+    workspace_files_then = set(meta.get("workspace_files", []))
+    current_files = []
+    for root, _, files in os.walk(WORKSPACE_DIR):
+        if ".git" in root: continue
+        for filename in files:
+            rel_path = os.path.relpath(os.path.join(root, filename), WORKSPACE_DIR)
+            current_files.append(rel_path.replace("\\", "/"))
+            
+    for f in current_files:
+        if f not in workspace_files_then:
+            path = Path(WORKSPACE_DIR) / f
+            try:
+                if path.exists():
+                    path.unlink()
+            except Exception:
+                pass
+                
     return restored
 
 def cleanup_snapshot(snap_dir):
@@ -342,14 +734,137 @@ def _show_diff(filename, old_str, new_str):
         else:
             console.print(line, highlight=False)
 
+# ---------- #58 HIL（人工介入编辑）----------
+
+def _detect_editor():
+    """返回可用编辑器命令列表。Windows 优先 VS Code，其次 notepad；Unix 读 $VISUAL/$EDITOR，否则 vi。"""
+    import shutil
+    if sys.platform == "win32":
+        if shutil.which("code"):
+            return ["code", "--wait"]
+        return ["notepad"]
+    for var in ("VISUAL", "EDITOR"):
+        val = os.environ.get(var)
+        if val:
+            return val.split()
+    return ["vi"]
+
+
+def _build_diff_lines(filename, old_content, new_content, is_new_file=False):
+    """生成 unified diff 行列表。超过 50 行时截断（头30 + 尾10）。"""
+    old_lines = [] if is_new_file else old_content.splitlines(keepends=True)
+    new_lines = new_content.splitlines(keepends=True)
+    from_file = "新建文件" if is_new_file else f"a/{filename}"
+    diff = list(difflib.unified_diff(
+        old_lines, new_lines,
+        fromfile=from_file, tofile=f"b/{filename}", lineterm=""
+    ))
+    if len(diff) > 50:
+        omitted = len(diff) - 40
+        diff = diff[:30] + [f"...已截断，共 {len(diff)} 行变更，省略 {omitted} 行..."] + diff[-10:]
+    return diff
+
+
+def _print_diff_colored(diff_lines):
+    """彩色输出 diff 行列表。"""
+    for line in diff_lines:
+        if line.startswith("---") or line.startswith("+++"):
+            console.print(line, style="bold", highlight=False)
+        elif line.startswith("-"):
+            console.print(line, style="red", highlight=False)
+        elif line.startswith("+"):
+            console.print(line, style="green", highlight=False)
+        elif line.startswith("@@"):
+            console.print(line, style="cyan", highlight=False)
+        elif line.startswith("..."):
+            console.print(line, style="yellow", highlight=False)
+        else:
+            console.print(line, highlight=False)
+
+
+def _hil_confirm(filename, old_content, new_content, is_new_file=False):
+    """展示 diff 并询问用户处理方式。
+    返回 (accept: bool, final_content: str)。
+    选 'a' 时设置 _HIL_AUTO_ACCEPT = True，后续不再询问。
+    """
+    global _HIL_AUTO_ACCEPT
+    if _HIL_AUTO_ACCEPT:
+        return True, new_content
+
+    diff_lines = _build_diff_lines(filename, old_content, new_content, is_new_file)
+    if not diff_lines:
+        return True, new_content
+
+    label = "新建文件" if is_new_file else "修改文件"
+    console.print(f"\n[HIL] {label}: {filename}", highlight=False)
+    _print_diff_colored(diff_lines)
+    console.print("\n[y] 接受  [n] 拒绝  [e] 编辑后接受  [a] 全部接受（本轮）  ?", highlight=False)
+
+    try:
+        answer = _prompt("").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        answer = "n"
+
+    if answer == "a":
+        _HIL_AUTO_ACCEPT = True
+        return True, new_content
+    if answer == "e":
+        import tempfile
+        suffix = Path(filename).suffix or ".txt"
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=suffix, delete=False, encoding="utf-8"
+        ) as tf:
+            tf.write(new_content)
+            tmp_path = tf.name
+        try:
+            import subprocess as _sp
+            _sp.call(_detect_editor() + [tmp_path])
+            edited = Path(tmp_path).read_text(encoding="utf-8")
+        except Exception as e:
+            console.print(f"[HIL] 编辑器错误: {e}", style="red", highlight=False)
+            edited = new_content
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+        return True, edited
+    if answer == "n":
+        console.print(f"[HIL] 已跳过: {filename}", highlight=False)
+        return False, new_content
+    return True, new_content
+
+
 # ---------- #26 Linter ----------
 
 def run_linter():
-    """静默运行 ruff check，有错误返回结果 dict，否则返回 None"""
+    """根据 _PROJECT_TYPE 运行对应的 Linter，有错误返回结果 dict，否则返回 None"""
     import shutil
-    if not shutil.which("ruff"):
+    if not _PROJECT_TYPE:
         return None
-    result = execute_command("ruff check .")
+    
+    cmd = None
+    if _PROJECT_TYPE == "Python":
+        if shutil.which("ruff"):
+            cmd = "ruff check ."
+        elif shutil.which("mypy"):
+            cmd = "mypy ."
+        else:
+            import sys
+            cmd = f'"{sys.executable}" -m ruff check .'
+    elif _PROJECT_TYPE == "Node.js":
+        cmd = "npm run lint --if-present"
+    elif _PROJECT_TYPE == "Go":
+        if shutil.which("go"):
+            cmd = "go vet ./..."
+    elif _PROJECT_TYPE == "Rust":
+        if shutil.which("cargo"):
+            cmd = "cargo clippy"
+    elif _PROJECT_TYPE == "Java/Maven":
+        if shutil.which("mvn"):
+            cmd = "mvn checkstyle:check"
+            
+    if not cmd:
+        return None
+        
+    result = execute_command(cmd)
     if result.get("returncode", 0) == 0:
         return None
     return result
@@ -535,6 +1050,64 @@ TOOLS = [
                 "required": ["symbol_name", "new_code", "file_path"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_webpage",
+            "description": "读取网页内容，提取正文文本，截断到3000字符。用于查询外部API文档等。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "要读取的网页URL"}
+                },
+                "required": ["url"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_docs",
+            "description": "使用 DuckDuckGo 搜索文档，返回前3条结果的标题+摘要+URL",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "搜索关键词"}
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "append_to_file",
+            "description": "向指定文件末尾追加内容",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filename": {"type": "string", "description": "文件名（相对于workspace）"},
+                    "content": {"type": "string", "description": "要追加的内容"}
+                },
+                "required": ["filename", "content"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_references",
+            "description": "在指定目录下递归搜索所有 .py 文件中的符号引用（排除定义行）",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string", "description": "要查找的符号名称"},
+                    "path": {"type": "string", "description": "搜索起始路径（相对于workspace，默认 \".\"）"}
+                },
+                "required": ["symbol"]
+            }
+        }
     }
 ]
 
@@ -568,7 +1141,35 @@ def call_llm(messages, tools=None, tool_choice=None, response_format=None):
 
     if result_holder[0] is None:
         raise RuntimeError(f"所有模型调用均失败: {exc_holder[0]}")
-    return result_holder[0]
+    
+    # #62 统计 Token
+    res = result_holder[0]
+    if hasattr(res, "usage") and res.usage:
+        p = res.usage.prompt_tokens
+        c = res.usage.completion_tokens
+        _last_request_tokens["prompt"] = p
+        _last_request_tokens["completion"] = c
+        _session_tokens["prompt"] += p
+        _session_tokens["completion"] += c
+
+    return res
+
+
+def show_stats():
+    """📊 显示 Token 消耗统计"""
+    p_last = _last_request_tokens["prompt"]
+    c_last = _last_request_tokens["completion"]
+    p_total = _session_tokens["prompt"]
+    c_total = _session_tokens["completion"]
+    total = p_total + c_total
+    
+    # 费用计算 (per 1M tokens)
+    cost = (p_total / 1_000_000 * TOKEN_PRICE_INPUT) + (c_total / 1_000_000 * TOKEN_PRICE_OUTPUT)
+    
+    console.print("\n📊 [bold]Token 消耗统计[/bold]", highlight=False)
+    console.print(f"  本次请求: prompt={p_last:,}  completion={c_last:,}", highlight=False)
+    console.print(f"  会话累计: prompt={p_total:,}  completion={c_total:,}  total={total:,}", highlight=False)
+    console.print(f"  预估费用: [green]${cost:.4f}[/green] (按 ${TOKEN_PRICE_INPUT}/1M input, ${TOKEN_PRICE_OUTPUT}/1M output)", highlight=False)
 
 
 _ARCHITECT_ROLE = """【角色：架构师 Agent】
@@ -581,14 +1182,65 @@ _CODER_ROLE = """【角色：码农 Agent】
 职责：严格按计划执行，不自行发挥额外功能；注重代码质量和边界处理；已有文件用 replace_in_file 精确修改，不得整体重写。
 """
 
+_REVIEWER_ROLE = """【角色：代码审查 Agent】
+你专注于审查已生成的代码。
+职责：检查代码是否满足原始需求，是否存在潜在的边界漏洞，以及是否符合项目规则。
+输入：本次修改的文件内容和原始需求。
+输出：必须严格返回 JSON 格式，包含 "approved" (bool), "issues" (字符串数组), "suggestions" (字符串数组)。
+"""
+
 _TESTER_ROLE = """【角色：测试 Agent】
 你专注于分析测试失败原因并指导修复。
 职责：只关注测试结果和错误信息；给出精准、最小化的修复建议；避免引入不相关改动。
 """
 
+def _get_project_rules():
+    rules_path = Path(WORKSPACE_DIR) / ".agent_rules"
+    if rules_path.exists():
+        try:
+            content = rules_path.read_text(encoding="utf-8").strip()
+            if content:
+                return f"\n项目规则：\n{content}\n"
+        except Exception:
+            pass
+    return ""
+
 def plan(requirement):
     """制定计划：生成文件列表和测试命令"""
     import platform
+
+    def _get_project_rules():
+        rules_path = Path(WORKSPACE_DIR) / ".agent_rules"
+        if rules_path.exists():
+            try:
+                content = rules_path.read_text(encoding="utf-8").strip()
+                if content:
+                    return f"\n项目规则：\n{content}\n"
+            except Exception:
+                pass
+        return ""
+
+    def _generate_tree():
+        ws = Path(WORKSPACE_DIR)
+        ignore_dirs = {".git", "__pycache__", "node_modules", ".yansh", ".pytest_cache", "venv"}
+        def walk(path, prefix="", level=0):
+            if level > 2:
+                return []
+            lines = []
+            try:
+                entries = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name))
+            except PermissionError:
+                return []
+            entries = [e for e in entries if e.name not in ignore_dirs]
+            for i, entry in enumerate(entries):
+                is_last = i == len(entries) - 1
+                marker = "└── " if is_last else "├── "
+                lines.append(f"{prefix}{marker}{entry.name}")
+                if entry.is_dir():
+                    ext = "    " if is_last else "│   "
+                    lines.extend(walk(entry, prefix + ext, level + 1))
+            return lines
+        return "当前项目结构：\n" + "\n".join(walk(ws)) + "\n"
 
     # 检测系统并生成命令提示
     system_name = platform.system()
@@ -598,6 +1250,8 @@ def plan(requirement):
         cmd_hint = "当前运行环境是 Linux/Mac，使用 Unix 命令：查看文件用 cat，列目录用 ls。"
 
     # 先获取当前 workspace 文件结构，注入到 LLM 上下文中避免重复创建
+    tree_output = _generate_tree()
+    project_rules = _get_project_rules()
     ws_files = list_files()
     files_list = "\n".join(f"- {f}" for f in ws_files.get("files", []))
     project_hint = (
@@ -605,7 +1259,7 @@ def plan(requirement):
         if _PROJECT_TYPE else ""
     )
     console.print("[Agent: Architect]", highlight=False)
-    system_prompt = f"""{_ARCHITECT_ROLE}
+    system_prompt = f"""{_ARCHITECT_ROLE}{project_rules}
 你是一个代码规划助手。根据用户需求，返回JSON格式的计划，包含：
 - files：数组，每个元素为 {{"filename": "文件名", "description": "修改意图/需求说明"}}；对于已有文件只需填写修改意图，不要重复列出完整内容
 - test_command：测试命令
@@ -616,16 +1270,31 @@ test_command 禁止使用 python -c 内联执行（会被安全策略拦截）�
 
 {cmd_hint}{project_hint}
 
-当前workspace已有文件：
+{tree_output}
+
+当前workspace已有文件列表：
 {files_list if files_list else "(空)"}
 
 注意：不要重复创建已有文件，尽量基于已有文件做增量修改。对已有文件只描述要追加/修改什么。"""
+    # #50 若有待注入图片，构造 vision content（消费后清空）
+    user_text = f"需求：{requirement}"
+    if _pending_images:
+        user_content = _build_vision_content(user_text, _pending_images)
+        _pending_images.clear()
+    else:
+        user_content = user_text
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": f"需求：{requirement}"}
+        {"role": "user", "content": user_content}
     ]
     response = call_llm(messages, response_format={"type": "json_object"})
-    return json.loads(response.choices[0].message.content)
+    content = response.choices[0].message.content
+    if not content:
+        content = "{}"
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        return {"files": [], "test_command": ""}
 
 def code(plan, mode="auto"):
     """根据计划逐个文件生成/修改代码。文件已存在优先用replace_in_file做精确修改；不存在则用write_file新建。"""
@@ -669,6 +1338,7 @@ def code(plan, mode="auto"):
             console.print(f"{filename} 已存在，读取现有内容进行增量修改...")
 
             sys_prompt = f"""{_CODER_ROLE}
+{_get_project_rules()}
 你是一个代码修改助手。对已有文件进行精确修改。
 
 可用操作：
@@ -718,7 +1388,20 @@ def code(plan, mode="auto"):
             if response_message.tool_calls:
                 for tool_call in response_message.tool_calls:
                     func_name = tool_call.function.name
-                    func_args = json.loads(tool_call.function.arguments)
+                    args_str = tool_call.function.arguments
+                    if not args_str:
+                        args_str = "{}"
+                    try:
+                        func_args = json.loads(args_str)
+                    except json.JSONDecodeError as e:
+                        console.print(f"[警告] 工具调用参数解析失败: {e}", highlight=False)
+                        msgs.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "name": func_name,
+                            "content": json.dumps({"error": f"Invalid JSON in arguments: {str(e)}"}, ensure_ascii=False)
+                        })
+                        continue
 
                     if func_name == "write_file":
                         fname = func_args.get("filename", "")
@@ -729,7 +1412,21 @@ def code(plan, mode="auto"):
                                 break
                         import os as _os2
                         overwrite = _os2.path.exists(_os2.path.join(WORKSPACE_DIR, fname))
-                        if mode == "auto" and overwrite:
+                        hil_on = _cfg("human_in_loop") and not _BATCH_MODE
+                        if hil_on:
+                            old_content = ""
+                            if overwrite:
+                                _r = read_file(fname)
+                                old_content = _r.get("content", "") if "error" not in _r else ""
+                            new_content = func_args.get("content", "")
+                            accept, final_content = _hil_confirm(fname, old_content, new_content, not overwrite)
+                            if not accept:
+                                result = {"error": "用户已跳过此写入"}
+                            else:
+                                func_args["content"] = final_content
+                                result = write_file(**func_args)
+                                console.print(f"写入{'(覆盖)' if overwrite else ''} {fname}")
+                        elif mode == "auto" and overwrite:
                             confirm = _prompt(f"write_file 将覆盖已有文件 {fname}，确认？(y/n) ")
                             if confirm != "y":
                                 result = {"error": "用户已跳过文件覆盖"}
@@ -744,24 +1441,44 @@ def code(plan, mode="auto"):
                     elif func_name == "read_file":
                         result = read_file(**func_args)
                     elif func_name == "replace_in_file":
-                        _show_diff(
-                            func_args.get("filename", ""),
-                            func_args.get("old_str", ""),
-                            func_args.get("new_str", ""),
-                        )
-                        skip = False
-                        if mode == "auto":
-                            confirm = _prompt("应用此修改？(y/n) ")
-                            if confirm != "y":
+                        hil_on = _cfg("human_in_loop") and not _BATCH_MODE
+                        rfname = func_args.get("filename", "")
+                        if hil_on:
+                            _r = read_file(rfname)
+                            old_content = _r.get("content", "") if "error" not in _r else ""
+                            old_str = func_args.get("old_str", "")
+                            new_str = func_args.get("new_str", "")
+                            new_content = old_content.replace(old_str, new_str, 1) if old_str in old_content else old_content
+                            accept, final_content = _hil_confirm(rfname, old_content, new_content)
+                            if not accept:
                                 result = {"error": "用户已跳过此修改"}
-                                skip = True
-                        if not skip:
-                            result = replace_in_file(**func_args)
-                            if "success" in result:
-                                console.print(f"replace_in_file OK: {result.get('filename')}", highlight=False)
-                                _task_files_modified.append(func_args.get("filename", ""))
                             else:
-                                console.print(f"替换失败: {result.get('error')}", highlight=False)
+                                if final_content != new_content:
+                                    result = write_file(rfname, final_content)
+                                    if "success" in result:
+                                        result = {"success": f"文件 {rfname} 替换成功", "filename": rfname}
+                                else:
+                                    result = replace_in_file(**func_args)
+                                if "success" in result:
+                                    console.print(f"replace_in_file OK: {result.get('filename')}", highlight=False)
+                                    _task_files_modified.append(rfname)
+                                else:
+                                    console.print(f"替换失败: {result.get('error')}", highlight=False)
+                        else:
+                            _show_diff(rfname, func_args.get("old_str", ""), func_args.get("new_str", ""))
+                            skip = False
+                            if mode == "auto":
+                                confirm = _prompt("应用此修改？(y/n) ")
+                                if confirm != "y":
+                                    result = {"error": "用户已跳过此修改"}
+                                    skip = True
+                            if not skip:
+                                result = replace_in_file(**func_args)
+                                if "success" in result:
+                                    console.print(f"replace_in_file OK: {result.get('filename')}", highlight=False)
+                                    _task_files_modified.append(rfname)
+                                else:
+                                    console.print(f"替换失败: {result.get('error')}", highlight=False)
                     elif func_name == "execute_command":
                         result = execute_command(**func_args)
                     elif func_name == "list_files":
@@ -789,6 +1506,14 @@ def code(plan, mode="auto"):
                         result = replace_symbol(**func_args)
                         if "success" in result:
                             _task_files_modified.append(func_args.get("file_path", ""))
+                    elif func_name == "fetch_webpage":
+                        result = fetch_webpage(**func_args)
+                    elif func_name == "search_docs":
+                        result = search_docs(**func_args)
+                    elif func_name == "append_to_file":
+                        result = append_to_file(**func_args)
+                        if "success" in result:
+                            _task_files_modified.append(func_args.get("filename", ""))
                     else:
                         result = {"error": "未预期的调用"}
 
@@ -803,6 +1528,47 @@ def code(plan, mode="auto"):
                 break
 
     console.print("代码生成/修改完成")
+
+def review(requirement, modified_files):
+    """代码审查阶段"""
+    console.print("[Agent: Reviewer]", highlight=False)
+    console.print("开始审查代码...")
+    
+    file_contents = []
+    for filename in dict.fromkeys(modified_files):
+        if not filename:
+            continue
+        content = read_file(filename).get("content", "")
+        if content:
+            file_contents.append(f"--- {filename} ---\n{content}")
+            
+    if not file_contents:
+        return {"approved": True, "issues": [], "suggestions": []}
+        
+    def _get_project_rules():
+        rules_path = Path(WORKSPACE_DIR) / ".agent_rules"
+        if rules_path.exists():
+            try:
+                content = rules_path.read_text(encoding="utf-8").strip()
+                if content:
+                    return f"\n项目规则：\n{content}\n"
+            except Exception:
+                pass
+        return ""
+        
+    sys_prompt = f"{_REVIEWER_ROLE}{_get_project_rules()}"
+    user_content = f"原始需求：{requirement}\n\n修改的文件内容：\n" + "\n\n".join(file_contents)
+    
+    messages = [
+        {"role": "system", "content": sys_prompt},
+        {"role": "user", "content": user_content}
+    ]
+    
+    response = call_llm(messages, response_format={"type": "json_object"})
+    try:
+        return json.loads(response.choices[0].message.content)
+    except Exception:
+        return {"approved": True, "issues": [], "suggestions": []}
 
 def fix(test_result, plan):
     """根据测试错误修复代码（多轮工具调用）"""
@@ -826,7 +1592,7 @@ def fix(test_result, plan):
     content = f"测试失败！\n错误输出：\n{error_info}\n\n计划：{json.dumps(plan)}"
     
     messages = [
-        {"role": "system", "content": f"{_TESTER_ROLE}\n你是代码修复助手。根据错误信息精准修复代码，优先使用 replace_in_file 做最小化修改，必要时才用 write_file 重写整个文件。"},
+        {"role": "system", "content": f"{_TESTER_ROLE}\n{_get_project_rules()}你是代码修复助手。根据错误信息精准修复代码，优先使用 replace_in_file 做最小化修改，必要时才用 write_file 重写整个文件。"},
         {"role": "user", "content": content}
     ]
     
@@ -839,7 +1605,20 @@ def fix(test_result, plan):
             console.print(f"执行 {len(response_message.tool_calls)} 个修复操作...")
             for tool_call in response_message.tool_calls:
                 func_name = tool_call.function.name
-                func_args = json.loads(tool_call.function.arguments)
+                args_str = tool_call.function.arguments
+                if not args_str:
+                    args_str = "{}"
+                try:
+                    func_args = json.loads(args_str)
+                except json.JSONDecodeError as e:
+                    console.print(f"[警告] 工具调用参数解析失败: {e}", highlight=False)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "name": func_name,
+                        "content": json.dumps({"error": f"Invalid JSON in arguments: {str(e)}"}, ensure_ascii=False)
+                    })
+                    continue
                 
                 if func_name == "write_file":
                     _fn = func_args.get("filename", "")
@@ -877,6 +1656,10 @@ def fix(test_result, plan):
                     result = replace_symbol(**func_args)
                     if "success" in result:
                         _task_files_modified.append(func_args.get("file_path", ""))
+                elif func_name == "append_to_file":
+                    result = append_to_file(**func_args)
+                    if "success" in result:
+                        _task_files_modified.append(func_args.get("filename", ""))
                 else:
                     result = {"error": "未预期的调用"}
 
@@ -918,13 +1701,37 @@ def _interrupted_result():
 
 def run(requirement, mode="auto"):
     """主运行流程。mode: auto（默认）| plan（只出计划）| code（跳过确认直接执行）"""
+    global _pending_images
+    # #57 显示已加载文件状态（处理当前指令前）
+    if _context_files:
+        console.print(f"[上下文] 已加载文件: {', '.join(_context_files.keys())}", highlight=False)
+    # #50 解析图片指令（@image / @paste）
+    requirement, _img_list = _parse_image_cmds(requirement)
+    _pending_images = _img_list
+    # #57 解析 @add_file / @clear_files，再注入 @file 语法
+    requirement = _parse_context_cmds(requirement)
+    requirement = _process_at_files(requirement)
+    ctx_block = _get_context_files_block()
+    if ctx_block:
+        requirement = requirement + "\n\n" + ctx_block
+
     try:
-        return _run(requirement, mode)
+        res = _run(requirement, mode)
+        # #61 任务失败自动保存回放
+        if not res["success"]:
+            create_replay_package(res["test_result"].get("stderr", "任务失败"))
+        return res
     except interrupt.Interrupted:
         return _interrupted_result()
+    except Exception as e:
+        # 异常退出也保存回放
+        create_replay_package(str(e))
+        raise
 
 
 def _run(requirement, mode):
+    global _HIL_AUTO_ACCEPT
+    _HIL_AUTO_ACCEPT = False  # 每轮任务重置"全部接受"标志
     original_requirement = requirement
     init_task_log(requirement, mode)
 
@@ -986,6 +1793,32 @@ def _run(requirement, mode):
     # code / auto（确认后）：生成代码 + 测试
     console.print("\n阶段2：生成代码")
     code(plan_result, mode=mode)
+    
+    # #48 Review Agent：在阶段2和阶段3之间进行代码审查
+    review_attempts = 0
+    max_review_attempts = 2
+    while review_attempts < max_review_attempts:
+        review_result = review(original_requirement, _task_files_modified)
+        if review_result.get("approved"):
+            console.print("代码审查通过！")
+            break
+        else:
+            console.print(f"代码审查未通过 (尝试 {review_attempts + 1}/{max_review_attempts})")
+            issues = review_result.get("issues", [])
+            suggestions = review_result.get("suggestions", [])
+            for issue in issues:
+                console.print(f"- 问题: {issue}", style="red")
+            for sug in suggestions:
+                console.print(f"- 建议: {sug}", style="yellow")
+            
+            # 使用 fix 逻辑修改代码
+            mock_test_result = {
+                "returncode": 1,
+                "stderr": "代码审查未通过：\n" + "\n".join(issues) + "\n建议：\n" + "\n".join(suggestions),
+                "stdout": ""
+            }
+            fix(mock_test_result, plan_result)
+            review_attempts += 1
 
     console.print("\n阶段3：测试与修复")
     attempts = 0
@@ -994,12 +1827,18 @@ def _run(requirement, mode):
 
     # #42 如果 workspace 中没有测试文件，自动生成
     ws = Path(WORKSPACE_DIR)
-    has_tests = bool(
-        [f for f in ws.rglob("test_*.py") if ".yansh" not in f.parts]
-        + [f for f in ws.rglob("*_test.py") if ".yansh" not in f.parts]
-    )
+    _ignore = {".yansh", ".git", "__pycache__", "node_modules", "venv", "workspace"}
+    has_tests = bool([
+        f for f in ws.rglob("test_*.py")
+        if not any(part in _ignore for part in f.relative_to(ws).parts)
+    ] + [
+        f for f in ws.rglob("*_test.py")
+        if not any(part in _ignore for part in f.relative_to(ws).parts)
+    ])
     if not has_tests:
         _auto_generate_tests(plan_result, _task_files_modified[:])
+
+
 
     # #26 Linter：先跑 ruff，有错误走修复循环
     linter_result = run_linter()
@@ -1090,7 +1929,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         if msg.tool_calls:
             for tc in msg.tool_calls:
                 fname = tc.function.name
-                args = json.loads(tc.function.arguments)
+                _args_str = tc.function.arguments
+                if not _args_str:
+                    _args_str = "{}"
+                try:
+                    args = json.loads(_args_str)
+                except json.JSONDecodeError:
+                    msgs.append({"tool_call_id": tc.id, "role": "tool", "name": fname,
+                                 "content": json.dumps({"error": "Invalid JSON in arguments"}, ensure_ascii=False)})
+                    continue
                 if fname == "write_file":
                     _fn = args.get("filename", "")
                     for _pfx in (WORKSPACE_DIR + "/", WORKSPACE_DIR + "\\"):
@@ -1125,20 +1972,40 @@ def classify_input(user_input):
 
 def chat(user_input):
     """闲聊模式，LLM 直接回复，控制在 100 字以内"""
+    global _pending_images
+    # #57 显示已加载文件状态（处理当前指令前）
+    if _context_files:
+        console.print(f"[上下文] 已加载文件: {', '.join(_context_files.keys())}", highlight=False)
+    # #50 解析图片指令（@image / @paste）
+    user_input, _img_list = _parse_image_cmds(user_input)
+    _pending_images = _img_list
+    # #57 解析 @add_file / @clear_files，再注入 @file 语法
+    user_input = _parse_context_cmds(user_input)
+    user_input = _process_at_files(user_input)
+    ctx_block = _get_context_files_block()
+    if ctx_block:
+        user_input = user_input + "\n\n" + ctx_block
+
     messages = [
         {"role": "system", "content": "你是一个友好的助手。简洁回复用户，控制在 100 字以内。"}
     ]
-    
+
     # 添加最近5轮历史
     messages.extend(get_recent_history())
-    
-    # 添加当前用户输入
-    messages.append({"role": "user", "content": user_input})
-    
+
+    # #50 构建 vision content（图片仅本轮携带，不存入历史）
+    user_text = user_input  # 纯文本用于历史保存
+    if _pending_images:
+        msg_content = _build_vision_content(user_input, _pending_images)
+        _pending_images = []
+    else:
+        msg_content = user_input
+    messages.append({"role": "user", "content": msg_content})
+
     response = call_llm(messages)
     assistant_reply = response.choices[0].message.content
-    
-    # 保存到历史
-    add_to_history(user_input, assistant_reply)
-    
+
+    # 保存到历史（仅文本，不含图片 base64）
+    add_to_history(user_text, assistant_reply)
+
     return assistant_reply

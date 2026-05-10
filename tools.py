@@ -183,11 +183,27 @@ def execute_command(command):
         t_out.start()
         t_err.start()
 
+        import interrupt
+        import time
+        start_time = time.time()
         try:
-            process.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            return {"error": "命令执行超时（30秒）"}
+            while True:
+                if interrupt.is_interrupted():
+                    process.terminate()
+                    process.wait(timeout=1)
+                    raise interrupt.Interrupted()
+                
+                try:
+                    process.wait(timeout=0.1)
+                    break # Finished
+                except subprocess.TimeoutExpired:
+                    if time.time() - start_time > 30:
+                        process.kill()
+                        return {"error": "命令执行超时（30秒）"}
+        except interrupt.Interrupted:
+            raise
+        except Exception as e:
+            return {"error": str(e)}
 
         t_out.join()
         t_err.join()
@@ -244,13 +260,31 @@ def replace_in_file(filename, old_str, new_str):
     except Exception as e:
         return {"error": str(e)}
 
+def _get_ignore_spec():
+    import pathspec
+    gitignore_path = Path(WORKSPACE_DIR) / ".gitignore"
+    if gitignore_path.exists():
+        try:
+            with open(gitignore_path, "r", encoding="utf-8") as f:
+                return pathspec.PathSpec.from_lines("gitwildmatch", f)
+        except Exception:
+            return None
+    return None
+
 def list_files():
-    """列出workspace目录下的所有文件"""
+    """列出workspace目录下的所有文件（遵循.gitignore）"""
     os.makedirs(WORKSPACE_DIR, exist_ok=True)
     files = []
+    spec = _get_ignore_spec()
     for root, dirs, filenames in os.walk(WORKSPACE_DIR):
+        # 跳过 .git 目录
+        if ".git" in root:
+            continue
         for filename in filenames:
             rel_path = os.path.relpath(os.path.join(root, filename), WORKSPACE_DIR)
+            # 统一使用正斜杠匹配
+            if spec and spec.match_file(rel_path.replace("\\", "/")):
+                continue
             files.append(rel_path)
     return {"files": files}
 def move_file(src, dst):
@@ -309,17 +343,21 @@ def search_in_files(pattern, workspace=None, regex=False, extensions=None):
         return {"error": "Search path exceeds workspace directory"}
     
     matches = []
-    
+    spec = _get_ignore_spec()
+
     # 递归搜索所有文件
     for file_path in workspace.rglob("*"):
         # 跳过目录
         if file_path.is_dir():
             continue
-        
+
         # 跳过 .git 目录
         if ".git" in file_path.parts:
             continue
-        
+
+        rel_path = os.path.relpath(file_path, abs_workspace).replace("\\", "/")
+        if spec and spec.match_file(rel_path):
+            continue
         # 扩展名过滤
         if extensions is not None:
             if file_path.suffix not in extensions:
@@ -450,10 +488,18 @@ def apply_patch(patch_text, file_path=None):
     for line in lines:
         m = hunk_re.match(line)
         if m:
+            old_start = int(m.group(1))
+            if old_start < 1:
+                return {"error": f"补丁行号不合法: 行号 {old_start} < 1"}
+            if old_start > len(file_lines):
+                return {"error": f"补丁行号不合法: 起始行号 {old_start} > 文件总行数 {len(file_lines)}"}
+            if m.group(2) and old_start > int(m.group(2)):
+                return {"error": f"补丁行号不合法: start ({old_start}) > end ({int(m.group(2))})"}
+
             if current is not None:
                 hunks.append(current)
             current = {
-                'old_start': int(m.group(1)) - 1,  # 转为 0-based
+                'old_start': old_start - 1,  # 转为 0-based
                 'lines': []
             }
         elif current is not None and not line.startswith(('--- ', '+++ ')):
@@ -537,6 +583,7 @@ def list_symbols(file_path):
 
 def replace_symbol(symbol_name, new_code, file_path):
     """用 tree-sitter 定位符号起止行，整体替换其实现"""
+    import textwrap
     parser, err = _load_ts_parser()
     if err:
         return err
@@ -577,9 +624,18 @@ def replace_symbol(symbol_name, new_code, file_path):
     end_line   = target.end_point[0]     # 0-based, inclusive
 
     lines = content.splitlines(keepends=True)
-    if not new_code.endswith("\n"):
-        new_code += "\n"
-    new_lines = lines[:start_line] + [new_code] + lines[end_line + 1:]
+
+    # 缩进修复
+    first_line = lines[start_line]
+    target_indent = first_line[:len(first_line) - len(first_line.lstrip())] if first_line.strip() else ""
+    
+    new_code = textwrap.dedent(new_code)
+    new_code_lines = new_code.splitlines()
+    indented_code = "".join(target_indent + line + "\n" if line.strip() else "\n" for line in new_code_lines)
+    if not indented_code.endswith("\n"):
+        indented_code += "\n"
+
+    new_lines = lines[:start_line] + [indented_code] + lines[end_line + 1:]
     try:
         resolved.write_text("".join(new_lines), encoding="utf-8")
         return {
@@ -589,3 +645,149 @@ def replace_symbol(symbol_name, new_code, file_path):
         }
     except Exception as e:
         return {"error": str(e)}
+
+def fetch_webpage(url):
+    """读取网页内容，提取正文文本，截断到3000字符"""
+    try:
+        import requests
+        from bs4 import BeautifulSoup
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+        text = soup.get_text(separator='\n', strip=True)
+        return {"content": text[:3000]}
+    except Exception as e:
+        return {"error": str(e)}
+
+def search_docs(query):
+    """搜索文档，优先使用 ddgs（duckduckgo_search 新包名），返回前3条结果的标题+摘要+URL"""
+    # 优先用新包名 ddgs
+    try:
+        from ddgs import DDGS
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=3))
+            if results:
+                return {"results": results}
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    # 兼容旧包名 duckduckgo_search
+    try:
+        from duckduckgo_search import DDGS
+        with DDGS() as ddgs:
+            results = []
+            for backend in ("api", "html", "lite"):
+                try:
+                    results = list(ddgs.text(query, max_results=3, backend=backend))
+                except Exception:
+                    pass
+                if results:
+                    break
+            if results:
+                return {"results": results}
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    # 备用：requests 直接抓 DuckDuckGo HTML
+    try:
+        import requests
+        from bs4 import BeautifulSoup
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; yansh-code/1.0)"}
+        resp = requests.get(
+            "https://html.duckduckgo.com/html/",
+            params={"q": query},
+            headers=headers,
+            timeout=10,
+        )
+        soup = BeautifulSoup(resp.text, "html.parser")
+        results = []
+        for r in soup.select(".result__body")[:3]:
+            title_el = r.select_one(".result__title")
+            snippet_el = r.select_one(".result__snippet")
+            url_el = r.select_one(".result__url")
+            results.append({
+                "title": title_el.get_text(strip=True) if title_el else "",
+                "body": snippet_el.get_text(strip=True) if snippet_el else "",
+                "href": url_el.get_text(strip=True) if url_el else "",
+            })
+        if results:
+            return {"results": results}
+    except Exception:
+        pass
+
+    return {"results": "未找到相关结果"}
+
+
+def append_to_file(filename, content):
+    """向指定文件末尾追加内容
+    - 路径校验（不能越出workspace）
+    - 写入前自动补一个换行符，避免和原有内容粘连
+    """
+    resolved, err = _validate_path(filename)
+    if err:
+        return err
+    try:
+        prefix = ""
+        if resolved.exists() and resolved.stat().st_size > 0:
+            with open(resolved, "rb") as f:
+                f.seek(-1, 2)
+                if f.read(1) != b'\n':
+                    prefix = "\n"
+
+        with open(resolved, "a", encoding="utf-8") as f:
+            f.write(prefix + content)
+
+        return {"success": f"文件 {filename} 追加成功"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def find_references(symbol, path="."):
+    """在指定目录下递归搜索所有 .py 文件中的符号引用
+    排除定义行（即包含 def symbol 或 class symbol 的行）
+    返回格式：文件路径:行号: 该行内容
+    """
+    from pathlib import Path
+    import re
+
+    resolved_root, err = _validate_path(path)
+    if err:
+        return err
+
+    # 构建排除定义的正则
+    # 匹配 def symbol, class symbol, async def symbol
+    def_pattern = re.compile(rf"\b(def|class|async\s+def)\s+{re.escape(symbol)}\b")
+    # 匹配符号引用（单词边界）
+    ref_pattern = re.compile(rf"\b{re.escape(symbol)}\b")
+
+    references = []
+
+    # 遵循 .gitignore
+    spec = _get_ignore_spec()
+    abs_workspace = Path(WORKSPACE_DIR).resolve()
+
+    for file_path in resolved_root.rglob("*.py"):
+        if ".git" in file_path.parts:
+            continue
+
+        rel_path_ws = os.path.relpath(file_path, abs_workspace).replace("\\", "/")
+        if spec and spec.match_file(rel_path_ws):
+            continue
+
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                for line_num, line in enumerate(f, start=1):
+                    # 检查是否包含符号
+                    if ref_pattern.search(line):
+                        # 排除定义行
+                        if not def_pattern.search(line):
+                            rel_path = os.path.relpath(file_path, WORKSPACE_DIR).replace("\\", "/")
+                            references.append(f"{rel_path}:{line_num}: {line.strip()}")
+        except Exception:
+            continue
+
+    return {"references": references, "total": len(references)}

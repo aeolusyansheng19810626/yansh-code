@@ -5,7 +5,7 @@ import subprocess
 import time
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
 from tools import write_file, read_file, delete_file, list_files, execute_command, replace_in_file, move_file, search_in_files
 from config import WORKSPACE_DIR
@@ -271,7 +271,147 @@ def test_search_extension_filter():
     write_file("script.py", "target_word in python")
     write_file("note.txt", "target_word in text")
     write_file("readme.md", "target_word in markdown")
-    
+
     result = search_in_files("target_word", workspace=globals()["WORKSPACE_DIR_OVERRIDE"], extensions=[".py"])
     assert result["total"] == 1
     assert result["matches"][0]["file"] == "script.py"
+
+
+# ── #58 HIL diff 生成 ──────────────────────────────────────────────────────────
+
+import agent as _agent
+
+
+def test_build_diff_lines_new_file():
+    """`is_new_file=True` 时 from 为"新建文件"，所有行为 + 开头"""
+    lines = _agent._build_diff_lines("foo.py", "", "a = 1\nb = 2\n", is_new_file=True)
+    assert any("+a = 1" in l for l in lines)
+    header_from = next((l for l in lines if l.startswith("---")), "")
+    assert "新建文件" in header_from
+
+
+def test_build_diff_lines_modify():
+    """修改场景：- 行包含旧内容，+ 行包含新内容"""
+    old = "def foo():\n    return 1\n"
+    new = "def foo():\n    return 42\n"
+    lines = _agent._build_diff_lines("bar.py", old, new)
+    assert any("-    return 1" in l for l in lines)
+    assert any("+    return 42" in l for l in lines)
+
+
+def test_build_diff_lines_no_change():
+    """内容相同时返回空列表"""
+    content = "x = 1\n"
+    lines = _agent._build_diff_lines("same.py", content, content)
+    assert lines == []
+
+
+def test_build_diff_lines_truncation():
+    """超过 50 行时截断并插入提示行"""
+    old = "\n".join(f"line{i} = {i}" for i in range(60)) + "\n"
+    new = "\n".join(f"line{i} = {i + 1}" for i in range(60)) + "\n"
+    lines = _agent._build_diff_lines("big.py", old, new)
+    assert len(lines) <= 41  # 30 + 1截断提示 + 10
+    assert any("截断" in l for l in lines)
+
+
+def test_build_diff_lines_exactly_50_no_truncation():
+    """恰好 50 行时不截断"""
+    old = "\n".join(f"a{i}" for i in range(24)) + "\n"
+    new = "\n".join(f"b{i}" for i in range(24)) + "\n"
+    lines = _agent._build_diff_lines("mid.py", old, new)
+    assert not any("截断" in l for l in lines)
+
+
+# ── #50 多模态视觉 ─────────────────────────────────────────────────────────────
+
+
+def _make_png_bytes(w, h, color="red"):
+    PIL = pytest.importorskip("PIL")
+    from PIL import Image
+    import io
+    img = Image.new("RGB", (w, h), color=color)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def test_load_image_base64():
+    """小图片 base64 编码正确：解码回 PNG 可被 PIL 打开且尺寸一致"""
+    pytest.importorskip("PIL")
+    import base64, io
+    from PIL import Image
+
+    test_dir = globals()["WORKSPACE_DIR_OVERRIDE"]
+    png_path = os.path.join(test_dir, "test_img.png")
+    with open(png_path, "wb") as f:
+        f.write(_make_png_bytes(10, 10))
+
+    result = _agent._load_image_file(png_path)
+    assert "error" not in result
+    assert result["width"] == 10
+    assert result["height"] == 10
+    assert result["mime_type"] == "image/png"
+
+    raw = base64.b64decode(result["base64"])
+    img = Image.open(io.BytesIO(raw))
+    assert img.size == (10, 10)
+
+
+def test_load_image_resize():
+    """超过 2048px 的图片自动缩放，保持比例"""
+    pytest.importorskip("PIL")
+
+    test_dir = globals()["WORKSPACE_DIR_OVERRIDE"]
+    png_path = os.path.join(test_dir, "big_img.png")
+    with open(png_path, "wb") as f:
+        f.write(_make_png_bytes(3000, 1500))
+
+    result = _agent._load_image_file(png_path)
+    assert "error" not in result
+    assert result["width"] == 2048
+    assert result["height"] == 1024
+
+
+def test_load_image_unsupported_format():
+    """不支持的格式返回 error，消息包含'不支持'"""
+    test_dir = globals()["WORKSPACE_DIR_OVERRIDE"]
+    bmp_path = os.path.join(test_dir, "test.bmp")
+    with open(bmp_path, "wb") as f:
+        f.write(b"BM fake data")
+
+    result = _agent._load_image_file(bmp_path)
+    assert "error" in result
+    assert "不支持" in result["error"]
+
+
+def test_build_vision_content():
+    """vision content 数组：图片在前、文字在后，URL 格式正确"""
+    fake_img = {
+        "base64": "abc123",
+        "mime_type": "image/png",
+        "width": 10,
+        "height": 10,
+        "source": "test.png",
+    }
+    content = _agent._build_vision_content("分析这张图", [fake_img])
+
+    assert isinstance(content, list)
+    assert len(content) == 2
+    assert content[0]["type"] == "image_url"
+    assert content[0]["image_url"]["url"] == "data:image/png;base64,abc123"
+    assert content[1]["type"] == "text"
+    assert content[1]["text"] == "分析这张图"
+
+
+def test_build_vision_content_multiple_images():
+    """多张图片时，所有图片均在文字之前"""
+    imgs = [
+        {"base64": "img1", "mime_type": "image/png", "width": 1, "height": 1, "source": "a.png"},
+        {"base64": "img2", "mime_type": "image/jpeg", "width": 1, "height": 1, "source": "b.jpg"},
+    ]
+    content = _agent._build_vision_content("对比两图", imgs)
+    assert len(content) == 3
+    assert content[0]["image_url"]["url"] == "data:image/png;base64,img1"
+    assert content[1]["image_url"]["url"] == "data:image/jpeg;base64,img2"
+    assert content[2]["text"] == "对比两图"

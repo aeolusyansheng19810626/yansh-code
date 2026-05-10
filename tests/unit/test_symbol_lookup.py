@@ -1,6 +1,6 @@
 """#29 get_symbol_definition 测试"""
 import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
 import tools
 from pathlib import Path
@@ -31,10 +31,10 @@ class ChildClass(MyClass):
         return super().method_one() + 1
 '''
 
-def setup_module(module):
+def setup():
     tools.write_file(_FIXTURE, _FIXTURE_SRC)
 
-def teardown_module(module):
+def teardown():
     tools.delete_file(_FIXTURE)
 
 # ---------- 基础查找 ----------

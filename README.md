@@ -2,25 +2,20 @@
 
 基于 LLM（DeepSeek）的自动化代码生成与测试 CLI 工具。
 
-通过 ReAct 循环自动完成：需求分析 → 生成代码 → 执行测试 → 错误修复。
+通过 ReAct 循环自动完成：需求分析 → 生成代码 → 代码审查 → 自动测试 → 错误修复。
 
 ## ✨ 功能特性
 
-- 🎭 **多 Agent 角色**：三个专职 Agent 各司其职——架构师制定计划、码农生成代码、测试员分析修复。
-- 🤖 **智能规划**：LLM 自动拆解需求，生成分步实施计划。
+- 🎭 **多 Agent 角色**：架构师（制定计划）、码农（生成代码）、审查员（代码走查）、测试员（分析修复）。
+- 🤖 **全流程自动化**：LLM 自动拆解需求、生成代码、运行测试，并在失败时自动定位修复。
 - 📝 **增量修改**：优先使用 `replace_in_file` 进行局部代码替换，拒绝无脑重写整文件。
-- 🧪 **闭环测试**：集成 `pytest` 自动运行单元测试，可选 `ruff` lint 检查。
-- 🔄 **自动修复**：测试失败时，Tester Agent 根据错误日志自动定位并修复漏洞。
-- 🔍 **AST 符号检索**：通过 tree-sitter 精确定位函数/类定义，返回文件路径、行号和完整代码。
-- 🌈 **彩色 Diff**：执行 `replace_in_file` 前展示 git 风格的红/绿色 diff，auto 模式下需确认。
-- 💾 **会话持久化**：历史自动保存到 `workspace/.yansh_history.json`，重启后恢复。
-- 🗂️ **项目类型检测**：启动时自动识别 Python/Node.js/Go/Rust/Java 项目，注入对应测试命令。
-- 💬 **对话记忆**：维护会话历史，闲聊时 LLM 能回答上下文相关问题（最多保留20轮）。
-- 🗜️ **自动压缩**：历史超过 6000 字符时自动压缩旧轮，保留最近 3 轮原文。
-- ⌨️ **交互命令**：支持 `/mode`、`/compress`、`/context`、`/clear` 等内置命令。
-- ⏹️ **ESC 中断**：任务执行中按 ESC 可立即中断，100ms 内响应。
-- 📦 **安全沙箱**：所有操作均在独立的 `workspace` 目录下执行，危险命令自动拦截。
-
+- 🔍 **AST 符号检索**：通过 tree-sitter 精确定位函数/类定义，支持精确代码替换。
+- 👁️ **视觉支持**：支持 `@image <路径/URL>` 和 `@paste`（剪贴板），可分析 UI 设计稿或报错截图生成代码。
+- 🧪 **闭环质量保障**：集成 `pytest` 自动运行测试，支持 `ruff` 静态检查，无测试文件时自动生成最小测试用例。
+- 🛡️ **安全与回滚**：任务开始前自动创建快照，支持手动 `/revert` 回滚。内置安全沙箱拦截危险命令。
+- 🗂️ **上下文管理**：支持 `@add_file` 注入特定文件上下文，自动压缩长对话历史，支持项目级规则 `.agent_rules`。
+- 💾 **任务回放**：任务失败或异常时自动打包 `replay` 包，方便后续复现与调试。
+- 💰 **成本透明**：显示每轮任务的 Token 消耗及估算的 API 费用。
 
 ## 快速开始
 
@@ -39,19 +34,34 @@ copy .env.example .env
 python main.py
 ```
 
+## 测试
+
+项目提供了完整的单元测试与集成测试，建议在重大修改后运行：
+
+```bash
+# 运行单元测试（工具函数、安全检查等，不调用 LLM）
+python tests/run_unit.py
+
+# 运行集成测试（多轮 Agent 交互流程，部分场景真实调用 LLM，会产生 API 费用）
+python tests/run_integration.py
+
+# 运行全部测试
+python tests/run_all.py
+
+# 运行特定的集成测试文件 (例如 1-9 号场景)
+python tests/integration/test_1_9.py
+```
+
 ## 工作流程
 
-输入需求后，程序自动执行 3 个阶段：
+输入需求后，程序自动执行 4 个阶段：
 
 ```
 📋 阶段1：制定计划  →  [Agent: Architect] 分析需求，生成文件列表和测试命令
 ✍️ 阶段2：生成代码  →  [Agent: Coder]     多轮工具调用，写入或增量修改代码文件
-🧪 阶段3：测试与修复 →  [Agent: Tester]    运行单元测试 → 失败则精准修复（最多3次）
+🧐 阶段3：代码审查  →  [Agent: Reviewer]  检查代码逻辑与规范，不通过则自动重修
+🧪 阶段4：测试与修复 →  [Agent: Tester]    自动生成测试 → 运行测试 → 失败则精准修复
 ```
-
-任务完成后进入对话循环，支持：
-- 继续提出新任务
-- 闲聊（LLM 能记住最近5轮对话）
 
 ## 内置命令
 
@@ -60,44 +70,48 @@ python main.py
 | 命令 | 说明 |
 |------|------|
 | `/mode plan` | 仅输出计划，不生成代码 |
-| `/mode code` | 跳过确认，直接生成代码 |
-| `/mode auto` | 默认交互模式（默认） |
-| `/compress` | 手动压缩上下文历史 |
-| `/context` | 查看当前上下文大小（轮数 / 字符数） |
+| `/mode code` | 跳过确认，直接生成代码执行 |
+| `/mode auto` | 默认交互模式（需用户确认计划） |
+| `/revert` | 回滚到上一个任务执行前的状态 |
+| `/context` | 查看当前上下文占用（轮数 / 字符数） |
+| `/history` | 查看最近的对话历史记录 |
+| `/stats` | 显示当前会话的 Token 消耗与费用统计 |
+| `/config` | 查看当前生效的配置项 |
+| `/rules` | 查看当前项目定义的 `.agent_rules` |
+| `/hil [on/off]` | 开启/关闭 Human-In-Loop 模式（详细修改需逐一确认） |
+| `/log` | 查看最近的任务执行日志 |
+| `/replay list/load` | 管理和加载任务回放数据 |
 | `/clear` | 清空全部对话历史 |
-| `exit` / `quit` | 退出程序 |
 
-任务执行中按 **ESC** 可立即中断。
+## 特殊语法
 
-## 配置
-
-通过 `config.py` 可调整：
-
-| 配置项 | 说明 | 默认值 |
-|--------|------|--------|
-| `DEEPSEEK_MODEL` | 模型名称 | `deepseek/deepseek-v4-flash` |
-| `MAX_ATTEMPTS` | 最大测试修复次数 | 3 |
-| `WORKSPACE_DIR` | 生成代码存放目录 | `workspace` |
-| `QUALITY_CASCADE` | 降级模型列表 | 5 层（当前统一使用 DeepSeek） |
+- **注入文件**: 在输入中使用 `@filename.py` 临时注入单个文件，或使用 `@add_file path/to/file` 长期加载到上下文（`@clear_files` 清除）。
+- **图片分析**: 输入 `@image path/to/img.png` 或粘贴图片后输入 `@paste`。
+- **规则定义**: 在 `workspace/` 下创建 `.agent_rules` 文本文件，注入特定的开发规范。
 
 ## 项目结构
 
 ```
 yansh-code/
-├── main.py           # CLI 交互入口（主循环、命令分发）
-├── agent.py          # Agent 核心逻辑（ReAct 循环、质量级联、上下文压缩）
-├── tools.py          # 增强工具集（读/写/删/查/精确替换/执行）
-├── config.py         # 模型级联与环境配置
-├── interrupt.py      # ESC 中断检测（跨平台后台线程）
-├── tests/            # 单元测试
-├── requirements.txt  # Python 依赖
-├── .env              # API 密钥
-└── workspace/        # 生成代码的输出目录
+├── main.py           # CLI 交互入口与命令分发
+├── agent.py          # Agent 核心逻辑（状态机、质量级联、视觉处理）
+├── tools.py          # 工具集（文件/AST操作、Web搜索、代码执行）
+├── config.py         # 模型配置、价格计算与项目级配置加载
+├── monitor.py        # 任务执行监控与统计
+├── interrupt.py      # ESC 异步中断处理
+├── workspace/        # 生成代码的隔离输出目录
+│   └── .yansh/       # 会话历史、日志与配置持久化目录
+└── tests/
+    ├── run_unit.py        # 单元测试入口
+    ├── run_integration.py # 集成测试入口（真实调用 LLM，会产生 API 费用）
+    ├── unit/
+    └── integration/
 ```
 
 ## 依赖
 
-- `openai` — OpenRouter API 调用
-- `python-dotenv` — 环境变量管理
-- `rich` — 终端彩色输出
-- `tree-sitter` / `tree-sitter-python` — AST 符号检索
+- `openai` — 调用 OpenRouter API
+- `tree-sitter` — AST 符号检索
+- `rich` / `prompt_toolkit` — 高级终端交互
+- `ruff` — 代码静态检查 (可选)
+- `pytest` — 自动化测试驱动
