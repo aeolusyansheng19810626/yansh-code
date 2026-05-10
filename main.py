@@ -64,14 +64,16 @@ def _read_input(prompt_str="> "):
     buf = []
     cursor = 0
     prev_lines = 1
+    term_cursor_line = 0  # 终端光标当前在输入区第几行
 
     def redraw():
-        nonlocal prev_lines
+        nonlocal prev_lines, term_cursor_line
         text  = "".join(buf)
         lines = text.split("\n")
 
-        if prev_lines > 1:
-            sys.stdout.write(f"\033[{prev_lines - 1}A")
+        # 精确移回输入区顶部
+        if term_cursor_line > 0:
+            sys.stdout.write(f"\033[{term_cursor_line}A")
         sys.stdout.write("\r")
 
         for i, line in enumerate(lines):
@@ -82,19 +84,17 @@ def _read_input(prompt_str="> "):
 
         prev_lines = len(lines)
 
-        before      = "".join(buf[:cursor])
-        before_lines= before.split("\n")
-        cur_line    = len(before_lines) - 1
-        cur_col     = len(before_lines[-1])
-        end_line    = len(lines) - 1
+        before       = "".join(buf[:cursor])
+        before_lines = before.split("\n")
+        cur_line     = len(before_lines) - 1
+        cur_col      = len(before_lines[-1])
+        end_line     = len(lines) - 1
 
         if end_line > cur_line:
             sys.stdout.write(f"\033[{end_line - cur_line}A")
         col = len(prompt_str) + cur_col
-        if col > 0:
-            sys.stdout.write(f"\r\033[{col}C")
-        else:
-            sys.stdout.write("\r")
+        sys.stdout.write(f"\r\033[{col}C" if col > 0 else "\r")
+        term_cursor_line = cur_line  # 记录光标所在行
         sys.stdout.flush()
 
     sys.stdout.write(prompt_str)
