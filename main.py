@@ -83,13 +83,18 @@ def main():
 
     # 主循环：multiline=True，Enter 换行，Meta+Enter（Alt+Enter）提交
     kb = KeyBindings()
-    @kb.add('c-enter')
-    def _submit(event):
-        event.current_buffer.validate_and_handle()
+    try:
+        @kb.add('c-enter')
+        def _submit(event):
+            event.current_buffer.validate_and_handle()
+        _multiline = True
+    except (ValueError, KeyError):
+        kb = None
+        _multiline = False
 
     while True:
         try:
-            user_input = prompt('> ', key_bindings=kb, multiline=True).strip()
+            user_input = prompt('> ', key_bindings=kb, multiline=_multiline).strip()
         except (EOFError, KeyboardInterrupt):
             console.print("再见！")
             break
