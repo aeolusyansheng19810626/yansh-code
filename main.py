@@ -83,7 +83,7 @@ def main():
 
     # 主循环：multiline=True，Enter 换行，Meta+Enter（Alt+Enter）提交
     kb = KeyBindings()
-    @kb.add('escape', 'enter')
+    @kb.add('c-enter')
     def _submit(event):
         event.current_buffer.validate_and_handle()
 
