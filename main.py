@@ -82,6 +82,13 @@ def _read_input(prompt_str="> "):
             if i < len(lines) - 1:
                 sys.stdout.write("\n")
 
+        # 清除行数减少时残留的旧行
+        extra = prev_lines - len(lines)
+        for _ in range(extra):
+            sys.stdout.write("\n\033[2K")
+        if extra > 0:
+            sys.stdout.write(f"\033[{extra}A")
+
         prev_lines = len(lines)
 
         before       = "".join(buf[:cursor])
