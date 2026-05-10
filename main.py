@@ -76,7 +76,7 @@ def _read_input(prompt_str="> "):
 
         for i, line in enumerate(lines):
             sys.stdout.write("\033[2K")
-            sys.stdout.write(f"{prompt_str}{line}" if i == 0 else line)
+            sys.stdout.write(f"{prompt_str}{line}")
             if i < len(lines) - 1:
                 sys.stdout.write("\n")
 
@@ -90,7 +90,7 @@ def _read_input(prompt_str="> "):
 
         if end_line > cur_line:
             sys.stdout.write(f"\033[{end_line - cur_line}A")
-        col = (len(prompt_str) if cur_line == 0 else 0) + cur_col
+        col = len(prompt_str) + cur_col
         if col > 0:
             sys.stdout.write(f"\r\033[{col}C")
         else:
