@@ -13,7 +13,6 @@ import interrupt
 from pathlib import Path
 import monitor
 from prompt_toolkit import prompt
-from prompt_toolkit.key_binding import KeyBindings
 
 console = Console()
 
@@ -82,14 +81,9 @@ def main():
     interrupt.start_listener()
 
     # 主循环
-    kb = KeyBindings()
-    @kb.add('s-enter')
-    def _(event):
-        event.current_buffer.insert_text('\n')
-
     while True:
         try:
-            user_input = prompt('> ', key_bindings=kb, multiline=False).strip()
+            user_input = prompt('> ').strip()
         except (EOFError, KeyboardInterrupt):
             console.print("再见！")
             break
