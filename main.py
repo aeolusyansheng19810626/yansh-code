@@ -12,10 +12,142 @@ from config import load_project_config, get_config, override_config, WORKSPACE_D
 import interrupt
 from pathlib import Path
 import monitor
-from prompt_toolkit import prompt
-from prompt_toolkit.key_binding import KeyBindings
-
 console = Console()
+
+
+def _read_input(prompt_str="> "):
+    """Windows: Shift+Enter 换行，Enter 提交。非 Windows 降级为 input()。"""
+    if sys.platform != "win32":
+        return input(prompt_str)
+
+    import ctypes
+    import ctypes.wintypes as wt
+
+    kernel32 = ctypes.windll.kernel32
+
+    # 开启 ANSI 转义序列
+    stdout_h = kernel32.GetStdHandle(-11)
+    mode = wt.DWORD()
+    kernel32.GetConsoleMode(stdout_h, ctypes.byref(mode))
+    kernel32.SetConsoleMode(stdout_h, mode.value | 0x0004)
+
+    stdin_h = kernel32.GetStdHandle(-10)
+
+    KEY_EVENT         = 0x0001
+    VK_RETURN         = 0x0D
+    VK_BACK           = 0x08
+    VK_LEFT           = 0x25
+    VK_RIGHT          = 0x27
+    VK_DELETE         = 0x2E
+    VK_HOME           = 0x24
+    VK_END            = 0x23
+    SHIFT_PRESSED     = 0x0010
+    LEFT_CTRL_PRESSED = 0x0008
+    RIGHT_CTRL_PRESSED= 0x0004
+
+    class KEY_EVENT_RECORD(ctypes.Structure):
+        _fields_ = [
+            ("bKeyDown",          wt.BOOL),
+            ("wRepeatCount",      wt.WORD),
+            ("wVirtualKeyCode",   wt.WORD),
+            ("wVirtualScanCode",  wt.WORD),
+            ("uChar",             wt.WCHAR),
+            ("dwControlKeyState", wt.DWORD),
+        ]
+
+    class EVENT_UNION(ctypes.Union):
+        _fields_ = [("KeyEvent", KEY_EVENT_RECORD), ("padding", ctypes.c_byte * 16)]
+
+    class INPUT_RECORD(ctypes.Structure):
+        _fields_ = [("EventType", wt.WORD), ("Event", EVENT_UNION)]
+
+    buf = []
+    cursor = 0
+    prev_lines = 1
+
+    def redraw():
+        nonlocal prev_lines
+        text  = "".join(buf)
+        lines = text.split("\n")
+
+        if prev_lines > 1:
+            sys.stdout.write(f"\033[{prev_lines - 1}A")
+        sys.stdout.write("\r")
+
+        for i, line in enumerate(lines):
+            sys.stdout.write("\033[2K")
+            sys.stdout.write(f"{prompt_str}{line}" if i == 0 else line)
+            if i < len(lines) - 1:
+                sys.stdout.write("\n")
+
+        prev_lines = len(lines)
+
+        before      = "".join(buf[:cursor])
+        before_lines= before.split("\n")
+        cur_line    = len(before_lines) - 1
+        cur_col     = len(before_lines[-1])
+        end_line    = len(lines) - 1
+
+        if end_line > cur_line:
+            sys.stdout.write(f"\033[{end_line - cur_line}A")
+        col = (len(prompt_str) if cur_line == 0 else 0) + cur_col
+        if col > 0:
+            sys.stdout.write(f"\r\033[{col}C")
+        else:
+            sys.stdout.write("\r")
+        sys.stdout.flush()
+
+    sys.stdout.write(prompt_str)
+    sys.stdout.flush()
+
+    while True:
+        rec = INPUT_RECORD()
+        n   = wt.DWORD(0)
+        kernel32.ReadConsoleInputW(stdin_h, ctypes.byref(rec), 1, ctypes.byref(n))
+
+        if rec.EventType != KEY_EVENT:
+            continue
+        key = rec.Event.KeyEvent
+        if not key.bKeyDown:
+            continue
+
+        vk    = key.wVirtualKeyCode
+        state = key.dwControlKeyState
+        shift = bool(state & SHIFT_PRESSED)
+        ctrl  = bool(state & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED))
+        ch    = key.uChar
+
+        if vk == VK_RETURN:
+            if shift:
+                buf.insert(cursor, "\n"); cursor += 1; redraw()
+            else:
+                sys.stdout.write("\n"); sys.stdout.flush()
+                return "".join(buf)
+        elif vk == VK_BACK:
+            if cursor > 0:
+                buf.pop(cursor - 1); cursor -= 1; redraw()
+        elif vk == VK_DELETE:
+            if cursor < len(buf):
+                buf.pop(cursor); redraw()
+        elif vk == VK_LEFT:
+            if cursor > 0:
+                cursor -= 1; redraw()
+        elif vk == VK_RIGHT:
+            if cursor < len(buf):
+                cursor += 1; redraw()
+        elif vk == VK_HOME:
+            before = "".join(buf[:cursor])
+            cursor = before.rfind("\n") + 1; redraw()
+        elif vk == VK_END:
+            after = "".join(buf[cursor:])
+            nl = after.find("\n")
+            cursor = cursor + nl if nl != -1 else len(buf); redraw()
+        elif ctrl and vk == 0x43:
+            raise KeyboardInterrupt
+        elif ctrl and vk == 0x44:
+            raise EOFError
+        elif ch and (ord(ch) >= 32 or ch == "\t"):
+            buf.insert(cursor, ch); cursor += 1; redraw()
 
 VALID_MODES = {"plan", "code", "auto"}
 
@@ -81,20 +213,9 @@ def main():
 
     interrupt.start_listener()
 
-    # 主循环：multiline=True，Enter 换行，Meta+Enter（Alt+Enter）提交
-    kb = KeyBindings()
-    try:
-        @kb.add('c-enter')
-        def _submit(event):
-            event.current_buffer.validate_and_handle()
-        _multiline = True
-    except (ValueError, KeyError):
-        kb = None
-        _multiline = False
-
     while True:
         try:
-            user_input = prompt('> ', key_bindings=kb, multiline=_multiline).strip()
+            user_input = _read_input('> ').strip()
         except (EOFError, KeyboardInterrupt):
             console.print("再见！")
             break
