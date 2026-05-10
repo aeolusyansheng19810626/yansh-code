@@ -33,6 +33,8 @@ def handle_task_result(result):
         console.print("\n[bold red]任务失败[/bold red]")
 
 def main():
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description="yansh-code: 极简代码智能体")
     parser.add_argument("requirement", nargs="?", help="任务需求说明")
     parser.add_argument("--mode", choices=VALID_MODES, help="运行模式")
