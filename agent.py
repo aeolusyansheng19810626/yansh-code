@@ -620,8 +620,9 @@ def _git_is_repo(cwd: str) -> bool:
 def create_snapshot(file_list):
     """备份工作区：若在 git 仓库内用 git stash，否则回退到文件复制快照。
     返回快照标识（git 模式：stash 消息前缀；文件模式：Path 对象）。"""
+    import config as _cfg_mod
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    ws = WORKSPACE_DIR
+    ws = _cfg_mod.WORKSPACE_DIR
 
     if _git_is_repo(ws):
         # git 模式：先 add 所有未追踪文件（确保新建文件也被 stash），再 stash
@@ -711,6 +712,8 @@ def restore_snapshot(snap_info):
 
 def _restore_file_snapshot(snap_dir: Path) -> int:
     """文件复制模式的恢复逻辑（原 restore_snapshot）。"""
+    import config as _cfg_mod
+    ws = _cfg_mod.WORKSPACE_DIR
     meta_file = snap_dir / "meta.json"
     if not meta_file.exists():
         return 0
@@ -718,23 +721,23 @@ def _restore_file_snapshot(snap_dir: Path) -> int:
     restored = 0
     for filename in meta.get("files", []):
         src = snap_dir / filename
-        dst = Path(WORKSPACE_DIR) / filename
+        dst = Path(ws) / filename
         if src.exists():
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(str(src), str(dst))
             restored += 1
     workspace_files_then = set(meta.get("workspace_files", []))
     current_files = []
-    for root, dirs, files in os.walk(WORKSPACE_DIR):
+    for root, dirs, files in os.walk(ws):
         if _should_skip_dir(root):
             dirs.clear()
             continue
         for filename in files:
-            rel_path = os.path.relpath(os.path.join(root, filename), WORKSPACE_DIR)
+            rel_path = os.path.relpath(os.path.join(root, filename), ws)
             current_files.append(rel_path.replace("\\", "/"))
     for f in current_files:
         if f not in workspace_files_then:
-            path = Path(WORKSPACE_DIR) / f
+            path = Path(ws) / f
             try:
                 if path.exists():
                     path.unlink()
@@ -745,12 +748,13 @@ def _restore_file_snapshot(snap_dir: Path) -> int:
 
 def cleanup_snapshot(snap_info):
     """清理快照：git 模式 drop stash，文件模式删除目录。"""
+    import config as _cfg_mod
     if not snap_info:
         return
     mode = snap_info.get("mode") if isinstance(snap_info, dict) else None
     if mode == "git":
         stash_msg = snap_info["msg"]
-        ws = WORKSPACE_DIR
+        ws = _cfg_mod.WORKSPACE_DIR
         rc, stdout, _ = _git_run(["stash", "list"], ws)
         for line in stdout.splitlines():
             if stash_msg in line:
