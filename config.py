@@ -5,18 +5,50 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+# ---------- [已弃用] DeepSeek / OpenRouter 配置 ----------
+# OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+# OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+# DEEPSEEK_MODEL = "deepseek/deepseek-v4-flash"
+# TIER_TOP       = DEEPSEEK_MODEL
+# TIER_UPPER_MID = DEEPSEEK_MODEL
+# TIER_MID       = DEEPSEEK_MODEL
+# TIER_LOW       = DEEPSEEK_MODEL
+# TIER_DEBUG     = DEEPSEEK_MODEL
+# QUALITY_CASCADE = [TIER_TOP, TIER_UPPER_MID, TIER_MID, TIER_LOW, TIER_DEBUG]
 
-# 通过OpenRouter调用DeepSeek
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-DEEPSEEK_MODEL = "deepseek/deepseek-v4-flash"
+# ---------- API 配置 ----------
+# DeepSeek 走 OpenRouter；Claude 走 IBM ICA 网关
+# 优先读 OPENROUTER_API_KEY（DeepSeek），回落到 CLAUDE_API_KEY（Claude/ICA）
+OPENROUTER_API_KEY = (
+    os.getenv("OPENROUTER_API_KEY")
+    or os.getenv("CLAUDE_API_KEY")
+    or os.getenv("ANTHROPIC_AUTH_TOKEN")
+    or os.getenv("ANTHROPIC_API_KEY")
+)
+# 若用 OpenRouter（DeepSeek），base_url 为 openrouter.ai；否则用 ICA 端点
+_using_openrouter = bool(os.getenv("OPENROUTER_API_KEY"))
+OPENROUTER_BASE_URL = (
+    "https://openrouter.ai/api/v1" if _using_openrouter
+    else (
+        os.getenv("CLAUDE_BASE_URL")
+        or os.getenv("ANTHROPIC_BASE_URL")
+        or "https://api.nextgen-beta.ica.ibm.com/ica/v1"
+    )
+)
 
-# 5-tier 模型配置（统一使用DeepSeek）
-TIER_TOP       = DEEPSEEK_MODEL
-TIER_UPPER_MID = DEEPSEEK_MODEL
-TIER_MID       = DEEPSEEK_MODEL
-TIER_LOW       = DEEPSEEK_MODEL
-TIER_DEBUG     = DEEPSEEK_MODEL
+# 模型 ID（按 ICA 网关接受的格式填写，示例供参考；ID 形如 claude-opus-4-7 / claude-sonnet-4-6 / claude-haiku-4-5）
+CLAUDE_OPUS   = "claude-opus-4-7"
+CLAUDE_SONNET = "claude-sonnet-4-6"
+CLAUDE_HAIKU  = "claude-haiku-4-5"
+
+# 5-tier 级联：顶端用 Opus，其次 Sonnet，失败兜底 Haiku
+DEEPSEEK_FLASH = "deepseek/deepseek-v4-flash"
+
+TIER_TOP       = DEEPSEEK_FLASH
+TIER_UPPER_MID = DEEPSEEK_FLASH
+TIER_MID       = DEEPSEEK_FLASH
+TIER_LOW       = DEEPSEEK_FLASH
+TIER_DEBUG     = DEEPSEEK_FLASH
 
 QUALITY_CASCADE = [TIER_TOP, TIER_UPPER_MID, TIER_MID, TIER_LOW, TIER_DEBUG]
 
@@ -33,7 +65,7 @@ TOKEN_PRICE_OUTPUT = 0.60  # $0.60 / 1M output tokens
 _CONFIG_FILE = Path(WORKSPACE_DIR) / ".yansh" / "config.json"
 
 _DEFAULTS = {
-    "model": DEEPSEEK_MODEL,
+    "model": TIER_TOP,
     "mode": "auto",
     "max_attempts": MAX_ATTEMPTS,
     "test_command": None,

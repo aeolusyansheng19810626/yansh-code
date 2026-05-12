@@ -1,6 +1,6 @@
 # yansh-code
 
-基于 LLM（DeepSeek）的自动化代码生成与测试 CLI 工具。
+基于 LLM（Claude / DeepSeek）的自动化代码生成与测试 CLI 工具。
 
 通过 ReAct 循环自动完成：需求分析 → 生成代码 → 代码审查 → 自动测试 → 错误修复。
 
@@ -26,9 +26,9 @@
 # 2. 安装依赖
 pip install -r requirements.txt
 
-# 3. 配置密钥（通过 OpenRouter 调用 DeepSeek）
+# 3. 配置密钥（通过 IBM ICA 网关调用 Claude）
 copy .env.example .env
-# 编辑 .env 填入你的 OPENROUTER_API_KEY
+# 编辑 .env 填入你的 CLAUDE_API_KEY 和 CLAUDE_BASE_URL
 
 # 4. 运行
 python main.py
@@ -39,10 +39,10 @@ python main.py
 项目提供了完整的单元测试与集成测试，建议在重大修改后运行：
 
 ```bash
-# 运行单元测试（工具函数、安全检查等，不调用 LLM）
+# 运行单元测试（工具函数、安全检查等）
 python tests/run_unit.py
 
-# 运行集成测试（多轮 Agent 交互流程，部分场景真实调用 LLM，会产生 API 费用）
+# 运行集成测试（多轮 Agent 交互流程）
 python tests/run_integration.py
 
 # 运行全部测试
@@ -80,6 +80,8 @@ python tests/integration/test_1_9.py
 | `/rules` | 查看当前项目定义的 `.agent_rules` |
 | `/hil [on/off]` | 开启/关闭 Human-In-Loop 模式（详细修改需逐一确认） |
 | `/log` | 查看最近的任务执行日志 |
+| `/model` | 交互式切换 LLM 模型（DeepSeek / Claude Opus / Sonnet / Haiku） |
+| `/compress` | 手动压缩对话历史 |
 | `/replay list/load` | 管理和加载任务回放数据 |
 | `/clear` | 清空全部对话历史 |
 
@@ -110,7 +112,7 @@ yansh-code/
 
 ## 依赖
 
-- `openai` — 调用 OpenRouter API
+- `openai` — 调用 Claude / DeepSeek API（OpenAI 兼容协议）
 - `tree-sitter` — AST 符号检索
 - `rich` / `prompt_toolkit` — 高级终端交互
 - `ruff` — 代码静态检查 (可选)

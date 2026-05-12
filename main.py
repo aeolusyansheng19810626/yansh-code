@@ -8,7 +8,7 @@ from agent import (
     get_latest_snapshot, restore_snapshot, cleanup_snapshot, show_recent_logs,
     detect_project_type, _PROJECT_TYPE, _PROJECT_TEST_CMD, _LOG_DIR
 )
-from config import load_project_config, get_config, override_config, WORKSPACE_DIR
+from config import load_project_config, get_config, override_config, WORKSPACE_DIR, CLAUDE_OPUS, CLAUDE_SONNET, CLAUDE_HAIKU
 import interrupt
 from pathlib import Path
 import monitor
@@ -66,6 +66,16 @@ def _read_input(prompt_str="> "):
     prev_lines = 1
     term_cursor_line = 0  # 终端光标当前在输入区第几行
 
+    try:
+        from wcwidth import wcswidth as _wcswidth
+        def _dispwidth(s): w = _wcswidth(s); return w if w >= 0 else len(s)
+    except ImportError:
+        try:
+            from prompt_toolkit.utils import get_cwidth as _gcw
+            def _dispwidth(s): return sum(_gcw(c) for c in s)
+        except ImportError:
+            def _dispwidth(s): return len(s)
+
     def redraw():
         nonlocal prev_lines, term_cursor_line
         text  = "".join(buf)
@@ -94,12 +104,12 @@ def _read_input(prompt_str="> "):
         before       = "".join(buf[:cursor])
         before_lines = before.split("\n")
         cur_line     = len(before_lines) - 1
-        cur_col      = len(before_lines[-1])
+        cur_col      = _dispwidth(before_lines[-1])
         end_line     = len(lines) - 1
 
         if end_line > cur_line:
             sys.stdout.write(f"\033[{end_line - cur_line}A")
-        col = len(prompt_str) + cur_col
+        col = _dispwidth(prompt_str) + cur_col
         sys.stdout.write(f"\r\033[{col}C" if col > 0 else "\r")
         term_cursor_line = cur_line  # 记录光标所在行
         sys.stdout.flush()
@@ -179,6 +189,7 @@ def main():
     parser.add_argument("--mode", choices=VALID_MODES, help="运行模式")
     parser.add_argument("--model", help="指定 LLM 模型")
     parser.add_argument("--json", action="store_true", help="以 JSON 格式输出最后结果 (batch 模式)")
+    parser.add_argument("--strict", action="store_true", help="批处理模式下拒绝需确认命令（pip/npm install、git checkout/reset）")
     args = parser.parse_args()
 
     # 加载配置
@@ -198,7 +209,7 @@ def main():
     
     # 批处理模式处理
     if args.requirement or args.json:
-        agent.set_batch_mode(True, json_output=args.json)
+        agent.set_batch_mode(True, json_output=args.json, strict=args.strict)
         if args.requirement:
             res = agent.run(args.requirement, mode=current_mode)
             if args.json:
@@ -234,13 +245,41 @@ def main():
             console.print("再见！")
             break
 
-        if user_input.startswith("/mode"):
+        if user_input == "/mode" or user_input.startswith("/mode "):
             parts = user_input.split()
             if len(parts) == 2 and parts[1] in VALID_MODES:
                 current_mode = parts[1]
                 console.print(f"已切换到 {current_mode} 模式")
             else:
                 console.print(f"用法：/mode [plan|code|auto]")
+            continue
+
+        if user_input == "/model":
+            MODEL_MENU = [
+                ("1", "DeepSeek V4 Flash",  "deepseek/deepseek-v4-flash"),
+                ("2", "Claude Opus 4.7",    CLAUDE_OPUS),
+                ("3", "Claude Sonnet 4.6",  CLAUDE_SONNET),
+                ("4", "Claude Haiku 4.5",   CLAUDE_HAIKU),
+            ]
+            current_model = get_config()["model"]
+            console.print("\n[bold]选择模型：[/bold]", highlight=False)
+            for num, label, mid in MODEL_MENU:
+                mark = " ◀ 当前" if mid == current_model else ""
+                console.print(f"  {num}. {label}  ({mid}){mark}", highlight=False)
+            try:
+                choice = _read_input("请输入数字 (1-4): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                choice = ""
+            matched = next((m for n, _, m in MODEL_MENU if n == choice), None)
+            if matched:
+                override_config(model=matched)
+                import agent as _am
+                if _am.QUALITY_CASCADE:
+                    _am.QUALITY_CASCADE[0] = matched
+                label = next(l for n, l, m in MODEL_MENU if m == matched)
+                console.print(f"已切换到：{label}  ({matched})", highlight=False)
+            else:
+                console.print("无效输入，未切换模型。", highlight=False)
             continue
 
         if user_input == "/compress":

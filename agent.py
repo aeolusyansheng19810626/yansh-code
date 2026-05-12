@@ -311,11 +311,12 @@ def _process_at_files(user_input):
     return user_input + "\n" + "\n".join(injected_texts)
 
 
-def set_batch_mode(enabled: bool, json_output: bool = False):
-    """设置批处理模式；json_output=True 时将 console 重定向到 stderr"""
+def set_batch_mode(enabled: bool, json_output: bool = False, strict: bool | None = None):
+    """设置批处理模式；json_output=True 时将 console 重定向到 stderr；
+    strict=True 时批处理下仍拒绝 Level-3 需确认命令（pip install / git reset 等）"""
     global _BATCH_MODE, console
     _BATCH_MODE = enabled
-    _tools_mod.set_batch_mode(enabled)
+    _tools_mod.set_batch_mode(enabled, strict=strict)
     if json_output:
         console = Console(file=sys.stderr)
 
@@ -334,7 +335,15 @@ def _prompt(msg: str, default: str = "y") -> str:
     except EOFError:
         return default
 
-# 初始化OpenAI客户端（兼容OpenRouter）
+# [已弃用] OpenRouter/DeepSeek 客户端
+# client = OpenAI(
+#     api_key=OPENROUTER_API_KEY,
+#     base_url=OPENROUTER_BASE_URL,
+# )
+
+# Claude 客户端（通过 IBM ICA 网关，走 OpenAI 兼容协议）
+# OPENROUTER_API_KEY / OPENROUTER_BASE_URL 已在 config.py 中指向 Claude/ICA，
+# 此处变量名保持不变，避免牵动 import。
 client = OpenAI(
     api_key=OPENROUTER_API_KEY,
     base_url=OPENROUTER_BASE_URL,
@@ -515,7 +524,7 @@ def create_replay_package(failure_reason):
         encoding="utf-8"
     )
     
-    console.print(f"\n💾 [bold]失败案例已保存[/bold]: replay/{replay_dir.name}", highlight=False)
+    console.print(f"\n💾 [bold]失败案例已保存[/bold]: {replay_dir}", highlight=False)
     return replay_dir.name
 
 def list_replays():
@@ -627,9 +636,9 @@ def restore_snapshot(snap_dir):
             try:
                 if path.exists():
                     path.unlink()
-            except Exception:
-                pass
-                
+            except Exception as e:
+                console.print(f"[警告] 回滚时无法删除 {f}: {e}", style="yellow", highlight=False)
+
     return restored
 
 def cleanup_snapshot(snap_dir):
@@ -1111,26 +1120,56 @@ TOOLS = [
     }
 ]
 
+LLM_TIMEOUT_SEC = 120
+LLM_MAX_RETRIES_PER_MODEL = 3  # 每个模型对 429/5xx 的退避重试次数
+
+
+def _is_transient_error(exc) -> bool:
+    """判断是否为应退避重试的瞬时错误（429 / 5xx / 连接错误）"""
+    try:
+        from openai import APIConnectionError, APITimeoutError, RateLimitError, InternalServerError
+        if isinstance(exc, (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError)):
+            return True
+    except ImportError:
+        pass
+    status = getattr(exc, "status_code", None) or getattr(exc, "http_status", None)
+    if isinstance(status, int) and (status == 429 or 500 <= status < 600):
+        return True
+    return False
+
+
 def call_llm(messages, tools=None, tool_choice=None, response_format=None):
-    """尝试QUALITY_CASCADE中的模型，依次降级调用。在子线程中执行，每100ms检查一次ESC中断。"""
+    """尝试QUALITY_CASCADE中的模型，依次降级调用。每模型对 429/5xx 指数退避重试。
+    在子线程中执行，每100ms检查一次ESC中断。"""
     result_holder = [None]
     exc_holder = [None]
 
     def _worker():
         for model in QUALITY_CASCADE:
-            try:
-                kwargs = {"model": model, "messages": messages}
-                if tools is not None:
-                    kwargs["tools"] = tools
-                if tool_choice is not None:
-                    kwargs["tool_choice"] = tool_choice
-                if response_format is not None:
-                    kwargs["response_format"] = response_format
-                result_holder[0] = client.chat.completions.create(**kwargs)
-                return
-            except Exception as e:
-                exc_holder[0] = e
-                continue
+            backoff = 1.0
+            for attempt in range(LLM_MAX_RETRIES_PER_MODEL):
+                try:
+                    kwargs = {"model": model, "messages": messages, "timeout": LLM_TIMEOUT_SEC}
+                    if tools is not None:
+                        kwargs["tools"] = tools
+                    if tool_choice is not None:
+                        kwargs["tool_choice"] = tool_choice
+                    if response_format is not None:
+                        kwargs["response_format"] = response_format
+                    result_holder[0] = client.chat.completions.create(**kwargs)
+                    return
+                except Exception as e:
+                    exc_holder[0] = e
+                    if _is_transient_error(e) and attempt < LLM_MAX_RETRIES_PER_MODEL - 1:
+                        # 指数退避；期间仍可被 ESC 打断（主循环每 100ms 检查）
+                        deadline = _time.time() + backoff
+                        while _time.time() < deadline:
+                            if interrupt.is_interrupted():
+                                return
+                            _time.sleep(0.1)
+                        backoff *= 2
+                        continue
+                    break  # 非瞬时错误或已达上限，跳到下一个模型
 
     t = threading.Thread(target=_worker, daemon=True)
     t.start()
@@ -1564,30 +1603,42 @@ def review(requirement, modified_files):
         {"role": "user", "content": user_content}
     ]
     
-    response = call_llm(messages, response_format={"type": "json_object"})
     try:
-        return json.loads(response.choices[0].message.content)
-    except Exception:
-        return {"approved": True, "issues": [], "suggestions": []}
+        response = call_llm(messages, response_format={"type": "json_object"})
+        content = response.choices[0].message.content or ""
+        return json.loads(content)
+    except json.JSONDecodeError as e:
+        return {
+            "approved": False,
+            "issues": [f"review_error: LLM 返回非 JSON（{e}）"],
+            "suggestions": [],
+        }
+    except Exception as e:
+        return {
+            "approved": False,
+            "issues": [f"review_error: {e}"],
+            "suggestions": [],
+        }
 
 def fix(test_result, plan):
     """根据测试错误修复代码（多轮工具调用）"""
     console.print("[Agent: Tester]", highlight=False)
     console.print("开始修复代码...")
     
-    # 优先使用 stderr，如果为空则使用截断的 stdout
+    # 优先使用 stderr，为空回落到 stdout；关键栈常在末尾，采用 head + tail 截断
     stderr = test_result.get("stderr", "")
     stdout = test_result.get("stdout", "")
-    
-    if stderr:
-        error_info = stderr
-    elif stdout:
-        # 截断 stdout 到最多 500 字符
-        error_info = stdout[:500]
-        if len(stdout) > 500:
-            error_info += "\n... (输出已截断)"
+    raw = stderr or stdout or "未知错误"
+
+    HEAD, TAIL = 800, 2000
+    if len(raw) > HEAD + TAIL:
+        error_info = (
+            raw[:HEAD]
+            + f"\n... (中间省略 {len(raw) - HEAD - TAIL} 字符) ...\n"
+            + raw[-TAIL:]
+        )
     else:
-        error_info = "未知错误"
+        error_info = raw
     
     content = f"测试失败！\n错误输出：\n{error_info}\n\n计划：{json.dumps(plan)}"
     
@@ -1732,6 +1783,7 @@ def run(requirement, mode="auto"):
 def _run(requirement, mode):
     global _HIL_AUTO_ACCEPT
     _HIL_AUTO_ACCEPT = False  # 每轮任务重置"全部接受"标志
+    os.makedirs(WORKSPACE_DIR, exist_ok=True)  # 兜底：新目录首次运行时 workspace/ 可能不存在
     original_requirement = requirement
     init_task_log(requirement, mode)
 
@@ -1796,11 +1848,15 @@ def _run(requirement, mode):
     
     # #48 Review Agent：在阶段2和阶段3之间进行代码审查
     review_attempts = 0
-    max_review_attempts = 2
+    max_review_attempts = 3
+    review_passed = False
+    last_review_result = None
     while review_attempts < max_review_attempts:
         review_result = review(original_requirement, _task_files_modified)
+        last_review_result = review_result
         if review_result.get("approved"):
             console.print("代码审查通过！")
+            review_passed = True
             break
         else:
             console.print(f"代码审查未通过 (尝试 {review_attempts + 1}/{max_review_attempts})")
@@ -1810,7 +1866,7 @@ def _run(requirement, mode):
                 console.print(f"- 问题: {issue}", style="red")
             for sug in suggestions:
                 console.print(f"- 建议: {sug}", style="yellow")
-            
+
             # 使用 fix 逻辑修改代码
             mock_test_result = {
                 "returncode": 1,
@@ -1819,6 +1875,20 @@ def _run(requirement, mode):
             }
             fix(mock_test_result, plan_result)
             review_attempts += 1
+
+    # 达到上限仍未通过：降级处理 —— 记录到日志，HIL 模式下征询用户
+    if not review_passed:
+        _current_task_log["review_failed"] = True
+        _current_task_log["review_last"] = last_review_result or {}
+        console.print("[审查未通过] 已达到最大尝试次数", style="bold yellow")
+        if _cfg("human_in_loop"):
+            ans = _prompt("是否继续进入测试阶段？(y/n) ", default="n")
+            if ans != "y":
+                cleanup_snapshot(current_snapshot)
+                finish_task_log(False, 0, {"returncode": -1, "stdout": "", "stderr": "审查未通过，用户终止"})
+                return {"success": False, "test_result": {"returncode": -1, "stdout": "", "stderr": "审查未通过，用户终止"}}
+        else:
+            console.print("继续进入测试阶段（非 HIL 模式）", style="yellow")
 
     console.print("\n阶段3：测试与修复")
     attempts = 0

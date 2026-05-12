@@ -10,11 +10,15 @@ _WORKSPACE_ROOT = Path(WORKSPACE_DIR).resolve()
 
 # #40 批处理模式标志（由 agent.set_batch_mode() 设置）
 _BATCH_MODE = False
+# 严格模式：批处理下仍然拒绝 Level-3 需确认命令（pip/npm install、git checkout/reset）
+_BATCH_STRICT = os.getenv("YANSH_BATCH_STRICT", "").lower() in ("1", "true", "yes")
 
 
-def set_batch_mode(enabled: bool):
-    global _BATCH_MODE
+def set_batch_mode(enabled: bool, strict: bool | None = None):
+    global _BATCH_MODE, _BATCH_STRICT
     _BATCH_MODE = enabled
+    if strict is not None:
+        _BATCH_STRICT = strict
 
 
 def _con():
@@ -132,10 +136,13 @@ def execute_command(command):
     # Level 2: safe — 直接执行
     is_safe = any(re.match(p, cmd_stripped, re.IGNORECASE) for p in _SAFE_PATTERNS)
 
-    # Level 3: confirm — 批处理模式自动确认，交互模式提示用户
+    # Level 3: confirm — 批处理模式默认自动确认，strict 下拒绝；交互模式提示用户
     if not is_safe:
         for pattern, label in _CONFIRM_PATTERNS:
             if re.search(pattern, cmd_stripped, re.IGNORECASE):
+                if _BATCH_MODE and _BATCH_STRICT:
+                    _con().print(f"[batch-strict] 拒绝执行需确认命令: {label}", highlight=False)
+                    return {"error": f"批处理严格模式拒绝执行: {label}", "returncode": -1, "stdout": "", "stderr": ""}
                 if _BATCH_MODE:
                     _con().print(f"[batch] 自动确认执行: {command}", highlight=False)
                 else:
@@ -246,7 +253,11 @@ def replace_in_file(filename, old_str, new_str):
     if count == 0:
         return {"error": f"在 {filename} 中未找到要替换的字符串"}
     if count > 1:
-        return {"error": f"在 {filename} 中找到 {count} 处匹配，需唯一匹配"}
+        return {"error": (
+            f"在 {filename} 中找到 {count} 处匹配，需唯一匹配。"
+            "请在 old_str 中增加上下文行（前后多带几行代码）以确保唯一；"
+            "或改用 replace_symbol 按函数/类名整体替换。"
+        )}
 
     content = content.replace(old_str, new_str, 1)
     try:

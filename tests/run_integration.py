@@ -10,6 +10,7 @@ files = [
     "tests/integration/test_26_27.py",
     "tests/integration/test_28_31.py",
     "tests/integration/test_32_35.py",
+    "tests/integration/test_36_42.py",
 ]
 
 if __name__ == "__main__":
