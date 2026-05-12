@@ -636,13 +636,20 @@ def replace_symbol(symbol_name, new_code, file_path):
 
     lines = content.splitlines(keepends=True)
 
-    # 缩进修复
+    # 缩进修复：取原符号首行的实际缩进字符串（保留 tab/space 原样，不 expand）
     first_line = lines[start_line]
-    target_indent = first_line[:len(first_line) - len(first_line.lstrip())] if first_line.strip() else ""
-    
+    # 用 re 精确提取前导空白，兼容 tab/space 混用
+    import re as _re
+    _indent_match = _re.match(r'^(\s*)', first_line)
+    target_indent = _indent_match.group(1) if _indent_match else ""
+
+    # dedent 新代码后，逐行加上原缩进
     new_code = textwrap.dedent(new_code)
     new_code_lines = new_code.splitlines()
-    indented_code = "".join(target_indent + line + "\n" if line.strip() else "\n" for line in new_code_lines)
+    indented_code = "".join(
+        target_indent + line + "\n" if line.strip() else line + "\n"
+        for line in new_code_lines
+    )
     if not indented_code.endswith("\n"):
         indented_code += "\n"
 

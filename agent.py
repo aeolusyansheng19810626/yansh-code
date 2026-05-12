@@ -123,14 +123,24 @@ def _parse_context_cmds(user_input: str) -> str:
     return user_input
 
 
+# 每个上下文文件注入到 prompt 的最大字符数（约 2000 token）
+_MAX_CONTEXT_INJECT_CHARS = 8000
+
 def _get_context_files_block() -> str:
-    """构建上下文文件注入块。"""
+    """构建上下文文件注入块。每个文件超过限制时截断并提示，避免 token 爆炸。"""
     if not _context_files:
         return ""
     parts = ["=== 附加上下文文件 ==="]
     for path, content in _context_files.items():
-        parts.append(f"--- 文件: {path} ---")
-        parts.append(content)
+        if len(content) > _MAX_CONTEXT_INJECT_CHARS:
+            truncated = content[:_MAX_CONTEXT_INJECT_CHARS]
+            omitted = len(content) - _MAX_CONTEXT_INJECT_CHARS
+            parts.append(f"--- 文件: {path} (已截断，省略末尾 {omitted} 字符) ---")
+            parts.append(truncated)
+            parts.append(f"... [已截断，完整文件共 {len(content)} 字符，超出限制 {_MAX_CONTEXT_INJECT_CHARS}] ...")
+        else:
+            parts.append(f"--- 文件: {path} ---")
+            parts.append(content)
     return "\n".join(parts)
 
 
