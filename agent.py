@@ -903,24 +903,105 @@ def run_linter():
 # ---------- #27 项目类型检测 ----------
 
 def detect_project_type():
-    """扫描 workspace 目录识别项目类型，返回 (type_str, test_cmd)"""
+    """扫描 workspace 目录识别项目类型，返回 (type_str, test_cmd)。
+    优先读取配置文件中用户自定义的 test 命令，而不是硬编码 pytest/npm test。"""
     from pathlib import Path
     from config import WORKSPACE_DIR
     ws = Path(WORKSPACE_DIR)
     if not ws.exists():
         return None, None
     all_names = {f.name for f in ws.rglob("*") if f.is_file()}
-    if any(n in all_names for n in ("requirements.txt", "pyproject.toml")) or any(n.endswith(".py") for n in all_names):
-        return "Python", "pytest"
+
+    # ---------- Python ----------
+    if any(n in all_names for n in ("requirements.txt", "pyproject.toml", "setup.py", "setup.cfg")) \
+            or any(n.endswith(".py") for n in all_names):
+        test_cmd = _detect_python_test_cmd(ws)
+        return "Python", test_cmd
+
+    # ---------- Node.js ----------
     if "package.json" in all_names:
-        return "Node.js", "npm test"
+        test_cmd = _detect_node_test_cmd(ws)
+        return "Node.js", test_cmd
+
+    # ---------- Go ----------
     if "go.mod" in all_names:
         return "Go", "go test ./..."
+
+    # ---------- Rust ----------
     if "Cargo.toml" in all_names:
         return "Rust", "cargo test"
+
+    # ---------- Java/Maven ----------
     if "pom.xml" in all_names:
         return "Java/Maven", "mvn test"
+
     return None, None
+
+
+def _detect_python_test_cmd(ws: "Path") -> str:
+    """从 pyproject.toml / tox.ini / setup.cfg 读取 Python 项目的真实测试命令。"""
+    import shutil
+
+    # 1. pyproject.toml — 检查 [tool.pytest.ini_options] 或 [tool.uv] / [tool.poetry]
+    pyproject = ws / "pyproject.toml"
+    if pyproject.exists():
+        try:
+            content = pyproject.read_text(encoding="utf-8")
+            # uv 项目：优先用 uv run pytest
+            if "[tool.uv]" in content or (ws / "uv.lock").exists():
+                if shutil.which("uv"):
+                    return "uv run pytest"
+            # poetry 项目
+            if "[tool.poetry]" in content or (ws / "poetry.lock").exists():
+                if shutil.which("poetry"):
+                    return "poetry run pytest"
+            # 有 pytest 配置就用 pytest
+            if "[tool.pytest" in content or "[pytest]" in content:
+                return "pytest"
+        except Exception:
+            pass
+
+    # 2. tox.ini — 有 tox 就用 tox
+    if (ws / "tox.ini").exists() and shutil.which("tox"):
+        return "tox"
+
+    # 3. Makefile 里有 test target
+    makefile = ws / "Makefile"
+    if makefile.exists():
+        try:
+            mk = makefile.read_text(encoding="utf-8", errors="replace")
+            if "test:" in mk or "test :" in mk:
+                return "make test"
+        except Exception:
+            pass
+
+    # 4. 默认 pytest（最通用）
+    if shutil.which("pytest"):
+        return "pytest"
+    # 没有全局 pytest 时用 python -m pytest
+    return "python -m pytest"
+
+
+def _detect_node_test_cmd(ws: "Path") -> str:
+    """从 package.json scripts.test 读取 Node 项目的真实测试命令。"""
+    import json as _json
+    import shutil
+    pkg = ws / "package.json"
+    if pkg.exists():
+        try:
+            data = _json.loads(pkg.read_text(encoding="utf-8"))
+            scripts = data.get("scripts", {})
+            # 优先用明确的 test script
+            if scripts.get("test"):
+                # 检测包管理器
+                if (ws / "yarn.lock").exists() and shutil.which("yarn"):
+                    return "yarn test"
+                if (ws / "pnpm-lock.yaml").exists() and shutil.which("pnpm"):
+                    return "pnpm test"
+                return "npm test"
+        except Exception:
+            pass
+    return "npm test"
 
 # 定义可用工具
 TOOLS = [
