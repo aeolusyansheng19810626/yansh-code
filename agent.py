@@ -1253,9 +1253,15 @@ def _is_transient_error(exc) -> bool:
     return False
 
 
-def call_llm(messages, tools=None, tool_choice=None, response_format=None):
+def call_llm(messages, tools=None, tool_choice=None, response_format=None, stream: bool | None = None):
     """尝试QUALITY_CASCADE中的模型，依次降级调用。每模型对 429/5xx 指数退避重试。
-    在子线程中执行，每100ms检查一次ESC中断。"""
+    在子线程中执行，每100ms检查一次ESC中断。
+    stream=True 且 tools=None 时启用流式输出，实时打印 token。"""
+    # 无工具调用时默认开启流式（response_format=json_object 时强制关闭，JSON 流解析复杂）
+    use_stream = (stream is True) or (
+        stream is None and tools is None and response_format is None
+    )
+
     result_holder = [None]
     exc_holder = [None]
 
@@ -1271,12 +1277,17 @@ def call_llm(messages, tools=None, tool_choice=None, response_format=None):
                         kwargs["tool_choice"] = tool_choice
                     if response_format is not None:
                         kwargs["response_format"] = response_format
-                    result_holder[0] = client.chat.completions.create(**kwargs)
+                    if use_stream:
+                        kwargs["stream"] = True
+                        result_holder[0] = _handle_stream(
+                            client.chat.completions.create(**kwargs), model
+                        )
+                    else:
+                        result_holder[0] = client.chat.completions.create(**kwargs)
                     return
                 except Exception as e:
                     exc_holder[0] = e
                     if _is_transient_error(e) and attempt < LLM_MAX_RETRIES_PER_MODEL - 1:
-                        # 指数退避；期间仍可被 ESC 打断（主循环每 100ms 检查）
                         deadline = _time.time() + backoff
                         while _time.time() < deadline:
                             if interrupt.is_interrupted():
@@ -1284,7 +1295,7 @@ def call_llm(messages, tools=None, tool_choice=None, response_format=None):
                             _time.sleep(0.1)
                         backoff *= 2
                         continue
-                    break  # 非瞬时错误或已达上限，跳到下一个模型
+                    break
 
     t = threading.Thread(target=_worker, daemon=True)
     t.start()
@@ -1295,18 +1306,58 @@ def call_llm(messages, tools=None, tool_choice=None, response_format=None):
 
     if result_holder[0] is None:
         raise RuntimeError(f"所有模型调用均失败: {exc_holder[0]}")
-    
+
     # #62 统计 Token
     res = result_holder[0]
     if hasattr(res, "usage") and res.usage:
-        p = res.usage.prompt_tokens
-        c = res.usage.completion_tokens
+        p = res.usage.prompt_tokens or 0
+        c = res.usage.completion_tokens or 0
         _last_request_tokens["prompt"] = p
         _last_request_tokens["completion"] = c
         _session_tokens["prompt"] += p
         _session_tokens["completion"] += c
 
     return res
+
+
+def _handle_stream(stream_iter, model: str):
+    """消费流式响应，实时打印 token，返回与非流式兼容的伪 response 对象。"""
+    from types import SimpleNamespace
+    collected_content = []
+    usage_data = None
+
+    for chunk in stream_iter:
+        if interrupt.is_interrupted():
+            raise interrupt.Interrupted()
+        if not chunk.choices:
+            # 某些模型在最后一个 chunk 放 usage
+            if hasattr(chunk, "usage") and chunk.usage:
+                usage_data = chunk.usage
+            continue
+        delta = chunk.choices[0].delta
+        if delta and delta.content:
+            sys.stdout.write(delta.content)
+            sys.stdout.flush()
+            collected_content.append(delta.content)
+
+    # 流结束后换行
+    if collected_content:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+    full_content = "".join(collected_content)
+
+    # 构造与非流式兼容的伪 response 对象
+    from types import SimpleNamespace
+    message = SimpleNamespace(
+        content=full_content,
+        tool_calls=None,
+        role="assistant",
+    )
+    choice = SimpleNamespace(message=message, finish_reason="stop")
+    usage = usage_data or SimpleNamespace(prompt_tokens=0, completion_tokens=len(full_content) // 4)
+    response = SimpleNamespace(choices=[choice], usage=usage, model=model)
+    return response
 
 
 def show_stats():
