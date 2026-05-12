@@ -681,8 +681,9 @@ def restore_snapshot(snap_info):
         return 0
 
     if mode == "git":
+        import config as _cfg_mod
         stash_msg = snap_info["msg"]
-        ws = WORKSPACE_DIR
+        ws = _cfg_mod.WORKSPACE_DIR
         # 找到对应的 stash 索引
         rc, stdout, _ = _git_run(["stash", "list"], ws)
         stash_idx = None
