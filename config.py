@@ -16,9 +16,10 @@ load_dotenv()
 # TIER_DEBUG     = DEEPSEEK_MODEL
 # QUALITY_CASCADE = [TIER_TOP, TIER_UPPER_MID, TIER_MID, TIER_LOW, TIER_DEBUG]
 
-# ---------- API 配置 ----------
+# ---------- API 配置（LLM_API_KEY）----------
 # DeepSeek 走 OpenRouter；Claude 走 IBM ICA 网关
 # 优先读 OPENROUTER_API_KEY（DeepSeek），回落到 CLAUDE_API_KEY（Claude/ICA）
+# 注：变量名沿用 OPENROUTER_API_KEY 以减少 import 改动，语义上等同于 LLM_API_KEY
 OPENROUTER_API_KEY = (
     os.getenv("OPENROUTER_API_KEY")
     or os.getenv("CLAUDE_API_KEY")
@@ -55,10 +56,11 @@ QUALITY_CASCADE = [TIER_TOP, TIER_UPPER_MID, TIER_MID, TIER_LOW, TIER_DEBUG]
 MAX_ATTEMPTS = 3
 WORKSPACE_DIR = "workspace"
 
-# ---------- #62 Token 价格配置 (按 Groq llama-4-scout) ----------
-# 按 $1M Tokens 计算
-TOKEN_PRICE_INPUT  = 0.20  # $0.20 / 1M input tokens
-TOKEN_PRICE_OUTPUT = 0.60  # $0.60 / 1M output tokens
+# ---------- #62 Token 价格配置 ----------
+# 按 $1M Tokens 计算；当前默认模型：DeepSeek V4 Flash (via OpenRouter)
+# DeepSeek V4 Flash: $0.07/1M input, $0.28/1M output（参考 openrouter.ai，以实际账单为准）
+TOKEN_PRICE_INPUT  = 0.07  # $0.07 / 1M input tokens
+TOKEN_PRICE_OUTPUT = 0.28  # $0.28 / 1M output tokens
 
 # ---------- #43 项目级配置文件 ----------
 

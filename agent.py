@@ -570,6 +570,14 @@ def load_replay(replay_id):
 
 # ---------- #37 快照 / 回滚 ----------
 
+# 快照/回滚时需要跳过的目录
+_SNAPSHOT_IGNORE_DIRS = {".git", ".yansh", "__pycache__", "venv", "node_modules", ".pytest_cache"}
+
+def _should_skip_dir(root: str) -> bool:
+    """判断 os.walk 的某个 root 路径是否应跳过"""
+    parts = set(Path(root).parts)
+    return bool(parts & _SNAPSHOT_IGNORE_DIRS)
+
 def create_snapshot(file_list):
     """备份 file_list 中在 workspace 已存在的文件，记录完整文件列表用于回滚，返回快照目录"""
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -578,8 +586,10 @@ def create_snapshot(file_list):
     
     # 记录当前 workspace 所有文件列表，用于恢复时删除新建文件
     workspace_files = []
-    for root, _, files in os.walk(WORKSPACE_DIR):
-        if ".git" in root: continue
+    for root, dirs, files in os.walk(WORKSPACE_DIR):
+        if _should_skip_dir(root):
+            dirs.clear()
+            continue
         for filename in files:
             rel_path = os.path.relpath(os.path.join(root, filename), WORKSPACE_DIR)
             workspace_files.append(rel_path.replace("\\", "/"))
@@ -624,8 +634,10 @@ def restore_snapshot(snap_dir):
     # 2. 删除快照后新建的文件
     workspace_files_then = set(meta.get("workspace_files", []))
     current_files = []
-    for root, _, files in os.walk(WORKSPACE_DIR):
-        if ".git" in root: continue
+    for root, dirs, files in os.walk(WORKSPACE_DIR):
+        if _should_skip_dir(root):
+            dirs.clear()
+            continue
         for filename in files:
             rel_path = os.path.relpath(os.path.join(root, filename), WORKSPACE_DIR)
             current_files.append(rel_path.replace("\\", "/"))
@@ -1650,7 +1662,12 @@ def fix(test_result, plan):
     while True:
         response = call_llm(messages, tools=TOOLS, tool_choice="auto")
         response_message = response.choices[0].message
-        messages.append(response_message)
+        # 显式序列化为 dict，避免 Pydantic 对象在不同 SDK 版本下序列化异常
+        messages.append({
+            "role": "assistant",
+            "content": response_message.content,
+            "tool_calls": [tc.model_dump() for tc in response_message.tool_calls] if response_message.tool_calls else None,
+        })
 
         if response_message.tool_calls:
             console.print(f"执行 {len(response_message.tool_calls)} 个修复操作...")
@@ -2030,15 +2047,35 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
             break
 
 
+# 明确是闲聊的关键词规则（规则优先，避免每次都调 LLM）
+_CHAT_PATTERNS = {"你好", "hi", "hello", "谢谢", "thanks", "thank you", "再见", "bye",
+                  "帮我", "解释", "什么是", "如何", "为什么", "介绍", "说说"}
+
 def classify_input(user_input):
-    """判断用户输入是新任务还是闲聊"""
+    """判断用户输入是新任务还是闲聊。规则优先，歧义时才调 LLM。"""
+    stripped = user_input.strip().lower()
+    # 极短输入（≤5字）直接视为闲聊
+    if len(stripped) <= 5:
+        return "chat"
+    # 关键词匹配
+    if any(kw in stripped for kw in _CHAT_PATTERNS):
+        return "chat"
+    # 明显任务关键词
+    task_kws = {"写", "创建", "实现", "修改", "修复", "生成", "添加", "删除", "重构",
+                "create", "write", "implement", "fix", "add", "remove", "refactor", "build"}
+    if any(kw in stripped for kw in task_kws):
+        return "task"
+    # 歧义时调 LLM
     messages = [
         {"role": "system", "content": "判断以下输入是'新任务'还是'闲聊'，只回复 task 或 chat。"},
         {"role": "user", "content": f"输入：{user_input}"}
     ]
-    response = call_llm(messages)
-    result = response.choices[0].message.content.strip().lower()
-    return "task" if "task" in result else "chat"
+    try:
+        response = call_llm(messages)
+        result = response.choices[0].message.content.strip().lower()
+        return "task" if "task" in result else "chat"
+    except Exception:
+        return "task"  # 调用失败时保守地当作任务
 
 def chat(user_input):
     """闲聊模式，LLM 直接回复，控制在 100 字以内"""
