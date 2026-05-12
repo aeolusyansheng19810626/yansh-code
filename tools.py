@@ -8,6 +8,19 @@ from config import WORKSPACE_DIR
 
 _WORKSPACE_ROOT = Path(WORKSPACE_DIR).resolve()
 
+
+def _reinit_paths():
+    """--cwd 变更后重新初始化模块级路径变量（由 main.py 调用）"""
+    global _WORKSPACE_ROOT
+    from config import WORKSPACE_DIR as _WD
+    _WORKSPACE_ROOT = Path(_WD).resolve()
+
+
+def _get_workspace() -> str:
+    """每次调用都从 config 读取最新 WORKSPACE_DIR，确保 --cwd 生效后不使用旧值。"""
+    import config as _cfg_mod
+    return _cfg_mod.WORKSPACE_DIR
+
 # #40 批处理模式标志（由 agent.set_batch_mode() 设置）
 _BATCH_MODE = False
 # 严格模式：批处理下仍然拒绝 Level-3 需确认命令（pip/npm install、git checkout/reset）
@@ -106,7 +119,7 @@ def write_file(filename, content):
     resolved, err = _validate_path(filename)
     if err:
         return err
-    os.makedirs(WORKSPACE_DIR, exist_ok=True)
+    os.makedirs(_get_workspace(), exist_ok=True)
     try:
         resolved.parent.mkdir(parents=True, exist_ok=True)
         resolved.write_text(content, encoding='utf-8')
@@ -168,7 +181,7 @@ def execute_command(command):
             text=True,
             encoding="utf-8",
             errors="replace",
-            cwd=WORKSPACE_DIR,
+            cwd=_get_workspace(),
             env=env,
         )
 
@@ -273,7 +286,7 @@ def replace_in_file(filename, old_str, new_str):
 
 def _get_ignore_spec():
     import pathspec
-    gitignore_path = Path(WORKSPACE_DIR) / ".gitignore"
+    gitignore_path = Path(_get_workspace()) / ".gitignore"
     if gitignore_path.exists():
         try:
             with open(gitignore_path, "r", encoding="utf-8") as f:
@@ -284,15 +297,16 @@ def _get_ignore_spec():
 
 def list_files():
     """列出workspace目录下的所有文件（遵循.gitignore）"""
-    os.makedirs(WORKSPACE_DIR, exist_ok=True)
+    ws = _get_workspace()
+    os.makedirs(ws, exist_ok=True)
     files = []
     spec = _get_ignore_spec()
-    for root, dirs, filenames in os.walk(WORKSPACE_DIR):
+    for root, dirs, filenames in os.walk(ws):
         # 跳过 .git 目录
         if ".git" in root:
             continue
         for filename in filenames:
-            rel_path = os.path.relpath(os.path.join(root, filename), WORKSPACE_DIR)
+            rel_path = os.path.relpath(os.path.join(root, filename), ws)
             # 统一使用正斜杠匹配
             if spec and spec.match_file(rel_path.replace("\\", "/")):
                 continue
@@ -339,12 +353,12 @@ def search_in_files(pattern, workspace=None, regex=False, extensions=None):
     import re
     
     if workspace is None:
-        workspace = Path(WORKSPACE_DIR)
+        workspace = Path(_get_workspace())
     else:
         workspace = Path(workspace)
     
     # 路径安全检查
-    abs_workspace = Path(WORKSPACE_DIR).resolve()
+    abs_workspace = Path(_get_workspace()).resolve()
     abs_search_path = workspace.resolve()
     
     try:
@@ -786,7 +800,7 @@ def find_references(symbol, path="."):
 
     # 遵循 .gitignore
     spec = _get_ignore_spec()
-    abs_workspace = Path(WORKSPACE_DIR).resolve()
+    abs_workspace = Path(_get_workspace()).resolve()
 
     for file_path in resolved_root.rglob("*.py"):
         if ".git" in file_path.parts:
@@ -803,7 +817,7 @@ def find_references(symbol, path="."):
                     if ref_pattern.search(line):
                         # 排除定义行
                         if not def_pattern.search(line):
-                            rel_path = os.path.relpath(file_path, WORKSPACE_DIR).replace("\\", "/")
+                            rel_path = os.path.relpath(file_path, _get_workspace()).replace("\\", "/")
                             references.append(f"{rel_path}:{line_num}: {line.strip()}")
         except Exception:
             continue

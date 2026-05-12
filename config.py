@@ -56,6 +56,16 @@ QUALITY_CASCADE = [TIER_TOP, TIER_UPPER_MID, TIER_MID, TIER_LOW, TIER_DEBUG]
 MAX_ATTEMPTS = 3
 WORKSPACE_DIR = "workspace"
 
+
+def set_workspace_dir(path: str):
+    """在 main() 解析 --cwd 后调用，更新 WORKSPACE_DIR 及依赖它的路径。
+    必须在 agent.py / tools.py 的模块级路径初始化完成后再调用
+    agent._reinit_paths() 和 tools._reinit_paths() 使变更生效。"""
+    global WORKSPACE_DIR, _CONFIG_FILE
+    WORKSPACE_DIR = path
+    _CONFIG_FILE = Path(path) / ".yansh" / "config.json"
+
+
 # ---------- #62 Token 价格配置 ----------
 # 按 $1M Tokens 计算；当前默认模型：DeepSeek V4 Flash (via OpenRouter)
 # DeepSeek V4 Flash: $0.07/1M input, $0.28/1M output（参考 openrouter.ai，以实际账单为准）

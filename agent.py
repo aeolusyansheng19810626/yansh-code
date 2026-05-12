@@ -578,6 +578,18 @@ def load_replay(replay_id):
     except Exception as e:
         console.print(f"[错误] 加载失败: {e}", style="red")
 
+def _reinit_paths():
+    """--cwd 变更后重新初始化 agent 中所有依赖 WORKSPACE_DIR 的模块级变量。"""
+    global _YANSH_DIR, _SNAPSHOT_DIR, _LOG_DIR, _REPLAY_DIR, _HISTORY_FILE
+    import config as _cfg_mod
+    _wd = _cfg_mod.WORKSPACE_DIR
+    _YANSH_DIR     = Path(_wd) / ".yansh"
+    _SNAPSHOT_DIR  = _YANSH_DIR / "snapshots"
+    _LOG_DIR       = _YANSH_DIR / "logs"
+    _REPLAY_DIR    = _YANSH_DIR / "replay"
+    _HISTORY_FILE  = Path(_wd) / ".yansh_history.json"
+
+
 # ---------- #37 快照 / 回滚 ----------
 
 # 快照/回滚时需要跳过的目录

@@ -8,7 +8,7 @@ from agent import (
     get_latest_snapshot, restore_snapshot, cleanup_snapshot, show_recent_logs,
     detect_project_type, _PROJECT_TYPE, _PROJECT_TEST_CMD, _LOG_DIR
 )
-from config import load_project_config, get_config, override_config, WORKSPACE_DIR, CLAUDE_OPUS, CLAUDE_SONNET, CLAUDE_HAIKU
+from config import load_project_config, get_config, override_config, set_workspace_dir, WORKSPACE_DIR, CLAUDE_OPUS, CLAUDE_SONNET, CLAUDE_HAIKU
 import interrupt
 from pathlib import Path
 import monitor
@@ -190,7 +190,17 @@ def main():
     parser.add_argument("--model", help="指定 LLM 模型")
     parser.add_argument("--json", action="store_true", help="以 JSON 格式输出最后结果 (batch 模式)")
     parser.add_argument("--strict", action="store_true", help="批处理模式下拒绝需确认命令（pip/npm install、git checkout/reset）")
+    parser.add_argument("--cwd", metavar="DIR", help="指定工作目录（workspace），默认为 ./workspace")
     args = parser.parse_args()
+
+    # --cwd：在一切初始化之前设置 workspace 路径
+    if args.cwd:
+        import config as _config_mod
+        import tools as _tools_mod2
+        import agent as _agent_mod2
+        _config_mod.set_workspace_dir(args.cwd)
+        _tools_mod2._reinit_paths()
+        _agent_mod2._reinit_paths()
 
     # 加载配置
     load_project_config()
