@@ -12,7 +12,10 @@
 - 🔍 **AST 符号检索**：通过 tree-sitter 精确定位函数/类定义，支持精确代码替换。
 - 👁️ **视觉支持**：支持 `@image <路径/URL>` 和 `@paste`（剪贴板），可分析 UI 设计稿或报错截图生成代码。
 - 🧪 **闭环质量保障**：集成 `pytest` 自动运行测试，支持 `ruff` 静态检查，无测试文件时自动生成最小测试用例。
-- 🛡️ **安全与回滚**：任务开始前自动创建快照，支持手动 `/revert` 回滚。内置安全沙箱拦截危险命令。
+- 🛡️ **安全与回滚**：任务开始前自动 git stash 快照（无 git 时文件复制兜底），支持 `/revert` 回滚。内置安全沙箱拦截危险命令。
+- 📡 **流式输出**：LLM 回复实时打印 token，长任务不再黑屏等待。
+- 📂 **多项目支持**：`--cwd <目录>` 指定任意项目作为 workspace，无需修改配置。
+- 🔍 **测试命令自动发现**：读取 pyproject.toml / package.json / tox.ini，自动选择 uv/poetry/tox/yarn/pnpm 等正确的测试命令。
 - 🗂️ **上下文管理**：支持 `@add_file` 注入特定文件上下文，自动压缩长对话历史，支持项目级规则 `.agent_rules`。
 - 💾 **任务回放**：任务失败或异常时自动打包 `replay` 包，方便后续复现与调试。
 - 💰 **成本透明**：显示每轮任务的 Token 消耗及估算的 API 费用。
@@ -26,12 +29,16 @@
 # 2. 安装依赖
 pip install -r requirements.txt
 
-# 3. 配置密钥（通过 IBM ICA 网关调用 Claude）
+# 3. 配置密钥（通过 IBM ICA 网关调用 Claude，或 OpenRouter 调用 DeepSeek）
 copy .env.example .env
-# 编辑 .env 填入你的 CLAUDE_API_KEY 和 CLAUDE_BASE_URL
+# 编辑 .env 填入你的 CLAUDE_API_KEY + CLAUDE_BASE_URL（IBM ICA）
+# 或填入 OPENROUTER_API_KEY（OpenRouter / DeepSeek）
 
-# 4. 运行
+# 4. 运行（默认 workspace/ 目录）
 python main.py
+
+# 指定任意项目目录作为 workspace
+python main.py --cwd /path/to/your/project
 ```
 
 ## 测试
