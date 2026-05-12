@@ -88,19 +88,23 @@ def test_git_snapshot_clean_workspace(git_ws):
 
 
 def test_git_restore_recovers_file(git_ws):
-    """restore_snapshot 后被删除的文件应恢复"""
+    """restore_snapshot 后被修改的文件应恢复"""
     from agent import create_snapshot, restore_snapshot, cleanup_snapshot
+    # 先提交 recover_me.py
     (git_ws / "recover_me.py").write_text("original")
     _git(["add", "."], git_ws)
     _git(["commit", "-m", "add file"], git_ws)
 
-    # 快照，然后修改
-    snap = create_snapshot(["recover_me.py"])
+    # 修改文件（产生脏变更），然后快照
     (git_ws / "recover_me.py").write_text("modified")
+    snap = create_snapshot(["recover_me.py"])
+    assert snap["mode"] == "git", f"预期 git 模式，实际: {snap}"
+
+    # 再次修改
+    (git_ws / "recover_me.py").write_text("further modified")
 
     n = restore_snapshot(snap)
     assert n >= 1
-    # 原内容应恢复（stash pop 后文件回到 committed 状态）
     cleanup_snapshot(snap)
 
 
