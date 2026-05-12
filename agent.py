@@ -600,50 +600,121 @@ def _should_skip_dir(root: str) -> bool:
     parts = set(Path(root).parts)
     return bool(parts & _SNAPSHOT_IGNORE_DIRS)
 
+
+def _git_run(args: list, cwd: str) -> tuple:
+    """在指定目录运行 git 命令，返回 (returncode, stdout, stderr)。"""
+    import subprocess
+    r = subprocess.run(
+        ["git"] + args,
+        cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace"
+    )
+    return r.returncode, r.stdout, r.stderr
+
+
+def _git_is_repo(cwd: str) -> bool:
+    """检查 cwd 是否在 git 仓库内。"""
+    rc, _, _ = _git_run(["rev-parse", "--git-dir"], cwd)
+    return rc == 0
+
+
 def create_snapshot(file_list):
-    """备份 file_list 中在 workspace 已存在的文件，记录完整文件列表用于回滚，返回快照目录"""
+    """备份工作区：若在 git 仓库内用 git stash，否则回退到文件复制快照。
+    返回快照标识（git 模式：stash 消息前缀；文件模式：Path 对象）。"""
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    ws = WORKSPACE_DIR
+
+    if _git_is_repo(ws):
+        # git 模式：先 add 所有未追踪文件（确保新建文件也被 stash），再 stash
+        stash_msg = f"yansh-snapshot-{timestamp}"
+        _git_run(["add", "-A"], ws)
+        rc, stdout, stderr = _git_run(["stash", "push", "-m", stash_msg], ws)
+        if rc == 0 and "No local changes" not in stdout:
+            console.print(f"[快照] git stash: {stash_msg}", highlight=False)
+            return {"mode": "git", "msg": stash_msg, "timestamp": timestamp}
+        else:
+            # 工作区干净，没有东西可 stash
+            console.print("[快照] 工作区干净，无需 stash", highlight=False)
+            return {"mode": "git_clean", "timestamp": timestamp}
+
+    # 文件复制模式（兜底）
     snap_dir = _SNAPSHOT_DIR / timestamp
     snap_dir.mkdir(parents=True, exist_ok=True)
-    
-    # 记录当前 workspace 所有文件列表，用于恢复时删除新建文件
     workspace_files = []
-    for root, dirs, files in os.walk(WORKSPACE_DIR):
+    for root, dirs, files in os.walk(ws):
         if _should_skip_dir(root):
             dirs.clear()
             continue
         for filename in files:
-            rel_path = os.path.relpath(os.path.join(root, filename), WORKSPACE_DIR)
+            rel_path = os.path.relpath(os.path.join(root, filename), ws)
             workspace_files.append(rel_path.replace("\\", "/"))
-
     backed = []
     for filename in file_list:
-        src = Path(WORKSPACE_DIR) / filename
+        src = Path(ws) / filename
         if src.exists() and src.is_file():
             dst = snap_dir / filename
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(str(src), str(dst))
             backed.append(filename)
-    
-    # 如果没有任何备份且没有任何文件（极少见），也要记录 meta
     (snap_dir / "meta.json").write_text(
-        json.dumps({
-            "files": backed, 
-            "workspace_files": workspace_files, 
-            "timestamp": timestamp
-        }, ensure_ascii=False),
-        encoding="utf-8"
+        json.dumps({"files": backed, "workspace_files": workspace_files, "timestamp": timestamp},
+                   ensure_ascii=False), encoding="utf-8"
     )
-    return snap_dir
+    console.print(f"[快照] 文件复制模式: {snap_dir.name}", highlight=False)
+    return {"mode": "file", "path": str(snap_dir), "timestamp": timestamp}
 
-def restore_snapshot(snap_dir):
-    """从快照目录恢复文件，并删除快照后新建的文件，返回恢复数量"""
+
+def restore_snapshot(snap_info):
+    """根据快照标识恢复工作区，返回恢复数量。"""
+    if not snap_info:
+        return 0
+
+    mode = snap_info.get("mode") if isinstance(snap_info, dict) else None
+
+    # 兼容旧版 Path 对象形式
+    if isinstance(snap_info, Path) or mode == "file":
+        snap_dir = Path(snap_info["path"]) if isinstance(snap_info, dict) else snap_info
+        return _restore_file_snapshot(snap_dir)
+
+    if mode == "git_clean":
+        console.print("[回滚] 工作区原本干净，无需恢复", highlight=False)
+        return 0
+
+    if mode == "git":
+        stash_msg = snap_info["msg"]
+        ws = WORKSPACE_DIR
+        # 找到对应的 stash 索引
+        rc, stdout, _ = _git_run(["stash", "list"], ws)
+        stash_idx = None
+        for line in stdout.splitlines():
+            if stash_msg in line:
+                # 格式: stash@{0}: On branch: msg
+                stash_idx = line.split(":")[0]  # "stash@{0}"
+                break
+        if stash_idx is None:
+            console.print(f"[回滚] 未找到 stash: {stash_msg}", style="yellow", highlight=False)
+            return 0
+        # 恢复：先丢弃当前改动，再 pop
+        _git_run(["checkout", "--", "."], ws)
+        _git_run(["clean", "-fd", "--exclude=.yansh"], ws)
+        rc, _, stderr = _git_run(["stash", "pop", stash_idx], ws)
+        if rc == 0:
+            console.print(f"[回滚] git stash pop 成功", highlight=False)
+            # 把恢复的文件重新变为未追踪状态（stash pop 后是 staged）
+            _git_run(["reset", "HEAD", "."], ws)
+            return 1
+        else:
+            console.print(f"[回滚] git stash pop 失败: {stderr}", style="red", highlight=False)
+            return 0
+
+    return 0
+
+
+def _restore_file_snapshot(snap_dir: Path) -> int:
+    """文件复制模式的恢复逻辑（原 restore_snapshot）。"""
     meta_file = snap_dir / "meta.json"
     if not meta_file.exists():
         return 0
     meta = json.loads(meta_file.read_text(encoding="utf-8"))
-    
-    # 1. 恢复备份的文件
     restored = 0
     for filename in meta.get("files", []):
         src = snap_dir / filename
@@ -652,8 +723,6 @@ def restore_snapshot(snap_dir):
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(str(src), str(dst))
             restored += 1
-            
-    # 2. 删除快照后新建的文件
     workspace_files_then = set(meta.get("workspace_files", []))
     current_files = []
     for root, dirs, files in os.walk(WORKSPACE_DIR):
@@ -663,7 +732,6 @@ def restore_snapshot(snap_dir):
         for filename in files:
             rel_path = os.path.relpath(os.path.join(root, filename), WORKSPACE_DIR)
             current_files.append(rel_path.replace("\\", "/"))
-            
     for f in current_files:
         if f not in workspace_files_then:
             path = Path(WORKSPACE_DIR) / f
@@ -672,23 +740,44 @@ def restore_snapshot(snap_dir):
                     path.unlink()
             except Exception as e:
                 console.print(f"[警告] 回滚时无法删除 {f}: {e}", style="yellow", highlight=False)
-
     return restored
 
-def cleanup_snapshot(snap_dir):
-    """删除快照目录"""
-    if snap_dir and snap_dir.exists():
-        shutil.rmtree(str(snap_dir))
+
+def cleanup_snapshot(snap_info):
+    """清理快照：git 模式 drop stash，文件模式删除目录。"""
+    if not snap_info:
+        return
+    mode = snap_info.get("mode") if isinstance(snap_info, dict) else None
+    if mode == "git":
+        stash_msg = snap_info["msg"]
+        ws = WORKSPACE_DIR
+        rc, stdout, _ = _git_run(["stash", "list"], ws)
+        for line in stdout.splitlines():
+            if stash_msg in line:
+                stash_idx = line.split(":")[0]
+                _git_run(["stash", "drop", stash_idx], ws)
+                break
+    elif mode == "file":
+        snap_dir = Path(snap_info["path"])
+        if snap_dir.exists():
+            shutil.rmtree(str(snap_dir))
+    elif isinstance(snap_info, Path) and snap_info.exists():
+        shutil.rmtree(str(snap_info))
+
 
 def get_latest_snapshot():
-    """返回最新快照目录，不存在返回 None"""
+    """返回最新快照目录，不存在返回 None（文件复制模式兼容）"""
     if not _SNAPSHOT_DIR.exists():
         return None
     candidates = sorted(
         (s for s in _SNAPSHOT_DIR.iterdir() if s.is_dir() and (s / "meta.json").exists()),
         reverse=True
     )
-    return candidates[0] if candidates else None
+    if not candidates:
+        return None
+    s = candidates[0]
+    return {"mode": "file", "path": str(s), "timestamp": s.name}
+
 
 # ---------- #38 任务日志 ----------
 
