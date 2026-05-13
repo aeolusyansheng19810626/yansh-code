@@ -387,6 +387,8 @@ def _get_ica_client():
             or _os.getenv("ANTHROPIC_BASE_URL")
             or "https://api.nextgen-beta.ica.ibm.com/ica/v1"
         )
+        if not ica_base.rstrip("/").endswith("/v1"):
+            ica_base = ica_base.rstrip("/") + "/v1"
         _ica_client = OpenAI(api_key=ica_key, base_url=ica_base)
     return _ica_client
 
