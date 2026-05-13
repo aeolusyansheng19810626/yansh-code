@@ -405,9 +405,22 @@ def _client_for(model: str):
         return _get_ica_client()
     return client
 
+def _extract_json(text: str) -> str:
+    """从 LLM 响应中提取 JSON 字符串（兼容 markdown 代码块）"""
+    import re
+    text = text.strip()
+    m = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
+    if m:
+        return m.group(1).strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return text[start:end + 1]
+    return text
+
 def _call_single_model(cl, model, messages, response_format=None):
     kwargs = {"model": model, "messages": messages, "timeout": LLM_TIMEOUT_SEC}
-    if response_format:
+    if response_format and not _is_claude(model):
         kwargs["response_format"] = response_format
     return cl.chat.completions.create(**kwargs)
 
@@ -1421,7 +1434,7 @@ def call_llm(messages, tools=None, tool_choice=None, response_format=None, strea
                         kwargs["tools"] = tools
                     if tool_choice is not None:
                         kwargs["tool_choice"] = tool_choice
-                    if response_format is not None:
+                    if response_format is not None and not _is_claude(model):
                         kwargs["response_format"] = response_format
                     cl = _client_for(model)
                     if use_stream and not _is_gemini(model):
@@ -1644,7 +1657,7 @@ test_command 禁止使用 python -c 内联执行（会被安全策略拦截）�
     if not content:
         content = "{}"
     try:
-        result = json.loads(content)
+        result = json.loads(_extract_json(content))
         if isinstance(result, list):
             return {"files": result, "test_command": ""}
         return result
@@ -1926,7 +1939,7 @@ def review(requirement, modified_files):
         else:
             response = call_llm(messages, response_format={"type": "json_object"})
         content = response.choices[0].message.content or ""
-        return json.loads(content)
+        return json.loads(_extract_json(content))
     except json.JSONDecodeError as e:
         return {
             "approved": False,
