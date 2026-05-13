@@ -362,6 +362,7 @@ client = OpenAI(
 REVIEW_MODEL = None  # None = 跟随写代码模型
 
 _gemini_client = None
+_ica_client = None
 
 def _get_gemini_client():
     global _gemini_client
@@ -370,8 +371,37 @@ def _get_gemini_client():
         _gemini_client = OpenAI(api_key=GEMINI_API_KEY, base_url=GEMINI_BASE_URL)
     return _gemini_client
 
+def _get_ica_client():
+    """专用 ICA 客户端，用于 Claude 模型（主 client 可能指向 OpenRouter）"""
+    global _ica_client
+    if _ica_client is None:
+        import os as _os
+        ica_key = (
+            _os.getenv("CLAUDE_API_KEY")
+            or _os.getenv("ANTHROPIC_AUTH_TOKEN")
+            or _os.getenv("ANTHROPIC_API_KEY")
+            or OPENROUTER_API_KEY
+        )
+        ica_base = (
+            _os.getenv("CLAUDE_BASE_URL")
+            or _os.getenv("ANTHROPIC_BASE_URL")
+            or "https://api.nextgen-beta.ica.ibm.com/ica/v1"
+        )
+        _ica_client = OpenAI(api_key=ica_key, base_url=ica_base)
+    return _ica_client
+
 def _is_gemini(model: str) -> bool:
     return model is not None and model.startswith("gemini")
+
+def _is_claude(model: str) -> bool:
+    return model is not None and model.startswith("claude")
+
+def _client_for(model: str):
+    if _is_gemini(model):
+        return _get_gemini_client()
+    if _is_claude(model):
+        return _get_ica_client()
+    return client
 
 def _call_single_model(cl, model, messages, response_format=None):
     kwargs = {"model": model, "messages": messages, "timeout": LLM_TIMEOUT_SEC}
@@ -1391,7 +1421,7 @@ def call_llm(messages, tools=None, tool_choice=None, response_format=None, strea
                         kwargs["tool_choice"] = tool_choice
                     if response_format is not None:
                         kwargs["response_format"] = response_format
-                    cl = _get_gemini_client() if _is_gemini(model) else client
+                    cl = _client_for(model)
                     if use_stream and not _is_gemini(model):
                         kwargs["stream"] = True
                         result_holder[0] = _handle_stream(
@@ -1888,11 +1918,8 @@ def review(requirement, modified_files):
     ]
     
     try:
-        if REVIEW_MODEL and _is_gemini(REVIEW_MODEL):
-            response = _call_single_model(_get_gemini_client(), REVIEW_MODEL, messages,
-                                          response_format={"type": "json_object"})
-        elif REVIEW_MODEL:
-            response = _call_single_model(client, REVIEW_MODEL, messages,
+        if REVIEW_MODEL:
+            response = _call_single_model(_client_for(REVIEW_MODEL), REVIEW_MODEL, messages,
                                           response_format={"type": "json_object"})
         else:
             response = call_llm(messages, response_format={"type": "json_object"})
