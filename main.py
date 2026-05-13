@@ -8,7 +8,7 @@ from agent import (
     get_latest_snapshot, restore_snapshot, cleanup_snapshot, show_recent_logs,
     detect_project_type, _PROJECT_TYPE, _PROJECT_TEST_CMD, _LOG_DIR
 )
-from config import load_project_config, get_config, override_config, set_workspace_dir, WORKSPACE_DIR, CLAUDE_OPUS, CLAUDE_SONNET, CLAUDE_HAIKU
+from config import load_project_config, get_config, override_config, set_workspace_dir, WORKSPACE_DIR, CLAUDE_OPUS, CLAUDE_SONNET, CLAUDE_HAIKU, GEMINI_3_FLASH, GEMINI_31_PRO
 import interrupt
 from pathlib import Path
 import monitor
@@ -270,26 +270,42 @@ def main():
                 ("2", "Claude Opus 4.7",    CLAUDE_OPUS),
                 ("3", "Claude Sonnet 4.6",  CLAUDE_SONNET),
                 ("4", "Claude Haiku 4.5",   CLAUDE_HAIKU),
+                ("5", "Gemini 3 Flash",     GEMINI_3_FLASH),
+                ("6", "Gemini 3.1 Pro",     GEMINI_31_PRO),
             ]
-            current_model = get_config()["model"]
+            import agent as _am
+            current_code_model = get_config()["model"]
+            current_review_model = _am.REVIEW_MODEL or "[跟随写代码模型]"
+            console.print("\n[bold]选择要配置的模型：[/bold]", highlight=False)
+            console.print(f"  1. 写代码模型（当前: {current_code_model}）", highlight=False)
+            console.print(f"  2. Review 模型（当前: {current_review_model}）", highlight=False)
+            try:
+                target = _read_input("请输入数字 (1-2): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                target = ""
+            if target not in ("1", "2"):
+                console.print("无效输入，已取消。", highlight=False)
+                continue
             console.print("\n[bold]选择模型：[/bold]", highlight=False)
             for num, label, mid in MODEL_MENU:
-                mark = " ◀ 当前" if mid == current_model else ""
-                console.print(f"  {num}. {label}  ({mid}){mark}", highlight=False)
+                console.print(f"  {num}. {label}  ({mid})", highlight=False)
             try:
-                choice = _read_input("请输入数字 (1-4): ").strip()
+                choice = _read_input("请输入数字 (1-6): ").strip()
             except (EOFError, KeyboardInterrupt):
                 choice = ""
             matched = next((m for n, _, m in MODEL_MENU if n == choice), None)
-            if matched:
+            if not matched:
+                console.print("无效输入，未切换模型。", highlight=False)
+                continue
+            label = next(l for n, l, m in MODEL_MENU if m == matched)
+            if target == "1":
                 override_config(model=matched)
-                import agent as _am
                 if _am.QUALITY_CASCADE:
                     _am.QUALITY_CASCADE[0] = matched
-                label = next(l for n, l, m in MODEL_MENU if m == matched)
-                console.print(f"已切换到：{label}  ({matched})", highlight=False)
+                console.print(f"写代码模型已切换到：{label}  ({matched})", highlight=False)
             else:
-                console.print("无效输入，未切换模型。", highlight=False)
+                _am.REVIEW_MODEL = matched
+                console.print(f"Review 模型已切换到：{label}  ({matched})", highlight=False)
             continue
 
         if user_input == "/compress":

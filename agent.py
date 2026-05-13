@@ -359,6 +359,26 @@ client = OpenAI(
     base_url=OPENROUTER_BASE_URL,
 )
 
+REVIEW_MODEL = None  # None = 跟随写代码模型
+
+_gemini_client = None
+
+def _get_gemini_client():
+    global _gemini_client
+    if _gemini_client is None:
+        from config import GEMINI_API_KEY, GEMINI_BASE_URL
+        _gemini_client = OpenAI(api_key=GEMINI_API_KEY, base_url=GEMINI_BASE_URL)
+    return _gemini_client
+
+def _is_gemini(model: str) -> bool:
+    return model is not None and model.startswith("gemini")
+
+def _call_single_model(cl, model, messages, response_format=None):
+    kwargs = {"model": model, "messages": messages, "timeout": LLM_TIMEOUT_SEC}
+    if response_format:
+        kwargs["response_format"] = response_format
+    return cl.chat.completions.create(**kwargs)
+
 _HISTORY_FILE = Path(WORKSPACE_DIR) / ".yansh_history.json"
 
 def save_history():
@@ -1371,13 +1391,14 @@ def call_llm(messages, tools=None, tool_choice=None, response_format=None, strea
                         kwargs["tool_choice"] = tool_choice
                     if response_format is not None:
                         kwargs["response_format"] = response_format
-                    if use_stream:
+                    cl = _get_gemini_client() if _is_gemini(model) else client
+                    if use_stream and not _is_gemini(model):
                         kwargs["stream"] = True
                         result_holder[0] = _handle_stream(
-                            client.chat.completions.create(**kwargs), model
+                            cl.chat.completions.create(**kwargs), model
                         )
                     else:
-                        result_holder[0] = client.chat.completions.create(**kwargs)
+                        result_holder[0] = cl.chat.completions.create(**kwargs)
                     return
                 except Exception as e:
                     exc_holder[0] = e
@@ -1591,7 +1612,10 @@ test_command 禁止使用 python -c 内联执行（会被安全策略拦截）�
     if not content:
         content = "{}"
     try:
-        return json.loads(content)
+        result = json.loads(content)
+        if isinstance(result, list):
+            return {"files": result, "test_command": ""}
+        return result
     except json.JSONDecodeError:
         return {"files": [], "test_command": ""}
 
@@ -1864,7 +1888,14 @@ def review(requirement, modified_files):
     ]
     
     try:
-        response = call_llm(messages, response_format={"type": "json_object"})
+        if REVIEW_MODEL and _is_gemini(REVIEW_MODEL):
+            response = _call_single_model(_get_gemini_client(), REVIEW_MODEL, messages,
+                                          response_format={"type": "json_object"})
+        elif REVIEW_MODEL:
+            response = _call_single_model(client, REVIEW_MODEL, messages,
+                                          response_format={"type": "json_object"})
+        else:
+            response = call_llm(messages, response_format={"type": "json_object"})
         content = response.choices[0].message.content or ""
         return json.loads(content)
     except json.JSONDecodeError as e:

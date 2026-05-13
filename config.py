@@ -42,6 +42,11 @@ CLAUDE_OPUS   = "claude-opus-4-7"
 CLAUDE_SONNET = "claude-sonnet-4-6"
 CLAUDE_HAIKU  = "claude-haiku-4-5"
 
+GEMINI_3_FLASH  = "gemini-3-flash-preview"
+GEMINI_31_PRO   = "gemini-3.1-pro-preview"
+GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY")
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+
 # 5-tier 级联：顶端用 Opus，其次 Sonnet，失败兜底 Haiku
 DEEPSEEK_FLASH = "deepseek/deepseek-v4-flash"
 
