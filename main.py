@@ -270,8 +270,8 @@ def main():
                 ("2", "Claude Opus 4.7",    CLAUDE_OPUS),
                 ("3", "Claude Sonnet 4.6",  CLAUDE_SONNET),
                 ("4", "Claude Haiku 4.5",   CLAUDE_HAIKU),
-                ("5", "Gemini 3 Flash",     GEMINI_3_FLASH),
-                ("6", "Gemini 3.1 Pro",     GEMINI_31_PRO),
+                ("5", "Gemini 2.5 Flash",    GEMINI_3_FLASH),
+                ("6", "Gemini 2.5 Pro",     GEMINI_31_PRO),
             ]
             import agent as _am
             current_code_model = get_config()["model"]
