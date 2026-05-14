@@ -419,17 +419,46 @@ def _extract_json(text: str) -> str:
     text = text.strip()
     m = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
     if m:
-        return m.group(1).strip()
+        return _sanitize_json_strings(m.group(1).strip())
     start = text.find("{")
     end = text.rfind("}")
     if start != -1 and end != -1 and end > start:
-        return text[start:end + 1]
+        return _sanitize_json_strings(text[start:end + 1])
     return text
 
-def _call_single_model(cl, model, messages, response_format=None):
+
+def _sanitize_json_strings(text: str) -> str:
+    """将 JSON 字符串值内的裸控制字符（换行、制表等）替换为合法转义序列。"""
+    result = []
+    in_string = False
+    escape_next = False
+    for ch in text:
+        if escape_next:
+            result.append(ch)
+            escape_next = False
+        elif ch == "\\":
+            result.append(ch)
+            escape_next = True
+        elif ch == '"':
+            result.append(ch)
+            in_string = not in_string
+        elif in_string and ch == "\n":
+            result.append("\\n")
+        elif in_string and ch == "\r":
+            result.append("\\r")
+        elif in_string and ch == "\t":
+            result.append("\\t")
+        else:
+            result.append(ch)
+    return "".join(result)
+
+def _call_single_model(cl, model, messages, response_format=None, stream=False):
     kwargs = {"model": model, "messages": messages, "timeout": LLM_TIMEOUT_SEC}
     if response_format and not _is_claude(model):
         kwargs["response_format"] = response_format
+    if stream and not _is_gemini(model):
+        kwargs["stream"] = True
+        return _handle_stream(cl.chat.completions.create(**kwargs), model)
     return cl.chat.completions.create(**kwargs)
 
 _HISTORY_FILE = Path(WORKSPACE_DIR) / ".yansh_history.json"
@@ -1942,10 +1971,9 @@ def review(requirement, modified_files):
     
     try:
         if REVIEW_MODEL:
-            response = _call_single_model(_client_for(REVIEW_MODEL), REVIEW_MODEL, messages,
-                                          response_format={"type": "json_object"})
+            response = _call_single_model(_client_for(REVIEW_MODEL), REVIEW_MODEL, messages, stream=True)
         else:
-            response = call_llm(messages, response_format={"type": "json_object"})
+            response = call_llm(messages, stream=True)
         content = response.choices[0].message.content or ""
         return json.loads(_extract_json(content))
     except json.JSONDecodeError as e:
@@ -2186,7 +2214,8 @@ def _run(requirement, mode):
         for f in plan_result.get("files", [])
     ]
     file_list = [f for f in file_list if f]
-    current_snapshot = create_snapshot(file_list)
+    # current_snapshot = create_snapshot(file_list)
+    current_snapshot = None
 
     # code / auto（确认后）：生成代码 + 测试
     console.print("\n阶段2：生成代码")

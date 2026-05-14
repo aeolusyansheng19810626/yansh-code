@@ -300,8 +300,8 @@ def main():
             label = next(l for n, l, m in MODEL_MENU if m == matched)
             if target == "1":
                 override_config(model=matched)
-                if _am.QUALITY_CASCADE:
-                    _am.QUALITY_CASCADE[0] = matched
+                from config import CLAUDE_HAIKU as _haiku
+                _am.QUALITY_CASCADE = [matched] if matched == _haiku else [matched, _haiku]
                 console.print(f"写代码模型已切换到：{label}  ({matched})", highlight=False)
             else:
                 _am.REVIEW_MODEL = matched

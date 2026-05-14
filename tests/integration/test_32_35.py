@@ -68,8 +68,8 @@ def test_scene_32_vision_content_array():
 
     captured_messages = []
 
-    def fake_create(**kwargs):
-        captured_messages.extend(kwargs.get("messages", []))
+    def fake_call_llm(msgs, **kwargs):
+        captured_messages.extend(msgs)
         return _fake_llm_response("图片内容是蓝色方块")
 
     try:
@@ -77,7 +77,7 @@ def test_scene_32_vision_content_array():
             tf.write(png_data)
             tmp_path = tf.name
 
-        with patch.object(agent.client.chat.completions, "create", side_effect=fake_create):
+        with patch.object(agent, "call_llm", side_effect=fake_call_llm):
             agent.chat(f"分析这张图 @image {tmp_path}")
 
         Path(tmp_path).unlink(missing_ok=True)
@@ -159,8 +159,8 @@ def test_scene_34_multiple_images():
 
     captured_messages = []
 
-    def fake_create(**kwargs):
-        captured_messages.extend(kwargs.get("messages", []))
+    def fake_call_llm(msgs, **kwargs):
+        captured_messages.extend(msgs)
         return _fake_llm_response("两张图分析完毕")
 
     try:
@@ -170,7 +170,7 @@ def test_scene_34_multiple_images():
             tf2.write(png_data)
             path1, path2 = tf1.name, tf2.name
 
-        with patch.object(agent.client.chat.completions, "create", side_effect=fake_create):
+        with patch.object(agent, "call_llm", side_effect=fake_call_llm):
             agent.chat(f"对比两图 @image {path1} @image {path2}")
 
         Path(path1).unlink(missing_ok=True)
@@ -193,12 +193,12 @@ def test_scene_35_no_image_plain_text():
     print("\n=== 场景35: 无图片时保持纯文本 ===")
     captured_messages = []
 
-    def fake_create(**kwargs):
-        captured_messages.extend(kwargs.get("messages", []))
+    def fake_call_llm(msgs, **kwargs):
+        captured_messages.extend(msgs)
         return _fake_llm_response("你好")
 
     try:
-        with patch.object(agent.client.chat.completions, "create", side_effect=fake_create):
+        with patch.object(agent, "call_llm", side_effect=fake_call_llm):
             agent.chat("你好")
 
         user_msgs = [m for m in captured_messages if m.get("role") == "user"]

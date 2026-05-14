@@ -9,7 +9,7 @@ except Exception:
     pass
 
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 import agent
 import tools
 from agent import set_batch_mode, write_file
@@ -177,17 +177,20 @@ def test_scene_42_call_llm_timeout_passed():
     print("\n=== 场景42: call_llm 传递 timeout ===")
     try:
         captured = {}
-        orig_create = agent.client.chat.completions.create
+        mock_client = MagicMock()
 
         def fake_create(**kwargs):
             captured.update(kwargs)
-            r = MagicMock(); r.choices = [MagicMock(message=MagicMock(content="{}"))]
+            r = MagicMock()
+            r.__iter__ = lambda self: iter([])  # 兼容流式迭代
+            r.choices = [MagicMock(message=MagicMock(content="{}"))]
             r.usage = MagicMock(prompt_tokens=1, completion_tokens=1)
             return r
 
-        agent.client.chat.completions.create = fake_create
-        agent.call_llm([{"role": "user", "content": "ping"}])
-        agent.client.chat.completions.create = orig_create
+        mock_client.chat.completions.create.side_effect = fake_create
+
+        with patch.object(agent, "_client_for", return_value=mock_client):
+            agent.call_llm([{"role": "user", "content": "ping"}])
 
         ok = captured.get("timeout") == agent.LLM_TIMEOUT_SEC
         report("场景42-timeout 传递", ok, f"timeout={captured.get('timeout')}")

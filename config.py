@@ -49,16 +49,12 @@ _gcp_project    = os.getenv("GOOGLE_CLOUD_PROJECT", "yansheng-project")
 _gcp_region     = os.getenv("GOOGLE_CLOUD_REGION", "us-central1")
 GEMINI_BASE_URL = f"https://{_gcp_region}-aiplatform.googleapis.com/v1beta1/projects/{_gcp_project}/locations/{_gcp_region}/endpoints/openapi/"
 
-# 5-tier 级联：顶端用 Opus，其次 Sonnet，失败兜底 Haiku
 DEEPSEEK_FLASH = "deepseek/deepseek-v4-flash"
 
-TIER_TOP       = DEEPSEEK_FLASH
-TIER_UPPER_MID = DEEPSEEK_FLASH
-TIER_MID       = DEEPSEEK_FLASH
-TIER_LOW       = DEEPSEEK_FLASH
-TIER_DEBUG     = DEEPSEEK_FLASH
+TIER_TOP = CLAUDE_HAIKU
 
-QUALITY_CASCADE = [TIER_TOP, TIER_UPPER_MID, TIER_MID, TIER_LOW, TIER_DEBUG]
+# 主模型 + Haiku 兜底（主模型已是 Haiku 时不重复）
+QUALITY_CASCADE = [TIER_TOP] if TIER_TOP == CLAUDE_HAIKU else [TIER_TOP, CLAUDE_HAIKU]
 
 MAX_ATTEMPTS = 3
 WORKSPACE_DIR = "workspace"
