@@ -361,15 +361,23 @@ client = OpenAI(
 
 REVIEW_MODEL = None  # None = 跟随写代码模型
 
-_gemini_client = None
 _ica_client = None
 
 def _get_gemini_client():
-    global _gemini_client
-    if _gemini_client is None:
-        from config import GEMINI_API_KEY, GEMINI_BASE_URL
-        _gemini_client = OpenAI(api_key=GEMINI_API_KEY, base_url=GEMINI_BASE_URL)
-    return _gemini_client
+    """每次调用刷新 OAuth token，供 Vertex AI 端点使用。"""
+    from config import GEMINI_BASE_URL
+    try:
+        import google.auth
+        import google.auth.transport.requests
+        credentials, _ = google.auth.default(
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+        credentials.refresh(google.auth.transport.requests.Request())
+        token = credentials.token
+    except Exception:
+        from config import GEMINI_API_KEY
+        token = GEMINI_API_KEY
+    return OpenAI(api_key=token, base_url=GEMINI_BASE_URL)
 
 def _get_ica_client():
     """专用 ICA 客户端，用于 Claude 模型（主 client 可能指向 OpenRouter）"""
