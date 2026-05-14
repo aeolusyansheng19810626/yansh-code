@@ -42,8 +42,8 @@ CLAUDE_OPUS   = "claude-opus-4-7"
 CLAUDE_SONNET = "claude-sonnet-4-6"
 CLAUDE_HAIKU  = "claude-haiku-4-5"
 
-GEMINI_3_FLASH  = "gemini-3-flash-preview"
-GEMINI_31_PRO   = "gemini-3.1-pro-preview"
+GEMINI_3_FLASH  = "google/gemini-3-flash-preview"
+GEMINI_31_PRO   = "google/gemini-3.1-pro-preview"
 GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY")
 _gcp_project    = os.getenv("GOOGLE_CLOUD_PROJECT", "yansheng-project")
 _gcp_region     = os.getenv("GOOGLE_CLOUD_REGION", "us-central1")

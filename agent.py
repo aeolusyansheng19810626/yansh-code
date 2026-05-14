@@ -401,7 +401,7 @@ def _get_ica_client():
     return _ica_client
 
 def _is_gemini(model: str) -> bool:
-    return model is not None and model.startswith("gemini")
+    return model is not None and ("gemini" in model)
 
 def _is_claude(model: str) -> bool:
     return model is not None and model.startswith("claude")
