@@ -1,6 +1,6 @@
 # yansh-code
 
-基于 LLM（Claude / DeepSeek）的自动化代码生成与测试 CLI 工具。
+基于 LLM（Claude / DeepSeek / Gemini）的自动化代码生成与测试 CLI 工具。
 
 通过 ReAct 循环自动完成：需求分析 → 生成代码 → 代码审查 → 自动测试 → 错误修复。
 
@@ -29,10 +29,11 @@
 # 2. 安装依赖
 pip install -r requirements.txt
 
-# 3. 配置密钥（通过 IBM ICA 网关调用 Claude，或 OpenRouter 调用 DeepSeek）
+# 3. 配置密钥
 copy .env.example .env
-# 编辑 .env 填入你的 CLAUDE_API_KEY + CLAUDE_BASE_URL（IBM ICA）
-# 或填入 OPENROUTER_API_KEY（OpenRouter / DeepSeek）
+# Claude（IBM ICA 网关）：填入 CLAUDE_API_KEY + CLAUDE_BASE_URL
+# DeepSeek（OpenRouter）：填入 OPENROUTER_API_KEY
+# Gemini（Vertex AI）：填入 GEMINI_API_KEY，并执行一次 gcloud auth application-default login
 
 # 4. 运行（默认 workspace/ 目录）
 python main.py
@@ -87,7 +88,7 @@ python tests/integration/test_1_9.py
 | `/rules` | 查看当前项目定义的 `.agent_rules` |
 | `/hil [on/off]` | 开启/关闭 Human-In-Loop 模式（详细修改需逐一确认） |
 | `/log` | 查看最近的任务执行日志 |
-| `/model` | 交互式切换 LLM 模型（DeepSeek / Claude Opus / Sonnet / Haiku） |
+| `/model` | 交互式切换模型：写代码模型或 Review 模型（DeepSeek / Claude / Gemini 2.5，独立配置） |
 | `/compress` | 手动压缩对话历史 |
 | `/replay list/load` | 管理和加载任务回放数据 |
 | `/clear` | 清空全部对话历史 |
@@ -117,9 +118,33 @@ yansh-code/
     └── integration/
 ```
 
+## 支持的模型
+
+| 显示名 | 模型 ID | 后端 |
+|--------|---------|------|
+| DeepSeek V4 Flash | `deepseek/deepseek-v4-flash` | OpenRouter |
+| Claude Opus 4.7 | `claude-opus-4-7` | IBM ICA 网关 |
+| Claude Sonnet 4.6 | `claude-sonnet-4-6` | IBM ICA 网关 |
+| Claude Haiku 4.5 | `claude-haiku-4-5` | IBM ICA 网关 |
+| Gemini 2.5 Flash | `google/gemini-2.5-flash` | Vertex AI |
+| Gemini 2.5 Pro | `google/gemini-2.5-pro` | Vertex AI |
+
+写代码模型与 Review 模型可**独立配置**，例如用 Claude Haiku 写代码、Gemini 2.5 Pro review。
+
+### Gemini / Vertex AI 配置
+
+1. 在 `.env` 中设置 `GEMINI_API_KEY`（Google Cloud API Key，需绑定 Agent Platform API）
+2. 安装 [Google Cloud CLI](https://cloud.google.com/sdk/docs/install)，执行一次授权：
+   ```bash
+   gcloud auth application-default login
+   gcloud auth application-default set-quota-project <your-project-id>
+   ```
+3. 默认使用 `us-central1` 区域，可通过 `GOOGLE_CLOUD_PROJECT` / `GOOGLE_CLOUD_REGION` 环境变量覆盖。
+
 ## 依赖
 
-- `openai` — 调用 Claude / DeepSeek API（OpenAI 兼容协议）
+- `openai` — 调用 Claude / DeepSeek / Gemini API（OpenAI 兼容协议）
+- `google-auth` — Vertex AI OAuth 2 token 自动刷新
 - `tree-sitter` — AST 符号检索
 - `rich` / `prompt_toolkit` — 高级终端交互
 - `ruff` — 代码静态检查 (可选)
