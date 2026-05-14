@@ -50,10 +50,15 @@ def test_compress_normal():
     summary = "【已完成任务】\n- 手动压缩\n\n【关键文件】\n- agent.py\n\n【未解决问题】\n- 无"
     recent_before = agent.conversation_history[-6:]
 
-    with patch.object(agent.client.chat.completions, "create", return_value=mock_resp(summary)):
+    fake_client = MagicMock()
+    fake_client.chat.completions.create.return_value = mock_resp(summary)
+    with patch.object(agent, "_get_ica_client", return_value=fake_client):
         agent.compress_history()
 
-    assert agent.conversation_history[0]["content"] == summary
+    # 摘要现在以 system role 注入，前缀 "[历史摘要]"
+    first = agent.conversation_history[0]
+    assert first["role"] == "system"
+    assert summary in first["content"]
     assert agent.conversation_history[1:] == recent_before
     print(f"[PASS] /compress 压缩完成，共 {len(agent.conversation_history)} 条（1摘要+{len(recent_before)}最近）")
 
@@ -66,7 +71,9 @@ def test_compress_message(capsys=None):
     original_print = agent.console.print
     agent.console.print = lambda msg, **kw: output.append(str(msg))
     try:
-        with patch.object(agent.client.chat.completions, "create", return_value=mock_resp(summary)):
+        fake_client = MagicMock()
+        fake_client.chat.completions.create.return_value = mock_resp(summary)
+        with patch.object(agent, "_get_ica_client", return_value=fake_client):
             agent.compress_history()
     finally:
         agent.console.print = original_print

@@ -151,26 +151,27 @@ def test_scene_7_auto_compress():
     print("\n=== 场景7: 自动压缩触发 ===")
     history_backup = _backup_history()
     original_history = agent.conversation_history[:]
-    original_create = agent.client.chat.completions.create
     try:
+        from unittest.mock import patch as _patch
         mock_summary = "【已完成任务】\n- mock压缩测试\n\n【关键文件】\n- mock.py\n\n【未解决问题】\n- 无"
         mock_msg = MagicMock(); mock_msg.content = mock_summary
         mock_choice = MagicMock(); mock_choice.message = mock_msg
         mock_resp = MagicMock(); mock_resp.choices = [mock_choice]
-        agent.client.chat.completions.create = MagicMock(return_value=mock_resp)
-        agent.conversation_history = []
-        override_config(compress_threshold=300, keep_recent_turns=1)
-        for i in range(4):
-            add_to_history(f"用户{i}: " + "x"*40, f"助手{i}: " + "y"*40)
-        maybe_compress_history()
-        ok = len(agent.conversation_history) < 8 and any("【已完成任务】" in m["content"] for m in agent.conversation_history)
+        fake_client = MagicMock()
+        fake_client.chat.completions.create = MagicMock(return_value=mock_resp)
+        with _patch.object(agent, "_get_ica_client", return_value=fake_client):
+            agent.conversation_history = []
+            override_config(compress_threshold=300, keep_recent_turns=1)
+            for i in range(4):
+                add_to_history(f"用户{i}: " + "x"*40, f"助手{i}: " + "y"*40)
+            maybe_compress_history()
+            ok = len(agent.conversation_history) < 8 and any("【已完成任务】" in m["content"] for m in agent.conversation_history)
         report("场景7-自动压缩触发", ok)
         return ok
     except Exception as e:
         report("场景7-自动压缩触发", False, str(e)[:120])
         return False
     finally:
-        agent.client.chat.completions.create = original_create
         _restore_history(history_backup)
         agent.conversation_history = original_history[:]
         override_config(compress_threshold=6000, keep_recent_turns=3)

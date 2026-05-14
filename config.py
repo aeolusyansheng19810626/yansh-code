@@ -51,7 +51,7 @@ GEMINI_BASE_URL = f"https://{_gcp_region}-aiplatform.googleapis.com/v1beta1/proj
 
 DEEPSEEK_FLASH = "deepseek/deepseek-v4-flash"
 
-TIER_TOP = CLAUDE_HAIKU
+TIER_TOP = CLAUDE_SONNET
 
 # 主模型 + Haiku 兜底（主模型已是 Haiku 时不重复）
 QUALITY_CASCADE = [TIER_TOP] if TIER_TOP == CLAUDE_HAIKU else [TIER_TOP, CLAUDE_HAIKU]
@@ -70,10 +70,25 @@ def set_workspace_dir(path: str):
 
 
 # ---------- #62 Token 价格配置 ----------
-# 按 $1M Tokens 计算；当前默认模型：DeepSeek V4 Flash (via OpenRouter)
-# DeepSeek V4 Flash: $0.07/1M input, $0.28/1M output（参考 openrouter.ai，以实际账单为准）
-TOKEN_PRICE_INPUT  = 0.07  # $0.07 / 1M input tokens
-TOKEN_PRICE_OUTPUT = 0.28  # $0.28 / 1M output tokens
+# 按 $1M tokens 计算。show_stats 按实际调用的模型分别计费再求和
+TOKEN_PRICE_TABLE = {
+    "claude-opus-4-7":             {"input": 15.0, "output": 75.0},
+    "claude-sonnet-4-6":           {"input": 3.0,  "output": 15.0},
+    "claude-haiku-4-5":            {"input": 1.0,  "output": 5.0},
+    "google/gemini-2.5-flash":     {"input": 0.30, "output": 2.50},
+    "google/gemini-2.5-pro":       {"input": 1.25, "output": 10.0},
+    "deepseek/deepseek-v4-flash":  {"input": 0.07, "output": 0.28},
+}
+_DEFAULT_PRICE = {"input": 1.0, "output": 5.0}  # 未知模型保守按 Haiku 估算
+
+
+def get_model_price(model: str) -> dict:
+    return TOKEN_PRICE_TABLE.get(model, _DEFAULT_PRICE)
+
+
+# 兼容旧 import：保留两个常量但不再使用
+TOKEN_PRICE_INPUT  = _DEFAULT_PRICE["input"]
+TOKEN_PRICE_OUTPUT = _DEFAULT_PRICE["output"]
 
 # ---------- #43 项目级配置文件 ----------
 

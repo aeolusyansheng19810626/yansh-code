@@ -1,7 +1,6 @@
-"""Unit tests for #2: Git集成snapshot（create_snapshot / restore_snapshot / cleanup_snapshot）"""
+"""快照单元测试（方案 A：纯文件复制，不动用户 git 状态）"""
 import os
 import sys
-import shutil
 import subprocess
 import pytest
 from pathlib import Path
@@ -16,14 +15,13 @@ def _git(args, cwd):
 
 @pytest.fixture
 def git_ws(tmp_path):
-    """初始化一个带 git 的临时 workspace，并设置 config.WORKSPACE_DIR"""
+    """初始化一个带 git 的临时 workspace（用于验证我们不会污染用户的 git 状态）"""
     import config, tools, agent
     ws = tmp_path / "workspace"
     ws.mkdir()
     _git(["init"], ws)
     _git(["config", "user.email", "test@test.com"], ws)
     _git(["config", "user.name", "Test"], ws)
-    # 初始提交（否则 stash 报错）
     (ws / "init.txt").write_text("init")
     _git(["add", "."], ws)
     _git(["commit", "-m", "init"], ws)
@@ -42,7 +40,7 @@ def git_ws(tmp_path):
 
 @pytest.fixture
 def file_ws(tmp_path):
-    """没有 git 的普通 workspace（文件复制模式）"""
+    """没有 git 的普通 workspace"""
     import config, tools, agent
     ws = tmp_path / "plain_ws"
     ws.mkdir()
@@ -56,73 +54,77 @@ def file_ws(tmp_path):
     agent._reinit_paths()
 
 
-# ── git stash 模式 ──────────────────────────────────────────────────────────
+# ── 方案 A：永远走 file 模式，不动 git ────────────────────────────────────────
 
-def test_git_is_repo_true(git_ws):
-    from agent import _git_is_repo
-    assert _git_is_repo(str(git_ws)) is True
-
-
-def test_git_is_repo_false(file_ws):
-    from agent import _git_is_repo
-    assert _git_is_repo(str(file_ws)) is False
-
-
-def test_git_snapshot_creates_stash(git_ws):
-    """有改动时 create_snapshot 返回 git 模式标识，stash 列表不为空"""
-    from agent import create_snapshot, _git_run
+def test_snapshot_always_file_mode_in_git_repo(git_ws):
+    """即使 workspace 在 git 仓库内，也走 file 模式（不再用 git stash）"""
+    from agent import create_snapshot
     (git_ws / "new_file.py").write_text("x = 1")
     snap = create_snapshot(["new_file.py"])
-    assert snap["mode"] == "git"
-    assert "yansh-snapshot-" in snap["msg"]
-    # stash 列表应包含这条记录
-    rc, stdout, _ = _git_run(["stash", "list"], str(git_ws))
-    assert snap["msg"] in stdout
+    assert snap["mode"] == "file"
 
 
-def test_git_snapshot_clean_workspace(git_ws):
-    """工作区干净时 create_snapshot 返回 git_clean 模式"""
+def test_snapshot_does_not_touch_user_git_state(git_ws):
+    """create_snapshot 不能污染用户的工作树和 stash 列表"""
+    from agent import create_snapshot, cleanup_snapshot
+    # 用户手动改了一个未提交的文件
+    (git_ws / "user_wip.py").write_text("user manual edit")
+    # 拍快照
+    snap = create_snapshot(["user_wip.py"])
+    cleanup_snapshot(snap)
+
+    # 用户的工作树状态不变：文件还在、内容没变
+    assert (git_ws / "user_wip.py").read_text() == "user manual edit"
+    # stash 列表应该是空（我们不再用 git stash）
+    r = subprocess.run(["git", "stash", "list"], cwd=str(git_ws),
+                       capture_output=True, text=True)
+    assert r.stdout.strip() == ""
+
+
+def test_snapshot_clean_workspace_still_records(file_ws):
+    """工作区干净（file_list 中无文件存在）时仍创建快照目录，meta.files 为空"""
     from agent import create_snapshot
     snap = create_snapshot([])
-    assert snap["mode"] == "git_clean"
+    assert snap["mode"] == "file"
+    assert Path(snap["path"]).exists()
 
 
-def test_git_restore_recovers_file(git_ws):
-    """restore_snapshot 后被修改的文件应恢复"""
-    from agent import create_snapshot, restore_snapshot, cleanup_snapshot
-    # 先提交 recover_me.py
-    (git_ws / "recover_me.py").write_text("original")
-    _git(["add", "."], git_ws)
-    _git(["commit", "-m", "add file"], git_ws)
+def test_backup_file_if_needed_incremental(file_ws):
+    """LLM 写入前的增量备份：未在 baseline 中的文件首次写入时被备份"""
+    from agent import create_snapshot, _backup_file_if_needed, restore_snapshot, cleanup_snapshot
+    (file_ws / "later.py").write_text("baseline content")
+    # 创建快照时不指定 later.py（它不在 file_list）
+    snap = create_snapshot([])
 
-    # 修改文件（产生脏变更），然后快照
-    (git_ws / "recover_me.py").write_text("modified")
-    snap = create_snapshot(["recover_me.py"])
-    assert snap["mode"] == "git", f"预期 git 模式，实际: {snap}"
-
-    # 再次修改
-    (git_ws / "recover_me.py").write_text("further modified")
+    # 模拟 LLM 即将改 later.py，触发增量备份
+    _backup_file_if_needed(snap, "later.py")
+    # 然后真的改
+    (file_ws / "later.py").write_text("modified by agent")
 
     n = restore_snapshot(snap)
-    assert n >= 1
+    assert n == 1
+    assert (file_ws / "later.py").read_text() == "baseline content"
     cleanup_snapshot(snap)
 
 
-def test_git_cleanup_drops_stash(git_ws):
-    """cleanup_snapshot 后 stash 列表应为空"""
-    from agent import create_snapshot, cleanup_snapshot, _git_run
-    (git_ws / "tmp.py").write_text("tmp")
-    snap = create_snapshot(["tmp.py"])
-    assert snap["mode"] == "git"
-    cleanup_snapshot(snap)
-    rc, stdout, _ = _git_run(["stash", "list"], str(git_ws))
-    assert snap["msg"] not in stdout
+def test_gc_old_snapshots(file_ws):
+    """_gc_old_snapshots 保留最近 N 个，删掉更老的"""
+    from agent import _SNAPSHOT_DIR, _gc_old_snapshots
+    _SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    # 制造 5 个排序在前的旧目录 + 5 个排序在后的新目录
+    for i in range(5):
+        (_SNAPSHOT_DIR / f"20200101-00000{i}").mkdir()
+    for i in range(5):
+        (_SNAPSHOT_DIR / f"20300101-00000{i}").mkdir()
+    _gc_old_snapshots(keep=5)
+    remaining = sorted(d.name for d in _SNAPSHOT_DIR.iterdir())
+    assert all(name.startswith("2030") for name in remaining)
+    assert len(remaining) == 5
 
 
-# ── 文件复制模式（兜底） ──────────────────────────────────────────────────────
+# ── 文件复制模式（与方案 A 对应的全部行为） ──────────────────────────────────
 
 def test_file_snapshot_creates_directory(file_ws):
-    """非 git 模式：create_snapshot 创建文件快照目录"""
     from agent import create_snapshot
     (file_ws / "data.txt").write_text("important data")
     snap = create_snapshot(["data.txt"])
@@ -133,12 +135,10 @@ def test_file_snapshot_creates_directory(file_ws):
 
 
 def test_file_snapshot_restore(file_ws):
-    """文件复制模式：restore_snapshot 后文件内容恢复"""
     from agent import create_snapshot, restore_snapshot, cleanup_snapshot
     (file_ws / "a.txt").write_text("original content")
     snap = create_snapshot(["a.txt"])
 
-    # 修改文件
     (file_ws / "a.txt").write_text("modified content")
     n = restore_snapshot(snap)
     assert n == 1
@@ -147,12 +147,10 @@ def test_file_snapshot_restore(file_ws):
 
 
 def test_file_snapshot_deletes_new_files(file_ws):
-    """restore_snapshot 应删除快照后新建的文件"""
     from agent import create_snapshot, restore_snapshot, cleanup_snapshot
     (file_ws / "existing.txt").write_text("exists before snapshot")
     snap = create_snapshot(["existing.txt"])
 
-    # 快照后新建文件
     (file_ws / "brand_new.txt").write_text("should be deleted on restore")
     restore_snapshot(snap)
     assert not (file_ws / "brand_new.txt").exists()
@@ -160,7 +158,6 @@ def test_file_snapshot_deletes_new_files(file_ws):
 
 
 def test_file_snapshot_cleanup_removes_dir(file_ws):
-    """cleanup_snapshot 后快照目录应被删除"""
     from agent import create_snapshot, cleanup_snapshot
     (file_ws / "f.txt").write_text("hi")
     snap = create_snapshot(["f.txt"])
@@ -171,7 +168,6 @@ def test_file_snapshot_cleanup_removes_dir(file_ws):
 
 
 def test_file_snapshot_none_input(file_ws):
-    """restore_snapshot(None) 不报错，返回 0"""
     from agent import restore_snapshot
     assert restore_snapshot(None) == 0
 

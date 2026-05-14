@@ -127,15 +127,29 @@ def write_file(filename, content):
     except Exception as e:
         return {"error": str(e)}
 
-def read_file(filename):
-    """读取workspace目录下的文件"""
+def read_file(filename, offset=None, limit=None):
+    """读取workspace目录下的文件。
+    可选 offset/limit 按行截取（offset 1-based 起始行；limit 行数上限）。
+    无截取参数时返回整个文件，行为与原版相同。"""
     resolved, err = _validate_path(filename)
     if err:
         return err
     try:
-        return {"content": resolved.read_text(encoding='utf-8')}
+        text = resolved.read_text(encoding='utf-8')
     except Exception as e:
         return {"error": str(e)}
+    if offset is None and limit is None:
+        return {"content": text}
+    lines = text.splitlines(keepends=True)
+    total = len(lines)
+    start = max(0, (offset or 1) - 1)
+    end = total if limit is None else min(total, start + max(0, int(limit)))
+    return {
+        "content": "".join(lines[start:end]),
+        "total_lines": total,
+        "offset": start + 1,
+        "lines_returned": end - start,
+    }
 
 def execute_command(command):
     """在workspace目录下执行命令，30秒超时，三级命令策略（deny/safe/confirm）"""
@@ -776,6 +790,78 @@ def append_to_file(filename, content):
         return {"success": f"文件 {filename} 追加成功"}
     except Exception as e:
         return {"error": str(e)}
+
+
+def glob_files(pattern, path="."):
+    """在 workspace 内按 glob 模式匹配文件路径，遵循 .gitignore。
+    pattern 同时匹配相对路径（如 'src/**/*.py'）和裸文件名（如 '*.py'）。"""
+    import fnmatch
+    resolved_root, err = _validate_path(path)
+    if err:
+        return err
+    spec = _get_ignore_spec()
+    abs_workspace = Path(_get_workspace()).resolve()
+    matches = []
+    for f in resolved_root.rglob("*"):
+        if f.is_dir():
+            continue
+        if ".git" in f.parts:
+            continue
+        try:
+            rel = os.path.relpath(f, abs_workspace).replace("\\", "/")
+        except ValueError:
+            continue
+        if spec and spec.match_file(rel):
+            continue
+        if fnmatch.fnmatch(rel, pattern) or fnmatch.fnmatch(f.name, pattern):
+            matches.append(rel)
+    return {"matches": matches, "total": len(matches)}
+
+
+def _git_run_ws(args: list, timeout: int = 10) -> tuple:
+    """在 workspace 目录跑 git 命令，返回 (returncode, stdout, stderr)"""
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["git"] + args,
+            cwd=_get_workspace(),
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=timeout,
+        )
+        return r.returncode, r.stdout, r.stderr
+    except FileNotFoundError:
+        return -1, "", "git 未安装"
+    except subprocess.TimeoutExpired:
+        return -1, "", "git 命令超时"
+
+
+def git_diff(path=None, staged=False):
+    """在 workspace 跑 git diff，输出超过 20000 字符截断"""
+    args = ["diff"]
+    if staged:
+        args.append("--cached")
+    if path:
+        resolved, err = _validate_path(path)
+        if err:
+            return err
+        try:
+            rel = str(resolved.relative_to(_WORKSPACE_ROOT)).replace("\\", "/")
+        except ValueError:
+            return {"error": "path 越界"}
+        args.append(rel)
+    rc, stdout, stderr = _git_run_ws(args, timeout=15)
+    if rc != 0 and not stdout:
+        return {"error": stderr.strip() or "git diff 失败（非 git 仓库？）"}
+    truncated = len(stdout) > 20000
+    return {"diff": stdout[:20000], "truncated": truncated}
+
+
+def git_log(limit=10):
+    """git log --oneline -n <limit>"""
+    rc, stdout, stderr = _git_run_ws(["log", "--oneline", f"-{int(limit)}"], timeout=10)
+    if rc != 0:
+        return {"error": stderr.strip() or "git log 失败"}
+    return {"log": stdout}
 
 
 def find_references(symbol, path="."):
