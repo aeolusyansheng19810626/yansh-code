@@ -11,4 +11,4 @@ requires-python = ">=3.9"
 yansh = "main:main"
 
 [tool.setuptools]
-py-modules = ["main", "agent", "tools", "config", "monitor", "interrupt"]
+py-modules = ["main", "agent", "tools", "config", "monitor", "interrupt", "snapshot", "hil", "task_log", "linter", "llm_client", "tools_schema"]

@@ -15,8 +15,31 @@ import monitor
 console = Console()
 
 
+_SLASH_COMMANDS = [
+    ("/mode",     "切换模式 [plan|code|auto]"),
+    ("/model",    "切换 LLM 模型"),
+    ("/compress", "压缩对话历史"),
+    ("/context",  "显示上下文使用情况"),
+    ("/clear",    "清空对话历史"),
+    ("/revert",   "回滚最近一次任务的文件改动"),
+    ("/log",      "显示最近任务日志"),
+    ("/config",   "显示当前配置"),
+    ("/rules",    "显示项目规则 (.agent_rules)"),
+    ("/hil",      "切换 Human-in-Loop 模式"),
+    ("/stats",    "Token 消耗统计"),
+    ("/replay",   "加载失败案例回放"),
+]
+
+
+def _match_slash(text: str):
+    """返回与 text 前缀匹配的命令列表，text 为 / 开头时才返回结果"""
+    if not text.startswith("/"):
+        return []
+    return [(c, d) for c, d in _SLASH_COMMANDS if c.startswith(text)]
+
+
 def _read_input(prompt_str="> "):
-    """Windows: Shift+Enter 换行，Enter 提交。非 Windows 降级为 input()。"""
+    """Windows: Shift+Enter 换行，Enter 提交。/ 命令实时补全。非 Windows 降级为 input()。"""
     if sys.platform != "win32":
         return input(prompt_str)
 
@@ -41,6 +64,8 @@ def _read_input(prompt_str="> "):
     VK_DELETE         = 0x2E
     VK_HOME           = 0x24
     VK_END            = 0x23
+    VK_TAB            = 0x09
+    VK_ESCAPE         = 0x1B
     SHIFT_PRESSED     = 0x0010
     LEFT_CTRL_PRESSED = 0x0008
     RIGHT_CTRL_PRESSED= 0x0004
@@ -65,6 +90,7 @@ def _read_input(prompt_str="> "):
     cursor = 0
     prev_lines = 1
     term_cursor_line = 0  # 终端光标当前在输入区第几行
+    completion_enabled = True  # Esc 暂时关闭，下一次按 / 时自动重开
 
     try:
         from wcwidth import wcswidth as _wcswidth
@@ -81,37 +107,51 @@ def _read_input(prompt_str="> "):
         text  = "".join(buf)
         lines = text.split("\n")
 
+        # 候选区：仅在单行 / 命令时显示
+        completions = []
+        if completion_enabled and "\n" not in text:
+            completions = _match_slash(text)
+
+        total_lines = len(lines) + len(completions)
+
         # 精确移回输入区顶部
         if term_cursor_line > 0:
             sys.stdout.write(f"\033[{term_cursor_line}A")
         sys.stdout.write("\r")
 
+        # 输入区
         for i, line in enumerate(lines):
             sys.stdout.write("\033[2K")
             sys.stdout.write(f"{prompt_str}{line}")
             if i < len(lines) - 1:
                 sys.stdout.write("\n")
 
+        # 候选区（紧跟输入区下方，无 prompt 前缀）
+        for cmd, desc in completions:
+            sys.stdout.write("\n\033[2K")
+            sys.stdout.write(f"  \033[36m{cmd}\033[0m  \033[2m{desc}\033[0m")
+
         # 清除行数减少时残留的旧行
-        extra = prev_lines - len(lines)
+        extra = prev_lines - total_lines
         for _ in range(extra):
             sys.stdout.write("\n\033[2K")
         if extra > 0:
             sys.stdout.write(f"\033[{extra}A")
 
-        prev_lines = len(lines)
+        prev_lines = total_lines
 
+        # 把光标移回输入区光标位置
         before       = "".join(buf[:cursor])
         before_lines = before.split("\n")
         cur_line     = len(before_lines) - 1
         cur_col      = _dispwidth(before_lines[-1])
-        end_line     = len(lines) - 1
+        end_line     = total_lines - 1
 
         if end_line > cur_line:
             sys.stdout.write(f"\033[{end_line - cur_line}A")
         col = _dispwidth(prompt_str) + cur_col
         sys.stdout.write(f"\r\033[{col}C" if col > 0 else "\r")
-        term_cursor_line = cur_line  # 记录光标所在行
+        term_cursor_line = cur_line
         sys.stdout.flush()
 
     sys.stdout.write(prompt_str)
@@ -138,8 +178,15 @@ def _read_input(prompt_str="> "):
             if shift:
                 buf.insert(cursor, "\n"); cursor += 1; redraw()
             else:
-                sys.stdout.write("\n"); sys.stdout.flush()
-                return "".join(buf)
+                # 检测是否为粘贴场景：粘贴时后面还有待处理的键盘事件
+                peeked = (INPUT_RECORD * 1)()
+                n_peeked = wt.DWORD(0)
+                kernel32.PeekConsoleInputW(stdin_h, ctypes.byref(peeked), 1, ctypes.byref(n_peeked))
+                if n_peeked.value > 0:
+                    buf.insert(cursor, "\n"); cursor += 1; redraw()
+                else:
+                    sys.stdout.write("\n"); sys.stdout.flush()
+                    return "".join(buf)
         elif vk == VK_BACK:
             if cursor > 0:
                 buf.pop(cursor - 1); cursor -= 1; redraw()
@@ -163,7 +210,24 @@ def _read_input(prompt_str="> "):
             raise KeyboardInterrupt
         elif ctrl and vk == 0x44:
             raise EOFError
-        elif ch and (ord(ch) >= 32 or ch == "\t"):
+        elif vk == VK_TAB:
+            # Tab 补全：仅当有候选时替换 buf 为首个完整命令
+            text = "".join(buf)
+            matches = _match_slash(text) if completion_enabled and "\n" not in text else []
+            if matches:
+                cmd = matches[0][0]
+                buf[:] = list(cmd)
+                cursor = len(buf)
+                redraw()
+            # 没匹配时静默忽略 Tab（不插入实体 Tab 字符）
+        elif vk == VK_ESCAPE:
+            # 隐藏候选区；按 / 时自动重开
+            if completion_enabled:
+                completion_enabled = False
+                redraw()
+        elif ch and ord(ch) >= 32:
+            if ch == "/":
+                completion_enabled = True  # 按 / 重开补全
             buf.insert(cursor, ch); cursor += 1; redraw()
 
 VALID_MODES = {"plan", "code", "auto"}

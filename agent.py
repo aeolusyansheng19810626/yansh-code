@@ -21,31 +21,43 @@ from tools import (
 )
 import interrupt
 import tools as _tools_mod
+import snapshot as _snapshot_mod
+from snapshot import (
+    create_snapshot, restore_snapshot, cleanup_snapshot,
+    _backup_file_if_needed, _gc_old_snapshots, get_latest_snapshot,
+)
+import hil as _hil_mod
+from hil import show_diff as _show_diff, hil_confirm as _hil_confirm
+import task_log as _task_log_mod
+from task_log import (
+    init_task_log, finish_task_log, show_recent_logs, get_last_task_log,
+)
+import linter as _linter_mod
+from linter import detect_project_type
+import llm_client as _llm_mod
+from tools_schema import TOOLS
+from llm_client import (
+    client, _ica_client, _get_ica_client, _get_gemini_client,
+    _is_gemini, _is_claude, _client_for, _call_single_model,
+    _is_transient_error, call_llm, _StreamToolCall, _handle_stream,
+    show_stats, LLM_TIMEOUT_SEC, LLM_MAX_RETRIES_PER_MODEL,
+)
 
 console = Console()
 
-# #62 Token 统计：按 model 分桶，便于按各自价格计费
-_session_tokens_by_model: dict = {}  # {model: {"prompt": int, "completion": int}}
-_last_request_tokens = {"prompt": 0, "completion": 0, "model": ""}
+# Token 统计在 llm_client 模块（_session_tokens_by_model / _last_request_tokens）
 
 # #40 批处理模式标志
 _BATCH_MODE = False
-_last_task_log: dict = {}  # 最近一次任务日志，供 --json 输出
 
 # #27 项目类型（由 main.py 调用 detect_project_type() 后写入）
 _PROJECT_TYPE = None
 _PROJECT_TEST_CMD = None
 
-# #37 快照 / #38 日志 / #61 回放 目录
+# #61 回放目录（任务日志在 task_log 模块；快照在 snapshot 模块）
 _YANSH_DIR     = Path(WORKSPACE_DIR) / ".yansh"
-_SNAPSHOT_DIR  = _YANSH_DIR / "snapshots"
-_LOG_DIR       = _YANSH_DIR / "logs"
+_LOG_DIR       = _YANSH_DIR / "logs"  # 仅 create_replay_package 引用
 _REPLAY_DIR    = _YANSH_DIR / "replay"
-
-# #38 当前任务日志状态（模块级，_run() 期间填充）
-_current_task_log: dict = {}
-_task_tool_calls: list  = []
-_task_files_modified: list = []
 
 # #37 当前任务的快照引用，code()/fix()/_auto_generate_tests 在写入前查它做增量备份
 _CURRENT_SNAPSHOT: dict | None = None
@@ -60,8 +72,7 @@ COMPRESS_MODEL = "claude-haiku-4-5"  # 通过 ICA 网关；llama 旧值在 ICA �
 _context_files: dict = {}  # {display_path: content}
 _MAX_CONTEXT_FILE_SIZE = 100 * 1024  # 100KB
 
-# #58 HIL（人工介入）本轮"全部接受"标志，每次 _run() 开始时重置
-_HIL_AUTO_ACCEPT = False
+# #58 HIL 状态在 hil 模块；agent._run() 通过 _hil_mod.reset_auto_accept() 重置
 
 # #50 多模态视觉：当前轮次待注入的图片，plan()/chat() 消费后清空
 _pending_images: list = []
@@ -334,10 +345,6 @@ def set_batch_mode(enabled: bool, json_output: bool = False, strict: bool | None
         console = Console(file=sys.stderr)
 
 
-def get_last_task_log() -> dict:
-    return dict(_last_task_log)
-
-
 def _prompt(msg: str, default: str = "y") -> str:
     """批处理模式自动返回 default；交互模式调用 console.input"""
     if _BATCH_MODE:
@@ -348,73 +355,9 @@ def _prompt(msg: str, default: str = "y") -> str:
     except EOFError:
         return default
 
-# [已弃用] OpenRouter/DeepSeek 客户端
-# client = OpenAI(
-#     api_key=OPENROUTER_API_KEY,
-#     base_url=OPENROUTER_BASE_URL,
-# )
-
-# Claude 客户端（通过 IBM ICA 网关，走 OpenAI 兼容协议）
-# OPENROUTER_API_KEY / OPENROUTER_BASE_URL 已在 config.py 中指向 Claude/ICA，
-# 此处变量名保持不变，避免牵动 import。
-client = OpenAI(
-    api_key=OPENROUTER_API_KEY,
-    base_url=OPENROUTER_BASE_URL,
-)
 
 REVIEW_MODEL = None  # None = 跟随写代码模型
 
-_ica_client = None
-
-def _get_gemini_client():
-    """每次调用刷新 OAuth token，供 Vertex AI 端点使用。"""
-    from config import GEMINI_BASE_URL
-    try:
-        import google.auth
-        import google.auth.transport.requests
-        credentials, _ = google.auth.default(
-            scopes=["https://www.googleapis.com/auth/cloud-platform"]
-        )
-        credentials.refresh(google.auth.transport.requests.Request())
-        token = credentials.token
-    except Exception:
-        from config import GEMINI_API_KEY
-        token = GEMINI_API_KEY
-    return OpenAI(api_key=token, base_url=GEMINI_BASE_URL)
-
-def _get_ica_client():
-    """专用 ICA 客户端，用于 Claude 模型（主 client 可能指向 OpenRouter）"""
-    global _ica_client
-    if _ica_client is None:
-        import os as _os
-        ica_key = (
-            _os.getenv("CLAUDE_API_KEY")
-            or _os.getenv("ANTHROPIC_AUTH_TOKEN")
-            or _os.getenv("ANTHROPIC_API_KEY")
-            or OPENROUTER_API_KEY
-        )
-        ica_base = (
-            _os.getenv("CLAUDE_BASE_URL")
-            or _os.getenv("ANTHROPIC_BASE_URL")
-            or "https://api.nextgen-beta.ica.ibm.com/ica/v1"
-        )
-        if not ica_base.rstrip("/").endswith("/v1"):
-            ica_base = ica_base.rstrip("/") + "/v1"
-        _ica_client = OpenAI(api_key=ica_key, base_url=ica_base)
-    return _ica_client
-
-def _is_gemini(model: str) -> bool:
-    return model is not None and ("gemini" in model)
-
-def _is_claude(model: str) -> bool:
-    return model is not None and model.startswith("claude")
-
-def _client_for(model: str):
-    if _is_gemini(model):
-        return _get_gemini_client()
-    if _is_claude(model):
-        return _get_ica_client()
-    return client
 
 def _extract_json(text: str) -> str:
     """从 LLM 响应中提取 JSON 字符串（兼容 markdown 代码块）"""
@@ -431,7 +374,7 @@ def _extract_json(text: str) -> str:
 
 
 def _sanitize_json_strings(text: str) -> str:
-    """将 JSON 字符串值内的裸控制字符（换行、制表等）替换为合法转义序列。"""
+    """将 JSON 字符串值内的裸控制字符（换行、制表等）替换为合法转义序列"""
     result = []
     in_string = False
     escape_next = False
@@ -455,15 +398,6 @@ def _sanitize_json_strings(text: str) -> str:
             result.append(ch)
     return "".join(result)
 
-def _call_single_model(cl, model, messages, response_format=None, stream=False):
-    kwargs = {"model": model, "messages": messages, "timeout": LLM_TIMEOUT_SEC}
-    if response_format and not _is_claude(model):
-        kwargs["response_format"] = response_format
-    if stream and not _is_gemini(model):
-        kwargs["stream"] = True
-        kwargs["stream_options"] = {"include_usage": True}  # #5 让网关返回 usage chunk
-        return _handle_stream(cl.chat.completions.create(**kwargs), model)
-    return cl.chat.completions.create(**kwargs)
 
 _HISTORY_FILE = Path(WORKSPACE_DIR) / ".yansh_history.json"
 
@@ -603,7 +537,7 @@ def create_replay_package(failure_reason):
     
     # 2. workspace 快照
     snap_dir = replay_dir / "workspace_snapshot"
-    snap_dir.mkdir()
+    snap_dir.mkdir(exist_ok=True)
     for root, _, files in os.walk(WORKSPACE_DIR):
         if any(p in root for p in (".git", ".yansh", "__pycache__", "venv", "node_modules")):
             continue
@@ -628,7 +562,7 @@ def create_replay_package(failure_reason):
         "failure_reason": failure_reason,
         "timestamp": timestamp,
         "model": QUALITY_CASCADE[0] if QUALITY_CASCADE else "unknown",
-        "tokens_by_model": {k: dict(v) for k, v in _session_tokens_by_model.items()},
+        "tokens_by_model": {k: dict(v) for k, v in _llm_mod._session_tokens_by_model.items()},
     }
     (replay_dir / "meta.json").write_text(
         json.dumps(meta, ensure_ascii=False, indent=2),
@@ -680,364 +614,19 @@ def load_replay(replay_id):
         console.print(f"[错误] 加载失败: {e}", style="red")
 
 def _reinit_paths():
-    """--cwd 变更后重新初始化 agent 中所有依赖 WORKSPACE_DIR 的模块级变量。"""
-    global _YANSH_DIR, _SNAPSHOT_DIR, _LOG_DIR, _REPLAY_DIR, _HISTORY_FILE
+    """--cwd 变更后重新初始化 agent / snapshot / task_log 中所有依赖 WORKSPACE_DIR 的模块级变量。"""
+    global _YANSH_DIR, _LOG_DIR, _REPLAY_DIR, _HISTORY_FILE
     import config as _cfg_mod
     _wd = _cfg_mod.WORKSPACE_DIR
     _YANSH_DIR     = Path(_wd) / ".yansh"
-    _SNAPSHOT_DIR  = _YANSH_DIR / "snapshots"
     _LOG_DIR       = _YANSH_DIR / "logs"
     _REPLAY_DIR    = _YANSH_DIR / "replay"
     _HISTORY_FILE  = Path(_wd) / ".yansh_history.json"
+    _snapshot_mod._reinit_paths()
+    _task_log_mod._reinit_paths()
 
 
-# ---------- #37 快照 / 回滚 ----------
-
-# 快照/回滚时需要跳过的目录
-_SNAPSHOT_IGNORE_DIRS = {".git", ".yansh", "__pycache__", "venv", "node_modules", ".pytest_cache"}
-
-def _should_skip_dir(root: str) -> bool:
-    """判断 os.walk 的某个 root 路径是否应跳过"""
-    parts = set(Path(root).parts)
-    return bool(parts & _SNAPSHOT_IGNORE_DIRS)
-
-
-def create_snapshot(file_list):
-    """方案 A：纯文件复制备份，不动用户的 git 状态。
-    任务开始时仅备份计划中已存在的文件作为 baseline；
-    任务过程中由 _backup_file_if_needed() 在 LLM 写入前增量补充。
-    回滚时按 meta.files 还原内容；任务期间新增的文件按 workspace_files 差集删除。"""
-    import config as _cfg_mod
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    ws = _cfg_mod.WORKSPACE_DIR
-    snap_dir = _SNAPSHOT_DIR / timestamp
-    snap_dir.mkdir(parents=True, exist_ok=True)
-
-    workspace_files = []
-    for root, dirs, files in os.walk(ws):
-        if _should_skip_dir(root):
-            dirs.clear()
-            continue
-        for filename in files:
-            rel_path = os.path.relpath(os.path.join(root, filename), ws)
-            workspace_files.append(rel_path.replace("\\", "/"))
-
-    backed = []
-    for filename in file_list:
-        src = Path(ws) / filename
-        if src.exists() and src.is_file():
-            dst = snap_dir / filename
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(str(src), str(dst))
-            backed.append(filename)
-    (snap_dir / "meta.json").write_text(
-        json.dumps({"files": backed, "workspace_files": workspace_files, "timestamp": timestamp},
-                   ensure_ascii=False), encoding="utf-8"
-    )
-    console.print(f"[快照] {snap_dir.name} (baseline {len(backed)} 文件)", highlight=False)
-    return {"mode": "file", "path": str(snap_dir), "timestamp": timestamp}
-
-
-def _backup_file_if_needed(snap_info, filename):
-    """LLM 写入前增量备份：若快照中尚无此文件且当前文件存在则备份；
-    若文件原本不存在，仅在 meta.json 中标记，使回滚时能删除这个新文件。"""
-    if not snap_info or not isinstance(snap_info, dict) or snap_info.get("mode") != "file":
-        return
-    if not filename:
-        return
-    snap_dir = Path(snap_info["path"])
-    target = snap_dir / filename
-    if target.exists():
-        return  # 已备份过
-    import config as _cfg_mod
-    src = Path(_cfg_mod.WORKSPACE_DIR) / filename
-    meta_file = snap_dir / "meta.json"
-    try:
-        meta = json.loads(meta_file.read_text(encoding="utf-8")) if meta_file.exists() else {}
-    except Exception:
-        meta = {}
-
-    if src.exists() and src.is_file():
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(str(src), str(target))
-        if filename not in meta.get("files", []):
-            meta.setdefault("files", []).append(filename)
-            meta_file.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
-
-
-def restore_snapshot(snap_info):
-    """根据快照恢复工作区，返回恢复数量。"""
-    if not snap_info:
-        return 0
-    if isinstance(snap_info, Path):
-        return _restore_file_snapshot(snap_info)
-    if isinstance(snap_info, dict) and snap_info.get("mode") == "file":
-        return _restore_file_snapshot(Path(snap_info["path"]))
-    return 0
-
-
-def _restore_file_snapshot(snap_dir: Path) -> int:
-    """文件复制模式的恢复逻辑（原 restore_snapshot）。"""
-    import config as _cfg_mod
-    ws = _cfg_mod.WORKSPACE_DIR
-    meta_file = snap_dir / "meta.json"
-    if not meta_file.exists():
-        return 0
-    meta = json.loads(meta_file.read_text(encoding="utf-8"))
-    restored = 0
-    for filename in meta.get("files", []):
-        src = snap_dir / filename
-        dst = Path(ws) / filename
-        if src.exists():
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(str(src), str(dst))
-            restored += 1
-    workspace_files_then = set(meta.get("workspace_files", []))
-    current_files = []
-    for root, dirs, files in os.walk(ws):
-        if _should_skip_dir(root):
-            dirs.clear()
-            continue
-        for filename in files:
-            rel_path = os.path.relpath(os.path.join(root, filename), ws)
-            current_files.append(rel_path.replace("\\", "/"))
-    for f in current_files:
-        if f not in workspace_files_then:
-            path = Path(ws) / f
-            try:
-                if path.exists():
-                    path.unlink()
-            except Exception as e:
-                console.print(f"[警告] 回滚时无法删除 {f}: {e}", style="yellow", highlight=False)
-    return restored
-
-
-def cleanup_snapshot(snap_info):
-    """清理快照目录"""
-    if not snap_info:
-        return
-    snap_dir = None
-    if isinstance(snap_info, dict) and snap_info.get("mode") == "file":
-        snap_dir = Path(snap_info["path"])
-    elif isinstance(snap_info, Path):
-        snap_dir = snap_info
-    if snap_dir and snap_dir.exists():
-        shutil.rmtree(str(snap_dir))
-
-
-def _gc_old_snapshots(keep=10):
-    """保留最近 keep 个快照目录，更老的删除（防止 .yansh/snapshots 无限增长）"""
-    if not _SNAPSHOT_DIR.exists():
-        return
-    candidates = sorted(
-        (s for s in _SNAPSHOT_DIR.iterdir() if s.is_dir()),
-        key=lambda p: p.name,
-        reverse=True
-    )
-    for old in candidates[keep:]:
-        try:
-            shutil.rmtree(str(old))
-        except Exception:
-            pass
-
-
-def get_latest_snapshot():
-    """返回最新快照目录，不存在返回 None（文件复制模式兼容）"""
-    if not _SNAPSHOT_DIR.exists():
-        return None
-    candidates = sorted(
-        (s for s in _SNAPSHOT_DIR.iterdir() if s.is_dir() and (s / "meta.json").exists()),
-        reverse=True
-    )
-    if not candidates:
-        return None
-    s = candidates[0]
-    return {"mode": "file", "path": str(s), "timestamp": s.name}
-
-
-# ---------- #38 任务日志 ----------
-
-def init_task_log(requirement, mode):
-    global _current_task_log, _task_tool_calls, _task_files_modified
-    _task_tool_calls = []
-    _task_files_modified = []
-    _current_task_log = {
-        "timestamp": datetime.now().isoformat(),
-        "requirement": requirement,
-        "mode": mode,
-        "model": QUALITY_CASCADE[0] if QUALITY_CASCADE else "unknown",
-        "plan": [],
-        "files_modified": [],
-        "tool_calls": [],
-        "test_command": "",
-        "test_result": "unknown",
-        "attempts": 0,
-        "error": None,
-        "duration_seconds": 0.0,
-        "_start": _time.time(),
-    }
-
-def finish_task_log(success, attempts, test_result=None):
-    global _current_task_log, _last_task_log
-    if not _current_task_log:
-        return
-    _current_task_log["test_result"] = "pass" if success else "fail"
-    _current_task_log["attempts"] = attempts
-    _current_task_log["tool_calls"] = _task_tool_calls[:]
-    _current_task_log["files_modified"] = list(dict.fromkeys(_task_files_modified))
-    _current_task_log["duration_seconds"] = round(_time.time() - _current_task_log.pop("_start"), 2)
-    if test_result and not success:
-        err = test_result.get("stderr", "") or test_result.get("stdout", "")
-        _current_task_log["error"] = err[:300]
-    _LOG_DIR.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    (_LOG_DIR / f"{ts}.jsonl").write_text(
-        json.dumps(_current_task_log, ensure_ascii=False), encoding="utf-8"
-    )
-    _last_task_log = dict(_current_task_log)
-    _current_task_log = {}
-
-def show_recent_logs():
-    """打印最近 5 条日志摘要"""
-    if not _LOG_DIR.exists():
-        console.print("暂无日志", highlight=False)
-        return
-    logs = sorted(_LOG_DIR.glob("*.jsonl"), reverse=True)[:5]
-    if not logs:
-        console.print("暂无日志", highlight=False)
-        return
-    for f in logs:
-        try:
-            e = json.loads(f.read_text(encoding="utf-8"))
-            ts  = e.get("timestamp", "")[:19]
-            req = e.get("requirement", "")[:60]
-            res = "✓" if e.get("test_result") == "pass" else "✗"
-            dur = e.get("duration_seconds", 0)
-            att = e.get("attempts", 0)
-            console.print(f"{ts} | {res} | {dur}s | {att}次 | {req}", highlight=False)
-        except Exception:
-            continue
-
-# ---------- #25 彩色 diff ----------
-
-def _show_diff(filename, old_str, new_str):
-    old_lines = old_str.splitlines(keepends=True)
-    new_lines = new_str.splitlines(keepends=True)
-    diff = list(difflib.unified_diff(
-        old_lines, new_lines,
-        fromfile=f"a/{filename}", tofile=f"b/{filename}", lineterm=""
-    ))
-    if not diff:
-        return
-    console.print(f"\n--- diff: {filename} ---", highlight=False)
-    for line in diff:
-        if line.startswith("---") or line.startswith("+++"):
-            console.print(line, style="bold", highlight=False)
-        elif line.startswith("-"):
-            console.print(line, style="red", highlight=False)
-        elif line.startswith("+"):
-            console.print(line, style="green", highlight=False)
-        elif line.startswith("@@"):
-            console.print(line, style="cyan", highlight=False)
-        else:
-            console.print(line, highlight=False)
-
-# ---------- #58 HIL（人工介入编辑）----------
-
-def _detect_editor():
-    """返回可用编辑器命令列表。Windows 优先 VS Code，其次 notepad；Unix 读 $VISUAL/$EDITOR，否则 vi。"""
-    import shutil
-    if sys.platform == "win32":
-        if shutil.which("code"):
-            return ["code", "--wait"]
-        return ["notepad"]
-    for var in ("VISUAL", "EDITOR"):
-        val = os.environ.get(var)
-        if val:
-            return val.split()
-    return ["vi"]
-
-
-def _build_diff_lines(filename, old_content, new_content, is_new_file=False):
-    """生成 unified diff 行列表。超过 50 行时截断（头30 + 尾10）。"""
-    old_lines = [] if is_new_file else old_content.splitlines(keepends=True)
-    new_lines = new_content.splitlines(keepends=True)
-    from_file = "新建文件" if is_new_file else f"a/{filename}"
-    diff = list(difflib.unified_diff(
-        old_lines, new_lines,
-        fromfile=from_file, tofile=f"b/{filename}", lineterm=""
-    ))
-    if len(diff) > 50:
-        omitted = len(diff) - 40
-        diff = diff[:30] + [f"...已截断，共 {len(diff)} 行变更，省略 {omitted} 行..."] + diff[-10:]
-    return diff
-
-
-def _print_diff_colored(diff_lines):
-    """彩色输出 diff 行列表。"""
-    for line in diff_lines:
-        if line.startswith("---") or line.startswith("+++"):
-            console.print(line, style="bold", highlight=False)
-        elif line.startswith("-"):
-            console.print(line, style="red", highlight=False)
-        elif line.startswith("+"):
-            console.print(line, style="green", highlight=False)
-        elif line.startswith("@@"):
-            console.print(line, style="cyan", highlight=False)
-        elif line.startswith("..."):
-            console.print(line, style="yellow", highlight=False)
-        else:
-            console.print(line, highlight=False)
-
-
-def _hil_confirm(filename, old_content, new_content, is_new_file=False):
-    """展示 diff 并询问用户处理方式。
-    返回 (accept: bool, final_content: str)。
-    选 'a' 时设置 _HIL_AUTO_ACCEPT = True，后续不再询问。
-    """
-    global _HIL_AUTO_ACCEPT
-    if _HIL_AUTO_ACCEPT:
-        return True, new_content
-
-    diff_lines = _build_diff_lines(filename, old_content, new_content, is_new_file)
-    if not diff_lines:
-        return True, new_content
-
-    label = "新建文件" if is_new_file else "修改文件"
-    console.print(f"\n[HIL] {label}: {filename}", highlight=False)
-    _print_diff_colored(diff_lines)
-    console.print("\n[y] 接受  [n] 拒绝  [e] 编辑后接受  [a] 全部接受（本轮）  ?", highlight=False)
-
-    try:
-        answer = _prompt("").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        answer = "n"
-
-    if answer == "a":
-        _HIL_AUTO_ACCEPT = True
-        return True, new_content
-    if answer == "e":
-        import tempfile
-        suffix = Path(filename).suffix or ".txt"
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=suffix, delete=False, encoding="utf-8"
-        ) as tf:
-            tf.write(new_content)
-            tmp_path = tf.name
-        try:
-            import subprocess as _sp
-            _sp.call(_detect_editor() + [tmp_path])
-            edited = Path(tmp_path).read_text(encoding="utf-8")
-        except Exception as e:
-            console.print(f"[HIL] 编辑器错误: {e}", style="red", highlight=False)
-            edited = new_content
-        finally:
-            Path(tmp_path).unlink(missing_ok=True)
-        return True, edited
-    if answer == "n":
-        console.print(f"[HIL] 已跳过: {filename}", highlight=False)
-        return False, new_content
-    return True, new_content
+# ---------- #37 快照已迁移至 snapshot.py；#38 任务日志已迁移至 task_log.py ----------
 
 
 # ---------- #7 统一工具分发 ----------
@@ -1094,7 +683,7 @@ def _dispatch_tool_call(tool_call, *, mode="auto", allow_hil=True, allow_confirm
         result = write_file(**args)
         if "success" in result:
             console.print(f"写入{'(覆盖)' if overwrite else ''} {fname}", highlight=False)
-            _task_files_modified.append(fname)
+            _task_log_mod._task_files_modified.append(fname)
         return {"name": name, "args": args, "id": tool_call.id, "result": result}
 
     if name == "replace_in_file":
@@ -1127,7 +716,7 @@ def _dispatch_tool_call(tool_call, *, mode="auto", allow_hil=True, allow_confirm
             result = replace_in_file(**args)
         if "success" in result:
             console.print(f"replace_in_file OK: {result.get('filename')}", highlight=False)
-            _task_files_modified.append(rfname)
+            _task_log_mod._task_files_modified.append(rfname)
         else:
             console.print(f"替换失败: {result.get('error')}", highlight=False)
         return {"name": name, "args": args, "id": tool_call.id, "result": result}
@@ -1147,21 +736,21 @@ def _dispatch_tool_call(tool_call, *, mode="auto", allow_hil=True, allow_confirm
         _backup_file_if_needed(snap, args.get("file_path", ""))
         result = apply_patch(**args)
         if "success" in result:
-            _task_files_modified.append(args.get("file_path", ""))
+            _task_log_mod._task_files_modified.append(args.get("file_path", ""))
         return {"name": name, "args": args, "id": tool_call.id, "result": result}
 
     if name == "replace_symbol":
         _backup_file_if_needed(snap, args.get("file_path", ""))
         result = replace_symbol(**args)
         if "success" in result:
-            _task_files_modified.append(args.get("file_path", ""))
+            _task_log_mod._task_files_modified.append(args.get("file_path", ""))
         return {"name": name, "args": args, "id": tool_call.id, "result": result}
 
     if name == "append_to_file":
         _backup_file_if_needed(snap, args.get("filename", ""))
         result = append_to_file(**args)
         if "success" in result:
-            _task_files_modified.append(args.get("filename", ""))
+            _task_log_mod._task_files_modified.append(args.get("filename", ""))
         return {"name": name, "args": args, "id": tool_call.id, "result": result}
 
     # 只读工具
@@ -1195,7 +784,7 @@ def _record_dispatch(out: dict, msgs: list):
     """把分发结果挂回 messages，并写入 task tool_calls 日志（敏感字段除外）"""
     args = out["args"]
     safe_args = {k: v for k, v in args.items() if k not in ("content", "new_str", "new_code")}
-    _task_tool_calls.append({"name": out["name"], "args": safe_args})
+    _task_log_mod._task_tool_calls.append({"name": out["name"], "args": safe_args})
     msgs.append({
         "tool_call_id": out["id"],
         "role": "tool",
@@ -1203,610 +792,10 @@ def _record_dispatch(out: dict, msgs: list):
         "content": json.dumps(out["result"]),
     })
 
-
-# ---------- #26 Linter ----------
+# ---------- #26 Linter / #27 项目类型检测：已迁移至 linter.py ----------
 
 def run_linter():
-    """根据 _PROJECT_TYPE 运行对应的 Linter，有错误返回结果 dict，否则返回 None"""
-    import shutil
-    if not _PROJECT_TYPE:
-        return None
-    
-    cmd = None
-    if _PROJECT_TYPE == "Python":
-        if shutil.which("ruff"):
-            cmd = "ruff check ."
-        elif shutil.which("mypy"):
-            cmd = "mypy ."
-        else:
-            import sys
-            cmd = f'"{sys.executable}" -m ruff check .'
-    elif _PROJECT_TYPE == "Node.js":
-        cmd = "npm run lint --if-present"
-    elif _PROJECT_TYPE == "Go":
-        if shutil.which("go"):
-            cmd = "go vet ./..."
-    elif _PROJECT_TYPE == "Rust":
-        if shutil.which("cargo"):
-            cmd = "cargo clippy"
-    elif _PROJECT_TYPE == "Java/Maven":
-        if shutil.which("mvn"):
-            cmd = "mvn checkstyle:check"
-            
-    if not cmd:
-        return None
-        
-    result = execute_command(cmd)
-    if result.get("returncode", 0) == 0:
-        return None
-    return result
-
-# ---------- #27 项目类型检测 ----------
-
-def detect_project_type():
-    """扫描 workspace 目录识别项目类型，返回 (type_str, test_cmd)。
-    优先读取配置文件中用户自定义的 test 命令，而不是硬编码 pytest/npm test。"""
-    from pathlib import Path
-    from config import WORKSPACE_DIR
-    ws = Path(WORKSPACE_DIR)
-    if not ws.exists():
-        return None, None
-    all_names = {f.name for f in ws.rglob("*") if f.is_file()}
-
-    # ---------- Python ----------
-    if any(n in all_names for n in ("requirements.txt", "pyproject.toml", "setup.py", "setup.cfg")) \
-            or any(n.endswith(".py") for n in all_names):
-        test_cmd = _detect_python_test_cmd(ws)
-        return "Python", test_cmd
-
-    # ---------- Node.js ----------
-    if "package.json" in all_names:
-        test_cmd = _detect_node_test_cmd(ws)
-        return "Node.js", test_cmd
-
-    # ---------- Go ----------
-    if "go.mod" in all_names:
-        return "Go", "go test ./..."
-
-    # ---------- Rust ----------
-    if "Cargo.toml" in all_names:
-        return "Rust", "cargo test"
-
-    # ---------- Java/Maven ----------
-    if "pom.xml" in all_names:
-        return "Java/Maven", "mvn test"
-
-    return None, None
-
-
-def _detect_python_test_cmd(ws: "Path") -> str:
-    """从 pyproject.toml / tox.ini / setup.cfg 读取 Python 项目的真实测试命令。"""
-    import shutil
-
-    # 1. pyproject.toml — 检查 [tool.pytest.ini_options] 或 [tool.uv] / [tool.poetry]
-    pyproject = ws / "pyproject.toml"
-    if pyproject.exists():
-        try:
-            content = pyproject.read_text(encoding="utf-8")
-            # uv 项目：优先用 uv run pytest
-            if "[tool.uv]" in content or (ws / "uv.lock").exists():
-                if shutil.which("uv"):
-                    return "uv run pytest"
-            # poetry 项目
-            if "[tool.poetry]" in content or (ws / "poetry.lock").exists():
-                if shutil.which("poetry"):
-                    return "poetry run pytest"
-            # 有 pytest 配置就用 pytest
-            if "[tool.pytest" in content or "[pytest]" in content:
-                return "pytest"
-        except Exception:
-            pass
-
-    # 2. tox.ini — 有 tox 就用 tox
-    if (ws / "tox.ini").exists() and shutil.which("tox"):
-        return "tox"
-
-    # 3. Makefile 里有 test target
-    makefile = ws / "Makefile"
-    if makefile.exists():
-        try:
-            mk = makefile.read_text(encoding="utf-8", errors="replace")
-            if "test:" in mk or "test :" in mk:
-                return "make test"
-        except Exception:
-            pass
-
-    # 4. 默认 pytest（最通用）
-    if shutil.which("pytest"):
-        return "pytest"
-    # 没有全局 pytest 时用 python -m pytest
-    return "python -m pytest"
-
-
-def _detect_node_test_cmd(ws: "Path") -> str:
-    """从 package.json scripts.test 读取 Node 项目的真实测试命令。"""
-    import json as _json
-    import shutil
-    pkg = ws / "package.json"
-    if pkg.exists():
-        try:
-            data = _json.loads(pkg.read_text(encoding="utf-8"))
-            scripts = data.get("scripts", {})
-            # 优先用明确的 test script
-            if scripts.get("test"):
-                # 检测包管理器
-                if (ws / "yarn.lock").exists() and shutil.which("yarn"):
-                    return "yarn test"
-                if (ws / "pnpm-lock.yaml").exists() and shutil.which("pnpm"):
-                    return "pnpm test"
-                return "npm test"
-        except Exception:
-            pass
-    return "npm test"
-
-# 定义可用工具
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "write_file",
-            "description": "在workspace目录下写入文件",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "filename": {"type": "string", "description": "文件名（相对于workspace）"},
-                    "content": {"type": "string", "description": "文件内容"}
-                },
-                "required": ["filename", "content"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": "读取workspace目录下的文件，可选按行号区间截取（用于大文件分块读取）",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "filename": {"type": "string", "description": "文件名（相对于workspace）"},
-                    "offset": {"type": "integer", "description": "起始行号（1-based，可选）"},
-                    "limit":  {"type": "integer", "description": "读取行数上限（可选）"}
-                },
-                "required": ["filename"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "execute_command",
-            "description": "在workspace目录下执行命令（30秒超时）",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string", "description": "要执行的命令"}
-                },
-                "required": ["command"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_files",
-            "description": "列出workspace目录下的所有文件",
-            "parameters": {"type": "object", "properties": {}, "required": []}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "replace_in_file",
-            "description": "在workspace文件中精确替换字符串。old_str必须唯一匹配，否则返回错误",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "filename": {"type": "string", "description": "文件名（相对于workspace）"},
-                    "old_str": {"type": "string", "description": "要替换的旧字符串（必须唯一匹配）"},
-                    "new_str": {"type": "string", "description": "替换后的新字符串"}
-                },
-                "required": ["filename", "old_str", "new_str"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_symbol_definition",
-            "description": "用 AST 精确查找函数或类的定义，返回所在文件、起始行号、完整代码。比读整个文件更高效，适合定位某个函数/类时使用。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "symbol_name": {"type": "string", "description": "要查找的函数名或类名"},
-                    "file_path": {"type": "string", "description": "指定搜索文件（相对于workspace，可选），不填则搜索整个workspace"}
-                },
-                "required": ["symbol_name"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_in_files",
-            "description": "在workspace内搜索匹配字符串，返回文件名、行号和匹配内容",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string", "description": "搜索模式（字符串或正则）"},
-                    "regex": {"type": "boolean", "description": "是否使用正则表达式匹配（默认false）"},
-                    "extensions": {"type": "array", "items": {"type": "string"}, "description": "文件扩展名过滤列表，如 [\".py\", \".md\"]"}
-                },
-                "required": ["pattern"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "move_file",
-            "description": "移动文件从src到dst（相对于workspace），自动创建目标父目录",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "src": {"type": "string", "description": "源文件路径（相对于workspace）"},
-                    "dst": {"type": "string", "description": "目标文件路径（相对于workspace）"}
-                },
-                "required": ["src", "dst"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "apply_patch",
-            "description": "应用 unified diff 格式的 patch 到文件，比 replace_in_file 更适合多处批量修改",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "patch_text": {"type": "string", "description": "unified diff 格式的 patch 字符串"},
-                    "file_path": {"type": "string", "description": "目标文件路径（相对于workspace，可从 patch 自动推断）"}
-                },
-                "required": ["patch_text"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_symbols",
-            "description": "列出文件中所有函数和类（名称、类型、行号），用于了解文件结构再做精确修改",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "file_path": {"type": "string", "description": "文件路径（相对于workspace）"}
-                },
-                "required": ["file_path"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "replace_symbol",
-            "description": "替换指定函数或类的完整实现（用 AST 定位，不依赖字符串精确匹配，比 replace_in_file 更稳）",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "symbol_name": {"type": "string", "description": "要替换的函数名或类名"},
-                    "new_code": {"type": "string", "description": "新的完整实现代码"},
-                    "file_path": {"type": "string", "description": "文件路径（相对于workspace）"}
-                },
-                "required": ["symbol_name", "new_code", "file_path"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "fetch_webpage",
-            "description": "读取网页内容，提取正文文本，截断到3000字符。用于查询外部API文档等。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "url": {"type": "string", "description": "要读取的网页URL"}
-                },
-                "required": ["url"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_docs",
-            "description": "使用 DuckDuckGo 搜索文档，返回前3条结果的标题+摘要+URL",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "搜索关键词"}
-                },
-                "required": ["query"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "append_to_file",
-            "description": "向指定文件末尾追加内容",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "filename": {"type": "string", "description": "文件名（相对于workspace）"},
-                    "content": {"type": "string", "description": "要追加的内容"}
-                },
-                "required": ["filename", "content"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "find_references",
-            "description": "在指定目录下递归搜索所有 .py 文件中的符号引用（排除定义行）",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "symbol": {"type": "string", "description": "要查找的符号名称"},
-                    "path": {"type": "string", "description": "搜索起始路径（相对于workspace，默认 \".\"）"}
-                },
-                "required": ["symbol"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "glob_files",
-            "description": "按 glob 模式匹配 workspace 内的文件路径，遵循 .gitignore。比 list_files 更灵活，pattern 例：'src/**/*.py'、'*.md'。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string", "description": "glob 模式"},
-                    "path":    {"type": "string", "description": "搜索起始路径（相对于workspace，默认 \".\"）"}
-                },
-                "required": ["pattern"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "git_diff",
-            "description": "查看 workspace 内的 git diff（未提交改动）。可选 path 限定文件，staged=true 显示已暂存的 diff。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path":   {"type": "string", "description": "可选：仅 diff 该路径"},
-                    "staged": {"type": "boolean", "description": "是否查看 --cached（已 add 的部分），默认 false"}
-                },
-                "required": []
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "git_log",
-            "description": "查看 workspace 最近的 git 提交（git log --oneline）",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "limit": {"type": "integer", "description": "返回条数，默认 10"}
-                },
-                "required": []
-            }
-        }
-    }
-]
-
-LLM_TIMEOUT_SEC = 120
-LLM_MAX_RETRIES_PER_MODEL = 3  # 每个模型对 429/5xx 的退避重试次数
-
-
-def _is_transient_error(exc) -> bool:
-    """判断是否为应退避重试的瞬时错误（429 / 5xx / 连接错误）"""
-    try:
-        from openai import APIConnectionError, APITimeoutError, RateLimitError, InternalServerError
-        if isinstance(exc, (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError)):
-            return True
-    except ImportError:
-        pass
-    status = getattr(exc, "status_code", None) or getattr(exc, "http_status", None)
-    if isinstance(status, int) and (status == 429 or 500 <= status < 600):
-        return True
-    return False
-
-
-def call_llm(messages, tools=None, tool_choice=None, response_format=None, stream: bool | None = None):
-    """尝试QUALITY_CASCADE中的模型，依次降级调用。每模型对 429/5xx 指数退避重试。
-    在子线程中执行，每100ms检查一次ESC中断。
-    stream=True 且 tools=None 时启用流式输出，实时打印 token。"""
-    # 无工具调用时默认开启流式（response_format=json_object 时强制关闭，JSON 流解析复杂）
-    use_stream = (stream is True) or (
-        stream is None and tools is None and response_format is None
-    )
-
-    result_holder = [None]
-    exc_holder = [None]
-
-    def _worker():
-        for model in QUALITY_CASCADE:
-            backoff = 1.0
-            for attempt in range(LLM_MAX_RETRIES_PER_MODEL):
-                try:
-                    kwargs = {"model": model, "messages": messages, "timeout": LLM_TIMEOUT_SEC}
-                    if tools is not None:
-                        kwargs["tools"] = tools
-                    if tool_choice is not None:
-                        kwargs["tool_choice"] = tool_choice
-                    if response_format is not None and not _is_claude(model):
-                        kwargs["response_format"] = response_format
-                    cl = _client_for(model)
-                    if use_stream and not _is_gemini(model):
-                        kwargs["stream"] = True
-                        kwargs["stream_options"] = {"include_usage": True}  # #5 让网关返回 usage chunk
-                        result_holder[0] = _handle_stream(
-                            cl.chat.completions.create(**kwargs), model
-                        )
-                    else:
-                        result_holder[0] = cl.chat.completions.create(**kwargs)
-                    return
-                except Exception as e:
-                    exc_holder[0] = e
-                    if _is_transient_error(e) and attempt < LLM_MAX_RETRIES_PER_MODEL - 1:
-                        deadline = _time.time() + backoff
-                        while _time.time() < deadline:
-                            if interrupt.is_interrupted():
-                                return
-                            _time.sleep(0.1)
-                        backoff *= 2
-                        continue
-                    break
-
-    t = threading.Thread(target=_worker, daemon=True)
-    t.start()
-    while t.is_alive():
-        if interrupt.is_interrupted():
-            raise interrupt.Interrupted()
-        t.join(timeout=0.1)
-
-    if result_holder[0] is None:
-        raise RuntimeError(f"所有模型调用均失败: {exc_holder[0]}")
-
-    # #62 统计 Token（按 model 分桶，以便用各自价格计费）
-    res = result_holder[0]
-    if hasattr(res, "usage") and res.usage:
-        p = res.usage.prompt_tokens or 0
-        c = res.usage.completion_tokens or 0
-        used_model = getattr(res, "model", None) or (QUALITY_CASCADE[0] if QUALITY_CASCADE else "unknown")
-        _last_request_tokens["prompt"] = p
-        _last_request_tokens["completion"] = c
-        _last_request_tokens["model"] = used_model
-        bucket = _session_tokens_by_model.setdefault(used_model, {"prompt": 0, "completion": 0})
-        bucket["prompt"] += p
-        bucket["completion"] += c
-
-    return res
-
-
-class _StreamToolCall:
-    """流式累积的 tool_call，提供 model_dump 兼容 OpenAI Pydantic API"""
-    def __init__(self, tc_id: str, name: str, arguments: str):
-        from types import SimpleNamespace
-        self.id = tc_id
-        self.type = "function"
-        self.function = SimpleNamespace(name=name, arguments=arguments)
-
-    def model_dump(self):
-        return {
-            "id": self.id,
-            "type": self.type,
-            "function": {"name": self.function.name, "arguments": self.function.arguments},
-        }
-
-
-def _handle_stream(stream_iter, model: str):
-    """消费流式响应，实时打印 content；按 index 累积 tool_calls 片段；末尾抽 usage。
-    返回与非流式兼容的伪 response 对象。"""
-    from types import SimpleNamespace
-    collected_content = []
-    usage_data = None
-    tool_calls_buf: dict = {}  # {index: {"id": str, "name": str, "arguments": str}}
-
-    for chunk in stream_iter:
-        if interrupt.is_interrupted():
-            raise interrupt.Interrupted()
-        if not chunk.choices:
-            # 某些网关在最后一个 chunk 放 usage（需 stream_options.include_usage）
-            if hasattr(chunk, "usage") and chunk.usage:
-                usage_data = chunk.usage
-            continue
-        delta = chunk.choices[0].delta
-        if delta and delta.content:
-            sys.stdout.write(delta.content)
-            sys.stdout.flush()
-            collected_content.append(delta.content)
-        # #3 累积 tool_calls 片段（OpenAI 协议：name/id 仅首个 chunk 给出，arguments 增量给）
-        tc_delta_list = getattr(delta, "tool_calls", None) if delta else None
-        if tc_delta_list:
-            for tc_delta in tc_delta_list:
-                idx = getattr(tc_delta, "index", 0) or 0
-                slot = tool_calls_buf.setdefault(idx, {"id": "", "name": "", "arguments": ""})
-                if getattr(tc_delta, "id", None):
-                    slot["id"] = tc_delta.id
-                fn = getattr(tc_delta, "function", None)
-                if fn is not None:
-                    if getattr(fn, "name", None):
-                        slot["name"] = fn.name
-                    if getattr(fn, "arguments", None):
-                        slot["arguments"] += fn.arguments
-
-    if collected_content:
-        sys.stdout.write("\n")
-        sys.stdout.flush()
-
-    full_content = "".join(collected_content)
-
-    tool_calls = None
-    if tool_calls_buf:
-        tool_calls = [
-            _StreamToolCall(
-                tool_calls_buf[i]["id"],
-                tool_calls_buf[i]["name"],
-                tool_calls_buf[i]["arguments"],
-            )
-            for i in sorted(tool_calls_buf.keys())
-        ]
-
-    message = SimpleNamespace(
-        content=full_content if full_content else None,
-        tool_calls=tool_calls,
-        role="assistant",
-    )
-    finish_reason = "tool_calls" if tool_calls else "stop"
-    choice = SimpleNamespace(message=message, finish_reason=finish_reason)
-    usage = usage_data or SimpleNamespace(prompt_tokens=0, completion_tokens=len(full_content) // 4)
-    response = SimpleNamespace(choices=[choice], usage=usage, model=model)
-    return response
-
-
-def show_stats():
-    """📊 显示 Token 消耗统计（按 model 分别按价计费）"""
-    p_last = _last_request_tokens["prompt"]
-    c_last = _last_request_tokens["completion"]
-    last_model = _last_request_tokens.get("model", "")
-
-    p_total = sum(b["prompt"] for b in _session_tokens_by_model.values())
-    c_total = sum(b["completion"] for b in _session_tokens_by_model.values())
-    total = p_total + c_total
-
-    cost = 0.0
-    for model, b in _session_tokens_by_model.items():
-        price = get_model_price(model)
-        cost += b["prompt"] / 1_000_000 * price["input"]
-        cost += b["completion"] / 1_000_000 * price["output"]
-
-    console.print("\n📊 [bold]Token 消耗统计[/bold]", highlight=False)
-    console.print(f"  本次请求: prompt={p_last:,}  completion={c_last:,}  ({last_model})", highlight=False)
-    console.print(f"  会话累计: prompt={p_total:,}  completion={c_total:,}  total={total:,}", highlight=False)
-    if len(_session_tokens_by_model) > 1:
-        for model, b in _session_tokens_by_model.items():
-            price = get_model_price(model)
-            sub = b["prompt"] / 1_000_000 * price["input"] + b["completion"] / 1_000_000 * price["output"]
-            console.print(f"    └─ {model}: ${sub:.4f}  (in {b['prompt']:,} / out {b['completion']:,})", highlight=False)
-    console.print(f"  预估费用: [green]${cost:.4f}[/green]", highlight=False)
-
+    return _linter_mod.run_linter_for(_PROJECT_TYPE)
 
 _ARCHITECT_ROLE = """【角色：架构师 Agent】
 你专注于分析需求和制定实现计划。
@@ -1816,6 +805,10 @@ _ARCHITECT_ROLE = """【角色：架构师 Agent】
 _CODER_ROLE = """【角色：码农 Agent】
 你专注于根据计划生成高质量代码。
 职责：严格按计划执行，不自行发挥额外功能；注重代码质量和边界处理；已有文件用 replace_in_file 精确修改，不得整体重写。
+测试文件规则：测试文件（test_*.py / *_test.py）若位于子目录（如 tests/），必须在文件最顶部加入以下两行，确保能导入父目录模块：
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 """
 
 _REVIEWER_ROLE = """【角色：代码审查 Agent】
@@ -1935,7 +928,7 @@ test_command 禁止使用 python -c 内联执行（会被安全策略拦截）�
     except json.JSONDecodeError:
         return {"files": [], "test_command": ""}
 
-def code(plan, mode="auto"):
+def code(plan, mode="auto", requirement=""):
     """根据计划逐个文件生成/修改代码。文件已存在优先用replace_in_file做精确修改；不存在则用write_file新建。"""
     import os as _os
     from tools import write_file, read_file, replace_in_file
@@ -1976,8 +969,9 @@ def code(plan, mode="auto"):
             existing_content = existing.get("content", "")
             console.print(f"{filename} 已存在，读取现有内容进行增量修改...")
 
+            req_block = f"\n原始需求（必须严格遵守，包括变量名、库名、API key 名称等技术细节）：\n{requirement}\n" if requirement else ""
             sys_prompt = f"""{_CODER_ROLE}
-{_get_project_rules()}
+{_get_project_rules()}{req_block}
 你是一个代码修改助手。对已有文件进行精确修改。
 
 可用操作：
@@ -1990,7 +984,8 @@ def code(plan, mode="auto"):
 - 每次调用 replace_in_file 只修改一处，如有多处修改需要多次调用"""
         else:
             console.print(f"{filename} 是新建文件...")
-            sys_prompt = f"""{_CODER_ROLE}
+            req_block = f"\n原始需求（必须严格遵守，包括变量名、库名、API key 名称等技术细节）：\n{requirement}\n" if requirement else ""
+            sys_prompt = f"""{_CODER_ROLE}{req_block}
 你是一个代码生成助手。请生成文件 `{filename}` 的完整代码。
 
 可用操作：
@@ -2035,9 +1030,19 @@ def code(plan, mode="auto"):
             # #8 上限耗尽仍在调工具，提示并记录
             warn = f"[警告] {filename} 已用尽 5 轮工具调用上限"
             console.print(warn, style="yellow", highlight=False)
-            _current_task_log.setdefault("warnings", []).append(warn)
+            _task_log_mod._current_task_log.setdefault("warnings", []).append(warn)
 
     console.print("代码生成/修改完成")
+
+    # pyproject.toml 有变更时自动重装包，确保新增模块立即可用
+    if any("pyproject.toml" in (f or "") for f in _task_log_mod._task_files_modified):
+        import subprocess as _sp
+        console.print("[自动] 检测到 pyproject.toml 变更，执行 pip install -e . ...", highlight=False)
+        r = _sp.run(["pip", "install", "-e", "."], capture_output=True, text=True)
+        if r.returncode == 0:
+            console.print("[自动] pip install -e . 完成", highlight=False)
+        else:
+            console.print(f"[警告] pip install -e . 失败: {r.stderr[:200]}", style="yellow", highlight=False)
 
 def review(requirement, modified_files):
     """代码审查阶段"""
@@ -2094,12 +1099,13 @@ def review(requirement, modified_files):
             "suggestions": [],
         }
 
-def fix(test_result, plan):
-    """根据测试错误修复代码（多轮工具调用）"""
+def fix(test_result, plan, reason="test_failure"):
+    """根据测试错误或审查意见修复代码（多轮工具调用）
+    reason: "test_failure" | "review_rejection"
+    """
     console.print("[Agent: Tester]", highlight=False)
     console.print("开始修复代码...")
-    
-    # 优先使用 stderr，为空回落到 stdout；关键栈常在末尾，采用 head + tail 截断
+
     stderr = test_result.get("stderr", "")
     stdout = test_result.get("stdout", "")
     raw = stderr or stdout or "未知错误"
@@ -2113,11 +1119,16 @@ def fix(test_result, plan):
         )
     else:
         error_info = raw
-    
-    content = f"测试失败！\n错误输出：\n{error_info}\n\n计划：{json.dumps(plan)}"
-    
+
+    if reason == "review_rejection":
+        content = f"代码审查未通过，请按以下审查意见逐条修复代码：\n\n{error_info}\n\n计划：{json.dumps(plan)}"
+        sys_role = f"{_TESTER_ROLE}\n{_get_project_rules()}你是代码审查修复助手。请严格按审查意见逐条修复，每条对应一次 replace_in_file 精确修改。不要改与审查意见无关的代码。"
+    else:
+        content = f"测试失败！\n错误输出：\n{error_info}\n\n计划：{json.dumps(plan)}"
+        sys_role = f"{_TESTER_ROLE}\n{_get_project_rules()}你是代码修复助手。根据错误信息精准修复代码，优先使用 replace_in_file 做最小化修改，必要时才用 write_file 重写整个文件。"
+
     messages = [
-        {"role": "system", "content": f"{_TESTER_ROLE}\n{_get_project_rules()}你是代码修复助手。根据错误信息精准修复代码，优先使用 replace_in_file 做最小化修改，必要时才用 write_file 重写整个文件。"},
+        {"role": "system", "content": sys_role},
         {"role": "user", "content": content}
     ]
 
@@ -2204,8 +1215,7 @@ def run(requirement, mode="auto"):
 
 
 def _run(requirement, mode):
-    global _HIL_AUTO_ACCEPT
-    _HIL_AUTO_ACCEPT = False  # 每轮任务重置"全部接受"标志
+    _hil_mod.reset_auto_accept()  # 每轮任务重置 HIL "全部接受"标志
     os.makedirs(WORKSPACE_DIR, exist_ok=True)  # 兜底：新目录首次运行时 workspace/ 可能不存在
     original_requirement = requirement
     init_task_log(requirement, mode)
@@ -2213,8 +1223,8 @@ def _run(requirement, mode):
     # 阶段1：制定计划
     console.print("阶段1：制定计划")
     plan_result = plan(requirement)
-    _current_task_log["plan"] = plan_result.get("files", [])
-    _current_task_log["test_command"] = plan_result.get("test_command", "")
+    _task_log_mod._current_task_log["plan"] = plan_result.get("files", [])
+    _task_log_mod._current_task_log["test_command"] = plan_result.get("test_command", "")
 
     # 格式化计划输出
     def print_plan(plan_result):
@@ -2271,7 +1281,7 @@ def _run(requirement, mode):
 
     # code / auto（确认后）：生成代码 + 测试
     console.print("\n阶段2：生成代码")
-    code(plan_result, mode=mode)
+    code(plan_result, mode=mode, requirement=original_requirement)
     
     # #48 Review Agent：在阶段2和阶段3之间进行代码审查
     review_attempts = 0
@@ -2279,7 +1289,7 @@ def _run(requirement, mode):
     review_passed = False
     last_review_result = None
     while review_attempts < max_review_attempts:
-        review_result = review(original_requirement, _task_files_modified)
+        review_result = review(original_requirement, _task_log_mod._task_files_modified)
         last_review_result = review_result
         if review_result.get("approved"):
             console.print("代码审查通过！")
@@ -2297,25 +1307,25 @@ def _run(requirement, mode):
             # 使用 fix 逻辑修改代码
             mock_test_result = {
                 "returncode": 1,
-                "stderr": "代码审查未通过：\n" + "\n".join(issues) + "\n建议：\n" + "\n".join(suggestions),
+                "stderr": "代码审查未通过：\n" + "\n".join(i if isinstance(i, str) else json.dumps(i, ensure_ascii=False) for i in issues) + "\n建议：\n" + "\n".join(s if isinstance(s, str) else json.dumps(s, ensure_ascii=False) for s in suggestions),
                 "stdout": ""
             }
-            fix(mock_test_result, plan_result)
+            fix(mock_test_result, plan_result, reason="review_rejection")
             review_attempts += 1
 
-    # 达到上限仍未通过：降级处理 —— 记录到日志，HIL 模式下征询用户
+    # 达到上限仍未通过：列出剩余问题，询问用户是否继续
     if not review_passed:
-        _current_task_log["review_failed"] = True
-        _current_task_log["review_last"] = last_review_result or {}
-        console.print("[审查未通过] 已达到最大尝试次数", style="bold yellow")
-        if _cfg("human_in_loop"):
-            ans = _prompt("是否继续进入测试阶段？(y/n) ", default="n")
-            if ans != "y":
-                cleanup_snapshot(current_snapshot)
-                finish_task_log(False, 0, {"returncode": -1, "stdout": "", "stderr": "审查未通过，用户终止"})
-                return {"success": False, "test_result": {"returncode": -1, "stdout": "", "stderr": "审查未通过，用户终止"}}
-        else:
-            console.print("继续进入测试阶段（非 HIL 模式）", style="yellow")
+        _task_log_mod._current_task_log["review_failed"] = True
+        _task_log_mod._current_task_log["review_last"] = last_review_result or {}
+        remaining_issues = (last_review_result or {}).get("issues", [])
+        console.print("[审查未通过] 已达到最大尝试次数，以下问题未能自动修复：", style="bold yellow")
+        for issue in remaining_issues:
+            console.print(f"  - {issue}", style="red")
+        ans = _prompt("是否继续进入测试阶段？(y/n) ", default="n")
+        if ans != "y":
+            cleanup_snapshot(current_snapshot)
+            finish_task_log(False, 0, {"returncode": -1, "stdout": "", "stderr": "审查未通过，用户终止"})
+            return {"success": False, "test_result": {"returncode": -1, "stdout": "", "stderr": "审查未通过，用户终止"}}
 
     console.print("\n阶段3：测试与修复")
     attempts = 0
@@ -2333,7 +1343,7 @@ def _run(requirement, mode):
         if not any(part in _ignore for part in f.relative_to(ws).parts)
     ])
     if not has_tests:
-        _auto_generate_tests(plan_result, _task_files_modified[:])
+        _auto_generate_tests(plan_result, _task_log_mod._task_files_modified[:])
 
 
 
@@ -2449,7 +1459,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
                     result = write_file(**args)
                     console.print(f"[自动测试] 生成: {args.get('filename')}", highlight=False)
                     if "success" in result:
-                        _task_files_modified.append(args.get("filename", ""))
+                        _task_log_mod._task_files_modified.append(args.get("filename", ""))
                 else:
                     result = {"error": "测试生成阶段只允许 write_file"}
                 msgs.append({"tool_call_id": tc.id, "role": "tool", "name": fname, "content": json.dumps(result)})

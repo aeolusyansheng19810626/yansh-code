@@ -26,8 +26,9 @@
 # 1. 进入虚拟环境
 .\venv\Scripts\activate
 
-# 2. 安装依赖
+# 2. 安装依赖并注册 yansh 命令
 pip install -r requirements.txt
+pip install -e .
 
 # 3. 配置密钥
 copy .env.example .env
@@ -36,10 +37,10 @@ copy .env.example .env
 # Gemini（Vertex AI）：填入 GEMINI_API_KEY，并执行一次 gcloud auth application-default login
 
 # 4. 运行（默认 workspace/ 目录）
-python main.py
+yansh
 
 # 指定任意项目目录作为 workspace
-python main.py --cwd /path/to/your/project
+yansh --cwd /path/to/your/project
 ```
 
 ## 测试
@@ -73,7 +74,7 @@ python tests/integration/test_1_9.py
 
 ## 内置命令
 
-在主循环中可直接输入以下命令：
+在主循环中可直接输入以下命令（输入 `/` 后自动弹出候选列表，继续输入字母可过滤；Tab 补全，Esc 关闭）：
 
 | 命令 | 说明 |
 |------|------|
@@ -103,9 +104,15 @@ python tests/integration/test_1_9.py
 
 ```
 yansh-code/
-├── main.py           # CLI 交互入口与命令分发
+├── main.py           # CLI 交互入口、命令分发与 / 自动补全
 ├── agent.py          # Agent 核心逻辑（状态机、质量级联、视觉处理）
+├── llm_client.py     # LLM 客户端工厂、call_llm 主循环、流式处理、token 统计
 ├── tools.py          # 工具集（文件/AST操作、Web搜索、代码执行）
+├── snapshot.py       # 任务快照与回滚（文件级备份，不污染 git 状态）
+├── hil.py            # Human-In-Loop diff 展示与交互确认
+├── task_log.py       # 任务日志记录与查询
+├── tools_schema.py   # LLM 工具调用 schema 定义（TOOLS 列表）
+├── linter.py         # Linter 与测试命令自动发现
 ├── config.py         # 模型配置、价格计算与项目级配置加载
 ├── monitor.py        # 任务执行监控与统计
 ├── interrupt.py      # ESC 异步中断处理

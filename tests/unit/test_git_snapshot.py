@@ -16,7 +16,7 @@ def _git(args, cwd):
 @pytest.fixture
 def git_ws(tmp_path):
     """初始化一个带 git 的临时 workspace（用于验证我们不会污染用户的 git 状态）"""
-    import config, tools, agent
+    import config, tools, agent, snapshot
     ws = tmp_path / "workspace"
     ws.mkdir()
     _git(["init"], ws)
@@ -41,7 +41,7 @@ def git_ws(tmp_path):
 @pytest.fixture
 def file_ws(tmp_path):
     """没有 git 的普通 workspace"""
-    import config, tools, agent
+    import config, tools, agent, snapshot
     ws = tmp_path / "plain_ws"
     ws.mkdir()
     original_ws = config.WORKSPACE_DIR
@@ -109,7 +109,7 @@ def test_backup_file_if_needed_incremental(file_ws):
 
 def test_gc_old_snapshots(file_ws):
     """_gc_old_snapshots 保留最近 N 个，删掉更老的"""
-    from agent import _SNAPSHOT_DIR, _gc_old_snapshots
+    from snapshot import _SNAPSHOT_DIR, _gc_old_snapshots
     _SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
     # 制造 5 个排序在前的旧目录 + 5 个排序在后的新目录
     for i in range(5):

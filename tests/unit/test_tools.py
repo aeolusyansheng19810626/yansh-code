@@ -280,11 +280,12 @@ def test_search_extension_filter():
 # ── #58 HIL diff 生成 ──────────────────────────────────────────────────────────
 
 import agent as _agent
+import hil as _hil
 
 
 def test_build_diff_lines_new_file():
     """`is_new_file=True` 时 from 为"新建文件"，所有行为 + 开头"""
-    lines = _agent._build_diff_lines("foo.py", "", "a = 1\nb = 2\n", is_new_file=True)
+    lines = _hil._build_diff_lines("foo.py", "", "a = 1\nb = 2\n", is_new_file=True)
     assert any("+a = 1" in l for l in lines)
     header_from = next((l for l in lines if l.startswith("---")), "")
     assert "新建文件" in header_from
@@ -294,7 +295,7 @@ def test_build_diff_lines_modify():
     """修改场景：- 行包含旧内容，+ 行包含新内容"""
     old = "def foo():\n    return 1\n"
     new = "def foo():\n    return 42\n"
-    lines = _agent._build_diff_lines("bar.py", old, new)
+    lines = _hil._build_diff_lines("bar.py", old, new)
     assert any("-    return 1" in l for l in lines)
     assert any("+    return 42" in l for l in lines)
 
@@ -302,7 +303,7 @@ def test_build_diff_lines_modify():
 def test_build_diff_lines_no_change():
     """内容相同时返回空列表"""
     content = "x = 1\n"
-    lines = _agent._build_diff_lines("same.py", content, content)
+    lines = _hil._build_diff_lines("same.py", content, content)
     assert lines == []
 
 
@@ -310,7 +311,7 @@ def test_build_diff_lines_truncation():
     """超过 50 行时截断并插入提示行"""
     old = "\n".join(f"line{i} = {i}" for i in range(60)) + "\n"
     new = "\n".join(f"line{i} = {i + 1}" for i in range(60)) + "\n"
-    lines = _agent._build_diff_lines("big.py", old, new)
+    lines = _hil._build_diff_lines("big.py", old, new)
     assert len(lines) <= 41  # 30 + 1截断提示 + 10
     assert any("截断" in l for l in lines)
 
@@ -319,7 +320,7 @@ def test_build_diff_lines_exactly_50_no_truncation():
     """恰好 50 行时不截断"""
     old = "\n".join(f"a{i}" for i in range(24)) + "\n"
     new = "\n".join(f"b{i}" for i in range(24)) + "\n"
-    lines = _agent._build_diff_lines("mid.py", old, new)
+    lines = _hil._build_diff_lines("mid.py", old, new)
     assert not any("截断" in l for l in lines)
 
 

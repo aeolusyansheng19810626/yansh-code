@@ -49,12 +49,12 @@ def test_tools_workspace_root_updated(tmp_path):
 
 def test_agent_reinit_updates_yansh_dir(tmp_path):
     """agent._reinit_paths() 后 _YANSH_DIR 等路径变量更新"""
-    import config, agent
+    import config, agent, snapshot
     new_ws = str(tmp_path / "ws2")
     config.set_workspace_dir(new_ws)
     agent._reinit_paths()
     assert agent._YANSH_DIR == Path(new_ws) / ".yansh"
-    assert agent._SNAPSHOT_DIR == Path(new_ws) / ".yansh" / "snapshots"
+    assert snapshot._SNAPSHOT_DIR == Path(new_ws) / ".yansh" / "snapshots"
     assert agent._LOG_DIR == Path(new_ws) / ".yansh" / "logs"
     assert agent._REPLAY_DIR == Path(new_ws) / ".yansh" / "replay"
     assert agent._HISTORY_FILE == Path(new_ws) / ".yansh_history.json"

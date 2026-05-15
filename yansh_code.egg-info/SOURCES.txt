@@ -1,11 +1,17 @@
 README.md
 agent.py
 config.py
+hil.py
 interrupt.py
+linter.py
+llm_client.py
 main.py
 monitor.py
 pyproject.toml
+snapshot.py
+task_log.py
 tools.py
+tools_schema.py
 yansh_code.egg-info/PKG-INFO
 yansh_code.egg-info/SOURCES.txt
 yansh_code.egg-info/dependency_links.txt

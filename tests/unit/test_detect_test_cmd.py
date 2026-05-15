@@ -8,7 +8,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
-from agent import _detect_python_test_cmd, _detect_node_test_cmd
+from linter import _detect_python_test_cmd, _detect_node_test_cmd
 from pathlib import Path
 
 
