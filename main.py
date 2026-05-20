@@ -269,6 +269,10 @@ def main():
     # 加载配置
     load_project_config()
     override_config(model=args.model)
+    if args.model:
+        import llm_client as _llm_mod
+        _cascade = [args.model] if args.model == CLAUDE_HAIKU else [args.model, CLAUDE_HAIKU]
+        _llm_mod.set_quality_cascade(_cascade)
     
     # 检测项目类型
     global _PROJECT_TYPE, _PROJECT_TEST_CMD
@@ -365,7 +369,9 @@ def main():
             if target == "1":
                 override_config(model=matched)
                 from config import CLAUDE_HAIKU as _haiku
-                _am.QUALITY_CASCADE = [matched] if matched == _haiku else [matched, _haiku]
+                import llm_client as _llm_mod
+                _cascade = [matched] if matched == _haiku else [matched, _haiku]
+                _llm_mod.set_quality_cascade(_cascade)
                 console.print(f"写代码模型已切换到：{label}  ({matched})", highlight=False)
             else:
                 _am.REVIEW_MODEL = matched

@@ -29,7 +29,7 @@ def _reinit_paths():
 
 def init_task_log(requirement, mode):
     """重置当前任务日志（in-place 清空+更新，外部持有的 dict 引用仍有效）"""
-    from config import QUALITY_CASCADE
+    from config import get_config
     _task_tool_calls.clear()
     _task_files_modified.clear()
     _current_task_log.clear()
@@ -37,7 +37,7 @@ def init_task_log(requirement, mode):
         "timestamp": datetime.now().isoformat(),
         "requirement": requirement,
         "mode": mode,
-        "model": QUALITY_CASCADE[0] if QUALITY_CASCADE else "unknown",
+        "model": get_config().get("model") or "unknown",
         "plan": [],
         "files_modified": [],
         "tool_calls": [],

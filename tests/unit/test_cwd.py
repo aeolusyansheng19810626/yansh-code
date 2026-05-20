@@ -82,5 +82,37 @@ def test_config_file_path_updated(tmp_path):
     assert config._CONFIG_FILE == Path(new_ws) / ".yansh" / "config.json"
 
 
+def test_agent_get_workspace_returns_new_path(tmp_path):
+    """#2 回归：agent._get_workspace() 必须读最新 config.WORKSPACE_DIR，
+    不能停留在 import 时的快照值"""
+    import config, agent
+    new_ws = str(tmp_path / "agent_ws")
+    config.set_workspace_dir(new_ws)
+    agent._reinit_paths()
+    assert agent._get_workspace() == new_ws
+
+
+def test_agent_strip_workspace_prefix_uses_new_cwd(tmp_path):
+    """#2 回归：_strip_workspace_prefix 应用最新 workspace 前缀"""
+    import config, agent
+    new_ws = str(tmp_path / "stripws")
+    config.set_workspace_dir(new_ws)
+    agent._reinit_paths()
+    args = {"filename": new_ws + "/sub/foo.py"}
+    agent._strip_workspace_prefix(args, "filename")
+    assert args["filename"] == "sub/foo.py"
+
+
+def test_agent_run_creates_new_workspace(tmp_path):
+    """#2 回归：run() 中 os.makedirs(WORKSPACE_DIR) 应在新 cwd 下创建"""
+    import config, agent
+    new_ws = tmp_path / "runws"
+    config.set_workspace_dir(str(new_ws))
+    agent._reinit_paths()
+    # 直接走与 run() 中相同的兜底逻辑
+    os.makedirs(agent._get_workspace(), exist_ok=True)
+    assert new_ws.exists()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

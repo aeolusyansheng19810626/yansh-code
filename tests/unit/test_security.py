@@ -142,6 +142,34 @@ def test_block_iex():
 def test_block_invoke_expression():
     _assert_blocked("Invoke-Expression 'evil code'", "Invoke-Expression")
 
+# --- #3 默认未识别命令需确认 / strict 拒绝 ---
+
+def test_strict_batch_rejects_unknown_command():
+    """batch + strict 模式下，未命中 deny/safe/confirm 的命令应被拒"""
+    tools.set_batch_mode(True, strict=True)
+    try:
+        result = tools.execute_command("ipconfig")  # 不是 deny/safe/confirm 任一
+        assert "error" in result, f"strict 模式应拒绝未识别命令，返回：{result}"
+        assert "批处理严格模式拒绝执行" in result["error"]
+        assert result.get("returncode") == -1
+        print(f"[PASS] strict 模式拒未识别命令：{result['error']}")
+    finally:
+        tools.set_batch_mode(False, strict=False)
+
+def test_nonstrict_batch_runs_unknown_command():
+    """batch 非 strict 模式保留旧行为：未识别命令自动确认并执行"""
+    tools.set_batch_mode(True, strict=False)
+    try:
+        # 用 echo 触发执行（命中 _SAFE_PATTERNS 也应通过；这里专门用一个非 safe 但安全的命令）
+        # 'set' 在 cmd / PowerShell 都能跑且无副作用，不在 deny/safe/confirm 任一
+        result = tools.execute_command("ver")  # Windows 内置：显示版本号
+        # 可能 returncode=0 或非 0（POSIX 上无 ver），但只要不是被我方拦截即通过
+        assert "批处理严格模式拒绝执行" not in (result.get("error") or "")
+        print(f"[PASS] 非 strict 模式放行未识别命令：rc={result.get('returncode')}")
+    finally:
+        tools.set_batch_mode(False, strict=False)
+
+
 if __name__ == "__main__":
     tests = [
         test_path_traversal_read,
@@ -171,6 +199,8 @@ if __name__ == "__main__":
         test_block_powershell_enc,
         test_block_iex,
         test_block_invoke_expression,
+        test_strict_batch_rejects_unknown_command,
+        test_nonstrict_batch_runs_unknown_command,
     ]
     failed = 0
     for t in tests:

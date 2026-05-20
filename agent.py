@@ -10,7 +10,7 @@ from openai import OpenAI
 from rich.console import Console
 from pathlib import Path
 from config import (
-    OPENROUTER_API_KEY, OPENROUTER_BASE_URL, QUALITY_CASCADE, WORKSPACE_DIR, get_config,
+    OPENROUTER_API_KEY, OPENROUTER_BASE_URL, WORKSPACE_DIR, get_config,
     get_model_price,
 )
 from tools import (
@@ -538,12 +538,13 @@ def create_replay_package(failure_reason):
     # 2. workspace 快照
     snap_dir = replay_dir / "workspace_snapshot"
     snap_dir.mkdir(exist_ok=True)
-    for root, _, files in os.walk(WORKSPACE_DIR):
+    _ws = _get_workspace()
+    for root, _, files in os.walk(_ws):
         if any(p in root for p in (".git", ".yansh", "__pycache__", "venv", "node_modules")):
             continue
         for f in files:
             src = Path(root) / f
-            rel = src.relative_to(WORKSPACE_DIR)
+            rel = src.relative_to(_ws)
             dst = snap_dir / rel
             dst.parent.mkdir(parents=True, exist_ok=True)
             try:
@@ -561,7 +562,7 @@ def create_replay_package(failure_reason):
     meta = {
         "failure_reason": failure_reason,
         "timestamp": timestamp,
-        "model": QUALITY_CASCADE[0] if QUALITY_CASCADE else "unknown",
+        "model": get_config().get("model") or "unknown",
         "tokens_by_model": {k: dict(v) for k, v in _llm_mod._session_tokens_by_model.items()},
     }
     (replay_dir / "meta.json").write_text(
@@ -613,11 +614,18 @@ def load_replay(replay_id):
     except Exception as e:
         console.print(f"[错误] 加载失败: {e}", style="red")
 
+def _get_workspace() -> str:
+    """每次调用都从 config 读取最新 WORKSPACE_DIR，确保 --cwd 生效后不使用旧值。
+    本模块顶部 `from config import WORKSPACE_DIR` 是初次启动时的快照，--cwd 变更后该名不会同步。
+    所有运行期路径拼接都应通过本函数读取。"""
+    import config as _cfg_mod
+    return _cfg_mod.WORKSPACE_DIR
+
+
 def _reinit_paths():
     """--cwd 变更后重新初始化 agent / snapshot / task_log 中所有依赖 WORKSPACE_DIR 的模块级变量。"""
     global _YANSH_DIR, _LOG_DIR, _REPLAY_DIR, _HISTORY_FILE
-    import config as _cfg_mod
-    _wd = _cfg_mod.WORKSPACE_DIR
+    _wd = _get_workspace()
     _YANSH_DIR     = Path(_wd) / ".yansh"
     _LOG_DIR       = _YANSH_DIR / "logs"
     _REPLAY_DIR    = _YANSH_DIR / "replay"
@@ -636,7 +644,8 @@ def _strip_workspace_prefix(args: dict, *keys: str):
     for k in keys:
         v = args.get(k)
         if isinstance(v, str):
-            for _pfx in (WORKSPACE_DIR + "/", WORKSPACE_DIR + "\\"):
+            _ws = _get_workspace()
+            for _pfx in (_ws + "/", _ws + "\\"):
                 if v.startswith(_pfx):
                     args[k] = v[len(_pfx):]
                     break
@@ -662,7 +671,7 @@ def _dispatch_tool_call(tool_call, *, mode="auto", allow_hil=True, allow_confirm
 
     if name == "write_file":
         fname = args.get("filename", "")
-        overwrite = os.path.exists(os.path.join(WORKSPACE_DIR, fname))
+        overwrite = os.path.exists(os.path.join(_get_workspace(), fname))
         new_content = args.get("content", "")
         if hil_on:
             old_content = ""
@@ -824,7 +833,7 @@ _TESTER_ROLE = """【角色：测试 Agent】
 """
 
 def _get_project_rules():
-    rules_path = Path(WORKSPACE_DIR) / ".agent_rules"
+    rules_path = Path(_get_workspace()) / ".agent_rules"
     if rules_path.exists():
         try:
             content = rules_path.read_text(encoding="utf-8").strip()
@@ -839,7 +848,7 @@ def plan(requirement):
     import platform
 
     def _get_project_rules():
-        rules_path = Path(WORKSPACE_DIR) / ".agent_rules"
+        rules_path = Path(_get_workspace()) / ".agent_rules"
         if rules_path.exists():
             try:
                 content = rules_path.read_text(encoding="utf-8").strip()
@@ -850,7 +859,7 @@ def plan(requirement):
         return ""
 
     def _generate_tree():
-        ws = Path(WORKSPACE_DIR)
+        ws = Path(_get_workspace())
         ignore_dirs = {".git", "__pycache__", "node_modules", ".yansh", ".pytest_cache", "venv"}
         def walk(path, prefix="", level=0):
             if level > 2:
@@ -932,7 +941,6 @@ def code(plan, mode="auto", requirement=""):
     """根据计划逐个文件生成/修改代码。文件已存在优先用replace_in_file做精确修改；不存在则用write_file新建。"""
     import os as _os
     from tools import write_file, read_file, replace_in_file
-    from config import WORKSPACE_DIR
 
     files = plan.get("files", [])
     console.print("[Agent: Coder]", highlight=False)
@@ -953,12 +961,13 @@ def code(plan, mode="auto", requirement=""):
             continue
 
         # 剥离 LLM 偶尔错误添加的 workspace/ 前缀
-        for _pfx in (WORKSPACE_DIR + "/", WORKSPACE_DIR + "\\"):
+        _ws = _get_workspace()
+        for _pfx in (_ws + "/", _ws + "\\"):
             if filename.startswith(_pfx):
                 filename = filename[len(_pfx):]
                 break
 
-        filepath = _os.path.join(WORKSPACE_DIR, filename)
+        filepath = _os.path.join(_ws, filename)
         file_exists = _os.path.exists(filepath)
 
         if file_exists:
@@ -1061,7 +1070,7 @@ def review(requirement, modified_files):
         return {"approved": True, "issues": [], "suggestions": []}
         
     def _get_project_rules():
-        rules_path = Path(WORKSPACE_DIR) / ".agent_rules"
+        rules_path = Path(_get_workspace()) / ".agent_rules"
         if rules_path.exists():
             try:
                 content = rules_path.read_text(encoding="utf-8").strip()
@@ -1216,7 +1225,7 @@ def run(requirement, mode="auto"):
 
 def _run(requirement, mode):
     _hil_mod.reset_auto_accept()  # 每轮任务重置 HIL "全部接受"标志
-    os.makedirs(WORKSPACE_DIR, exist_ok=True)  # 兜底：新目录首次运行时 workspace/ 可能不存在
+    os.makedirs(_get_workspace(), exist_ok=True)  # 兜底：新目录首次运行时 workspace/ 可能不存在
     original_requirement = requirement
     init_task_log(requirement, mode)
 
@@ -1333,7 +1342,7 @@ def _run(requirement, mode):
     max_attempts = _cfg("max_attempts") or 3
 
     # #42 如果 workspace 中没有测试文件，自动生成
-    ws = Path(WORKSPACE_DIR)
+    ws = Path(_get_workspace())
     _ignore = {".yansh", ".git", "__pycache__", "node_modules", "venv", "workspace"}
     has_tests = bool([
         f for f in ws.rglob("test_*.py")
@@ -1446,7 +1455,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
                     continue
                 if fname == "write_file":
                     _fn = args.get("filename", "")
-                    for _pfx in (WORKSPACE_DIR + "/", WORKSPACE_DIR + "\\"):
+                    _ws = _get_workspace()
+                    for _pfx in (_ws + "/", _ws + "\\"):
                         if _fn.startswith(_pfx):
                             _fn = _fn[len(_pfx):]
                             break

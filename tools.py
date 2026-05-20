@@ -163,25 +163,29 @@ def execute_command(command):
     # Level 2: safe — 直接执行
     is_safe = any(re.match(p, cmd_stripped, re.IGNORECASE) for p in _SAFE_PATTERNS)
 
-    # Level 3: confirm — 批处理模式默认自动确认，strict 下拒绝；交互模式提示用户
+    # Level 3: confirm — 默认所有非 _SAFE_PATTERNS 命令都需要用户确认。
+    # 命中 _CONFIRM_PATTERNS 的额外提供识别标签（如 "pip install"）；未命中则归为 "未识别命令"。
+    # batch + strict：未识别命令直接拒；batch 非 strict：自动确认（保留向后兼容）。
     if not is_safe:
-        for pattern, label in _CONFIRM_PATTERNS:
-            if re.search(pattern, cmd_stripped, re.IGNORECASE):
-                if _BATCH_MODE and _BATCH_STRICT:
-                    _con().print(f"[batch-strict] 拒绝执行需确认命令: {label}", highlight=False)
-                    return {"error": f"批处理严格模式拒绝执行: {label}", "returncode": -1, "stdout": "", "stderr": ""}
-                if _BATCH_MODE:
-                    _con().print(f"[batch] 自动确认执行: {command}", highlight=False)
-                else:
-                    _c = _con()
-                    _c.print(f"[确认] 即将执行: {command}", highlight=False)
-                    try:
-                        answer = _c.input("继续？(y/n) ").strip().lower()
-                    except EOFError:
-                        answer = "n"
-                    if answer != "y":
-                        return {"error": "用户取消执行", "returncode": -1, "stdout": "", "stderr": ""}
-                break
+        label = next(
+            (lbl for pat, lbl in _CONFIRM_PATTERNS
+             if re.search(pat, cmd_stripped, re.IGNORECASE)),
+            "未识别命令",
+        )
+        if _BATCH_MODE and _BATCH_STRICT:
+            _con().print(f"[batch-strict] 拒绝执行: {label} -> {command}", highlight=False)
+            return {"error": f"批处理严格模式拒绝执行: {label}", "returncode": -1, "stdout": "", "stderr": ""}
+        if _BATCH_MODE:
+            _con().print(f"[batch] 自动确认执行 ({label}): {command}", highlight=False)
+        else:
+            _c = _con()
+            _c.print(f"[确认] 即将执行 ({label}): {command}", highlight=False)
+            try:
+                answer = _c.input("继续？(y/n) ").strip().lower()
+            except EOFError:
+                answer = "n"
+            if answer != "y":
+                return {"error": "用户取消执行", "returncode": -1, "stdout": "", "stderr": ""}
 
     import threading
 

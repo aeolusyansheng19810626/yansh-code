@@ -34,6 +34,13 @@ LLM_TIMEOUT_SEC = 120
 LLM_MAX_RETRIES_PER_MODEL = 3  # 每个模型对 429/5xx 的退避重试次数
 
 
+def set_quality_cascade(cascade):
+    """切换实际请求用的模型降级链。main.py 解析 --model 或 /model 后调用。
+    必须更新本模块的 QUALITY_CASCADE，因为 call_llm 循环读的是这里。"""
+    global QUALITY_CASCADE
+    QUALITY_CASCADE = list(cascade)
+
+
 def _get_gemini_client():
     """每次调用刷新 OAuth token，供 Vertex AI 端点使用"""
     from config import GEMINI_BASE_URL
