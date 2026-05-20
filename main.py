@@ -230,7 +230,7 @@ def _read_input(prompt_str="> "):
                 completion_enabled = True  # 按 / 重开补全
             buf.insert(cursor, ch); cursor += 1; redraw()
 
-VALID_MODES = {"plan", "code", "auto"}
+VALID_MODES = {"plan", "code", "auto", "audit"}
 
 def show_config():
     cfg = get_config()
@@ -329,7 +329,7 @@ def main():
                 current_mode = parts[1]
                 console.print(f"已切换到 {current_mode} 模式")
             else:
-                console.print(f"用法：/mode [plan|code|auto]")
+                console.print(f"用法：/mode [plan|code|auto|audit]  (audit = 只读审计现有代码，输出 markdown 报告)")
             continue
 
         if user_input == "/model":

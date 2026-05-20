@@ -17,7 +17,7 @@ from tools import (
     write_file, read_file, execute_command, list_files, replace_in_file,
     get_symbol_definition, search_in_files, move_file, apply_patch,
     list_symbols, replace_symbol, fetch_webpage, search_docs, append_to_file,
-    find_references, glob_files, git_diff, git_log,
+    find_references, glob_files, git_diff, git_log, workspace_symbols,
 )
 import interrupt
 import tools as _tools_mod
@@ -35,7 +35,7 @@ from task_log import (
 import linter as _linter_mod
 from linter import detect_project_type
 import llm_client as _llm_mod
-from tools_schema import TOOLS
+from tools_schema import TOOLS, READONLY_TOOL_NAMES
 from llm_client import (
     client, _ica_client, _get_ica_client, _get_gemini_client,
     _is_gemini, _is_claude, _client_for, _call_single_model,
@@ -651,6 +651,11 @@ def _strip_workspace_prefix(args: dict, *keys: str):
                     break
 
 
+def _filter_tools(allowed_names):
+    """从 TOOLS 中筛选出名字在 allowed_names 集合内的工具。审计/只读人格用。"""
+    return [t for t in TOOLS if t["function"]["name"] in allowed_names]
+
+
 def _dispatch_tool_call(tool_call, *, mode="auto", allow_hil=True, allow_confirm=True, snap=None) -> dict:
     """统一处理 LLM 返回的单个 tool_call，code()/fix() 共用。
     返回 {"name": str, "args": dict, "id": str, "result": dict}
@@ -665,6 +670,11 @@ def _dispatch_tool_call(tool_call, *, mode="auto", allow_hil=True, allow_confirm
     except json.JSONDecodeError as e:
         return {"name": name, "args": {}, "id": tool_call.id,
                 "result": {"error": f"Invalid JSON in arguments: {e}"}}
+
+    # 审计模式：兜底拦截写/执行工具，防止 LLM hallucinate 超出 schema 的工具
+    if mode == "audit" and name not in READONLY_TOOL_NAMES:
+        return {"name": name, "args": args, "id": tool_call.id,
+                "result": {"error": f"audit 模式禁止调用工具 '{name}'：仅允许只读工具"}}
 
     _strip_workspace_prefix(args, "filename", "file_path", "src", "dst")
     hil_on = allow_hil and _cfg("human_in_loop") and not _BATCH_MODE
@@ -769,6 +779,7 @@ def _dispatch_tool_call(tool_call, *, mode="auto", allow_hil=True, allow_confirm
         "get_symbol_definition": get_symbol_definition,
         "search_in_files": search_in_files,
         "list_symbols": list_symbols,
+        "workspace_symbols": workspace_symbols,
         "fetch_webpage": fetch_webpage,
         "search_docs": search_docs,
         "find_references": find_references,
@@ -830,6 +841,21 @@ _REVIEWER_ROLE = """【角色：代码审查 Agent】
 _TESTER_ROLE = """【角色：测试 Agent】
 你专注于分析测试失败原因并指导修复。
 职责：只关注测试结果和错误信息；给出精准、最小化的修复建议；避免引入不相关改动。
+"""
+
+_AUDITOR_ROLE = """【角色：审计 Agent】
+你专注于审计现有代码，输出可读的 Markdown 报告，绝不修改任何文件。
+工作流：先看 system 中预注入的 workspace_symbols 摘要锁定关注文件；再用 read_file/get_symbol_definition/search_in_files/find_references 按需深挖；最后输出报告。
+报告结构：
+## 总览（项目类型、规模、关注重点）
+## 重要发现
+- 按 严重 / 中 / 低 三级分类
+- 每条标注 `file:line` + 现状描述 + 建议
+## 总评（整体健康度、最值得优先处理的 1-3 项）
+克制原则：
+- 区分 bug 与风格偏好；指出问题前先排除"这是有意为之的设计选择"
+- 不臆断未读过的代码；引用证据时给出 file:line
+- 对小问题保持比例感，不要为凑数堆砌
 """
 
 def _get_project_rules():
@@ -1053,6 +1079,74 @@ def code(plan, mode="auto", requirement=""):
         else:
             console.print(f"[警告] pip install -e . 失败: {r.stderr[:200]}", style="yellow", highlight=False)
 
+def audit(requirement):
+    """审计现有代码，只读多轮工具调用，最终输出 markdown 报告。
+    返回 {"success": bool, "report": str}。"""
+    console.print("[Agent: Auditor]", highlight=False)
+
+    # 预先构建符号索引摘要，注入 system 减少 LLM 探索回合
+    ws_symbols_result = workspace_symbols()
+    if "error" in ws_symbols_result:
+        symbols_brief = f"（workspace_symbols 失败：{ws_symbols_result['error']}）"
+    else:
+        files_map = ws_symbols_result.get("files", {})
+        # 控制 prompt 体量：每文件最多列 30 个符号；总文件数超 80 时截断并标注
+        lines = []
+        for i, (path, syms) in enumerate(sorted(files_map.items())):
+            if i >= 80:
+                lines.append(f"... 还有 {len(files_map) - 80} 个文件未列出 ...")
+                break
+            head = ", ".join(f"{s['name']}({s['type'][0]}:L{s['line']})" for s in syms[:30])
+            extra = f" +{len(syms)-30}" if len(syms) > 30 else ""
+            lines.append(f"  {path}: {head}{extra}")
+        symbols_brief = (
+            f"workspace 符号索引（{ws_symbols_result['total_files']} 文件 / "
+            f"{ws_symbols_result['total_symbols']} 符号）：\n" + "\n".join(lines)
+        )
+
+    sys_prompt = f"{_AUDITOR_ROLE}{_get_project_rules()}\n\n{symbols_brief}"
+    messages = [
+        {"role": "system", "content": sys_prompt},
+        {"role": "user", "content": f"审计需求：{requirement}"}
+    ]
+
+    audit_tools = _filter_tools(READONLY_TOOL_NAMES)
+    max_audit_rounds = 8
+    rounds_used = 0
+    last_text = ""
+
+    while rounds_used < max_audit_rounds:
+        rounds_used += 1
+        if interrupt.is_interrupted():
+            raise interrupt.Interrupted()
+        response = call_llm(messages, tools=audit_tools, tool_choice="auto", stream=False)
+        msg = response.choices[0].message
+        messages.append({
+            "role": "assistant",
+            "content": msg.content,
+            "tool_calls": [tc.model_dump() for tc in msg.tool_calls] if msg.tool_calls else None,
+        })
+
+        if msg.content:
+            last_text = msg.content
+
+        if msg.tool_calls:
+            console.print(f"审计轮 {rounds_used}: {len(msg.tool_calls)} 次工具调用")
+            for tc in msg.tool_calls:
+                out = _dispatch_tool_call(tc, mode="audit", allow_hil=False, allow_confirm=False, snap=None)
+                _record_dispatch(out, messages)
+        else:
+            console.print(f"审计完成（{rounds_used} 轮）")
+            console.print()
+            console.print(last_text or "（无报告内容）", highlight=False)
+            return {"success": True, "report": last_text}
+
+    console.print(f"[警告] audit 已达 {max_audit_rounds} 轮上限，输出当前报告", style="yellow", highlight=False)
+    console.print()
+    console.print(last_text or "（无报告内容）", highlight=False)
+    return {"success": bool(last_text), "report": last_text}
+
+
 def review(requirement, modified_files):
     """代码审查阶段"""
     console.print("[Agent: Reviewer]", highlight=False)
@@ -1228,6 +1322,14 @@ def _run(requirement, mode):
     os.makedirs(_get_workspace(), exist_ok=True)  # 兜底：新目录首次运行时 workspace/ 可能不存在
     original_requirement = requirement
     init_task_log(requirement, mode)
+
+    # audit 模式：完全独立路径，不进 plan/code/review/fix
+    if mode == "audit":
+        res = audit(original_requirement)
+        finish_task_log(res["success"], 0)
+        return {"success": res["success"],
+                "test_result": {"returncode": 0 if res["success"] else 1,
+                                "stdout": res.get("report", ""), "stderr": ""}}
 
     # 阶段1：制定计划
     console.print("阶段1：制定计划")

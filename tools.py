@@ -123,6 +123,7 @@ def write_file(filename, content):
     try:
         resolved.parent.mkdir(parents=True, exist_ok=True)
         resolved.write_text(content, encoding='utf-8')
+        _invalidate_ast_cache(resolved)
         return {"success": f"文件 {filename} 写入成功"}
     except Exception as e:
         return {"error": str(e)}
@@ -293,6 +294,7 @@ def replace_in_file(filename, old_str, new_str):
     content = content.replace(old_str, new_str, 1)
     try:
         resolved.write_text(content, encoding='utf-8')
+        _invalidate_ast_cache(resolved)
         return {
             "success": f"文件 {filename} 替换成功",
             "filename": filename,
@@ -436,14 +438,9 @@ def search_in_files(pattern, workspace=None, regex=False, extensions=None):
 def get_symbol_definition(symbol_name, file_path=None):
     """用 tree-sitter 精确查找函数或类定义，返回文件、行号、完整代码。
     file_path 可选；不填则搜索整个 workspace 的 .py 文件。"""
-    try:
-        import tree_sitter_python as tspython
-        from tree_sitter import Language, Parser
-    except ImportError:
-        return {"error": "tree-sitter 未安装，请运行: pip install tree-sitter tree-sitter-python"}
-
-    py_lang = Language(tspython.language())
-    parser = Parser(py_lang)
+    parser, err = _load_ts_parser()
+    if err:
+        return err
 
     def _collect(node, src_bytes, parent_type=None):
         hits = []
@@ -573,6 +570,7 @@ def apply_patch(patch_text, file_path=None):
 
     try:
         resolved.write_text(''.join(result), encoding='utf-8')
+        _invalidate_ast_cache(resolved)
         return {"success": f"patch 应用成功: {file_path}"}
     except Exception as e:
         return {"error": str(e)}
@@ -580,29 +578,54 @@ def apply_patch(patch_text, file_path=None):
 
 # ---------- #41 符号级编辑 ----------
 
+# 进程级 parser 单例，懒加载；避免每次 list_symbols / get_symbol_definition 都重建
+_TS_PARSER = None
+# 文件级 AST 符号缓存：abs_path_str -> (mtime, [{name, type, line}])
+# 仅 list_symbols 路径使用；replace_symbol 写入后调 _invalidate_ast_cache
+_AST_CACHE: dict = {}
+
+
 def _load_ts_parser():
+    """返回 (parser, error_dict)。parser 跨调用复用。"""
+    global _TS_PARSER
+    if _TS_PARSER is not None:
+        return _TS_PARSER, None
     try:
         import tree_sitter_python as tspython
         from tree_sitter import Language, Parser
         py_lang = Language(tspython.language())
-        parser = Parser(py_lang)
-        return parser, None
+        _TS_PARSER = Parser(py_lang)
+        return _TS_PARSER, None
     except ImportError:
         return None, {"error": "tree-sitter 未安装，请运行: pip install tree-sitter tree-sitter-python"}
 
 
-def list_symbols(file_path):
-    """列出文件中所有函数和类，返回 name/type/line 列表"""
+def _invalidate_ast_cache(abs_path):
+    """文件被写入后调用，清掉对应的缓存项"""
+    _AST_CACHE.pop(str(abs_path), None)
+
+
+def _parse_symbols_cached(abs_path):
+    """按 mtime 命中 _AST_CACHE；未命中则 parse 并写缓存。
+    返回 (symbols_list, error_dict)；error_dict 为 None 表示成功。
+    symbols_list 元素：{name, type, line}，仅函数和类。"""
     parser, err = _load_ts_parser()
     if err:
-        return err
-    resolved, err = _validate_path(file_path)
-    if err:
-        return err
+        return None, err
     try:
-        src_bytes = resolved.read_bytes()
+        mtime = abs_path.stat().st_mtime
     except Exception as e:
-        return {"error": str(e)}
+        return None, {"error": str(e)}
+
+    key = str(abs_path)
+    cached = _AST_CACHE.get(key)
+    if cached and cached[0] == mtime:
+        return cached[1], None
+
+    try:
+        src_bytes = abs_path.read_bytes()
+    except Exception as e:
+        return None, {"error": str(e)}
 
     tree = parser.parse(src_bytes)
     symbols = []
@@ -621,6 +644,18 @@ def list_symbols(file_path):
             _collect(ch)
 
     _collect(tree.root_node)
+    _AST_CACHE[key] = (mtime, symbols)
+    return symbols, None
+
+
+def list_symbols(file_path):
+    """列出文件中所有函数和类，返回 name/type/line 列表"""
+    resolved, err = _validate_path(file_path)
+    if err:
+        return err
+    symbols, err = _parse_symbols_cached(resolved)
+    if err:
+        return err
     return {"symbols": symbols, "total": len(symbols)}
 
 
@@ -688,6 +723,7 @@ def replace_symbol(symbol_name, new_code, file_path):
     new_lines = lines[:start_line] + [indented_code] + lines[end_line + 1:]
     try:
         resolved.write_text("".join(new_lines), encoding="utf-8")
+        _invalidate_ast_cache(resolved)
         return {
             "success": f"符号 '{symbol_name}' 替换成功",
             "file": file_path,
@@ -695,6 +731,44 @@ def replace_symbol(symbol_name, new_code, file_path):
         }
     except Exception as e:
         return {"error": str(e)}
+
+_WORKSPACE_SYMBOLS_IGNORE = {".git", ".yansh", "__pycache__", "node_modules", "venv", ".venv", ".pytest_cache"}
+
+
+def workspace_symbols(extensions=None):
+    """扫描 workspace 下符合 extensions 的文件，返回每个文件的函数/类清单。
+    默认只扫 .py。命中 _AST_CACHE 几乎零成本，未命中则增量 parse 并入缓存。"""
+    exts = tuple(extensions) if extensions else (".py",)
+    root = Path(_get_workspace())
+    if not root.exists():
+        return {"files": {}, "total_files": 0, "total_symbols": 0}
+
+    files_out: dict = {}
+    total_symbols = 0
+
+    for f in root.rglob("*"):
+        if not f.is_file():
+            continue
+        if any(part in _WORKSPACE_SYMBOLS_IGNORE for part in f.parts):
+            continue
+        if not f.name.endswith(exts):
+            continue
+        symbols, err = _parse_symbols_cached(f)
+        if err:
+            # tree-sitter 未装会反复返回同一错误，提前返回
+            if "tree-sitter 未安装" in err.get("error", ""):
+                return err
+            continue
+        rel = str(f.relative_to(root)).replace("\\", "/")
+        files_out[rel] = symbols
+        total_symbols += len(symbols)
+
+    return {
+        "files": files_out,
+        "total_files": len(files_out),
+        "total_symbols": total_symbols,
+    }
+
 
 def fetch_webpage(url):
     """读取网页内容，提取正文文本，截断到3000字符"""
@@ -790,7 +864,7 @@ def append_to_file(filename, content):
 
         with open(resolved, "a", encoding="utf-8") as f:
             f.write(prefix + content)
-
+        _invalidate_ast_cache(resolved)
         return {"success": f"文件 {filename} 追加成功"}
     except Exception as e:
         return {"error": str(e)}

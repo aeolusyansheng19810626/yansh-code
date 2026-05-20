@@ -252,6 +252,24 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "workspace_symbols",
+            "description": "扫描 workspace 内所有源文件，返回每个文件的函数和类清单（name/type/line）。用于一次性了解项目整体结构，避免反复 list_symbols。默认只扫 .py。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "extensions": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "文件扩展名列表，例 [\".py\"]。不传则默认 [\".py\"]。"
+                    }
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "git_log",
             "description": "查看 workspace 最近的 git 提交（git log --oneline）",
             "parameters": {
@@ -264,3 +282,13 @@ TOOLS = [
         }
     }
 ]
+
+
+# 审计模式 / 只读人格使用的工具白名单。任何写/执行类工具都不应在此集合内。
+READONLY_TOOL_NAMES = {
+    "read_file", "list_files", "glob_files", "search_in_files",
+    "list_symbols", "get_symbol_definition", "find_references",
+    "workspace_symbols",
+    "git_diff", "git_log",
+    "fetch_webpage", "search_docs",
+}

@@ -6,10 +6,12 @@
 
 ## ✨ 功能特性
 
-- 🎭 **多 Agent 角色**：架构师（制定计划）、码农（生成代码）、审查员（代码走查）、测试员（分析修复）。
+- 🎭 **多 Agent 角色**：架构师（制定计划）、码农（生成代码）、审查员（代码走查）、测试员（分析修复）、**审计员**（只读审计现有代码）。
 - 🤖 **全流程自动化**：LLM 自动拆解需求、生成代码、运行测试，并在失败时自动定位修复。
 - 📝 **增量修改**：优先使用 `replace_in_file` 进行局部代码替换，拒绝无脑重写整文件。
 - 🔍 **AST 符号检索**：通过 tree-sitter 精确定位函数/类定义，支持精确代码替换。
+- 🗺️ **全局符号索引**：`workspace_symbols` 工具一次性扫出整项目的函数/类清单，按文件 mtime 缓存，命中后零成本；让 LLM 不用反复 `read_file` 摸结构。
+- 📑 **代码审计模式**：`--mode audit` 启动只读人格，注入符号索引摘要 + 只读工具白名单，输出分级 markdown 报告，**全程拒绝任何写/执行操作**。
 - 👁️ **视觉支持**：支持 `@image <路径/URL>` 和 `@paste`（剪贴板），可分析 UI 设计稿或报错截图生成代码。
 - 🧪 **闭环质量保障**：集成 `pytest` 自动运行测试，支持 `ruff` 静态检查，无测试文件时自动生成最小测试用例。
 - 🛡️ **安全与回滚**：任务开始前自动 git stash 快照（无 git 时文件复制兜底），支持 `/revert` 回滚。内置安全沙箱拦截危险命令。
@@ -26,8 +28,7 @@
 # 1. 进入虚拟环境
 .\venv\Scripts\activate
 
-# 2. 安装依赖并注册 yansh 命令
-pip install -r requirements.txt
+# 2. 安装（pyproject 已声明全部运行期依赖，单条命令即可）
 pip install -e .
 
 # 3. 配置密钥
@@ -72,6 +73,50 @@ python tests/integration/test_1_9.py
 🧪 阶段4：测试与修复 →  [Agent: Tester]    自动生成测试 → 运行测试 → 失败则精准修复
 ```
 
+## 代码审计模式
+
+`--mode audit`（或 `/mode audit`）启动一条**完全独立、只读**的工作流，专门用于审计现有项目代码。
+
+### 用法
+
+```bash
+# 审计当前目录的项目，输出 markdown 报告
+yansh --cwd /path/to/your/project --mode audit "审计 src/ 目录，找出潜在 bug 与设计问题"
+
+# 在交互模式中切换
+yansh
+> /mode audit
+> 审计 agent.py 与 tools.py 的安全和性能问题
+```
+
+### 工作机制
+
+1. **预注入符号索引**：启动时调用 `workspace_symbols` 扫描全项目（默认 `.py`），把"每个文件包含哪些函数/类"作为 system prompt 一次性给到 LLM，**避免 LLM 上来就反复 `list_files` / `read_file` 摸结构**。
+2. **只读工具白名单**：审计人格只能看到 `read_file / list_files / glob_files / search_in_files / list_symbols / get_symbol_definition / find_references / workspace_symbols / git_diff / git_log / fetch_webpage / search_docs`。
+3. **双重防护**：即使 LLM hallucinate 调用 `write_file` / `replace_in_file` / `execute_command`，分发层也会**直接返回错误并拒绝执行**——审计模式下保证零写入、零命令执行。
+4. **多轮深挖**：LLM 根据预注入索引按需调用只读工具深挖（最多 8 轮），最后输出 markdown 报告。
+
+### 报告结构
+
+```markdown
+## 总览
+项目类型、规模、关注重点。
+
+## 重要发现
+- **严重**：xxx.py:123 — 现状 / 建议
+- **中**：...
+- **低**：...
+
+## 总评
+整体健康度，最值得优先处理的 1-3 项。
+```
+
+### 适用场景
+
+- 接手老项目想先做体检
+- PR review 前的预扫
+- 想用一个 LLM 看另一个 LLM 写的代码（参见本仓库 `.claude/plans/` 下的多轮对照实验）
+
 ## 内置命令
 
 在主循环中可直接输入以下命令（输入 `/` 后自动弹出候选列表，继续输入字母可过滤；Tab 补全，Esc 关闭）：
@@ -81,6 +126,7 @@ python tests/integration/test_1_9.py
 | `/mode plan` | 仅输出计划，不生成代码 |
 | `/mode code` | 跳过确认，直接生成代码执行 |
 | `/mode auto` | 默认交互模式（需用户确认计划） |
+| `/mode audit` | 只读审计现有代码，输出 markdown 报告（详见上文"代码审计模式"） |
 | `/revert` | 回滚到上一个任务执行前的状态 |
 | `/context` | 查看当前上下文占用（轮数 / 字符数） |
 | `/history` | 查看最近的对话历史记录 |

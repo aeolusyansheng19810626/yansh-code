@@ -16,6 +16,7 @@ files = [
     "tests/unit/test_detect_test_cmd.py",
     "tests/unit/test_cwd.py",
     "tests/unit/test_git_snapshot.py",
+    "tests/unit/test_audit.py",
 ]
 
 if __name__ == "__main__":
