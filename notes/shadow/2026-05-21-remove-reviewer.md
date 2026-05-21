@@ -114,6 +114,44 @@ yansh 整体行为立刻变好。**减法**比**加法**有时候 ROI 更高。
 这是"消灭 6 轮硬上限"的根本方案，跟今天砍 reviewer 一脉相承——都是
 **让 LLM 自己声明状态**，而不是流程硬编码。
 
+## Claude Code vs yansh 完整对比表
+
+任务："tests/unit/test_tools.py 里 test_replace_in_file_multiple_matches 失败了，修一下"
+（注入的 bug：`tools.py:287` 把 `count > 1` 改成 `count == -1`）
+
+两边都用 **claude-sonnet-4-6**。
+
+| 维度 | Claude Code | yansh 改前（有 reviewer） | yansh 改后（无 reviewer） |
+|---|---|---|---|
+| 耗时 | **30s** | 272s | 164s |
+| 工具调用总数 | **5** | 35 | 20 |
+| 工具组合 | Bash×3 + Read×1 + Edit×1 | execute×10 / search×9 / read×8 / symdef×3 / replace×3 / list×2 | read×6 / search×5 / execute×4 / symdef×3 / replace×2 |
+| 任务结果 | ✅ 完成 | ❌ 失败（代码实际对了） | ✅ 完成 |
+| 相对 Claude Code | 1x（基线） | 9.1x slower | **5.5x slower** |
+
+### Claude Code 的工具序列（5 步）
+
+| 步 | 工具 | 关键参数 |
+|---|---|---|
+| 1 | Bash | `pytest -v` 看具体失败信息 |
+| 2 | Read | `tools.py:283-292`（10 行精读） |
+| 3 | Edit | `count == -1` → `count > 1` |
+| 4 | Bash | `pytest` 验证修复 |
+| 5 | Bash | 全测试回归 |
+
+### 改后 yansh 还慢 5.5x 的原因
+
+虽然砍掉 reviewer 解决了"死循环"和"判定错误"，但底层效率瓶颈仍在：
+
+1. **architect 过度规划**：计划要改 2 文件（test + tools），实际只需改 tools
+2. **coder 顺手改不相关代码**：把 `for l in lines` 改成 `for line in lines`
+3. **fix loop 6 轮硬上限**：即使任务早就修对，循环还在跑
+4. **plan/code/test 三阶段串行**：每段都要新起 LLM 调用，相比 Claude Code 单 context 内自然展开多了协议开销
+
+→ ROADMAP P0 #2（prompt 收敛 architect 范围）+ P0 #3（task_complete 软退出）是下一阶段重点。
+
+---
+
 ## 三句话总结
 
 1. Claude Code 没有独立 reviewer，是有意为之的架构选择
