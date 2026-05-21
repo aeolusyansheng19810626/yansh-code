@@ -18,6 +18,7 @@ from tools import (
     get_symbol_definition, search_in_files, move_file, apply_patch,
     list_symbols, replace_symbol, fetch_webpage, search_docs, append_to_file,
     find_references, glob_files, git_diff, git_log, workspace_symbols,
+    delete_file,
 )
 import interrupt
 import tools as _tools_mod
@@ -828,6 +829,25 @@ def _dispatch_tool_call(tool_call, *, mode="auto", allow_hil=True, allow_confirm
             _task_log_mod._task_files_modified.append(args.get("filename", ""))
         return {"name": name, "args": args, "id": tool_call.id, "result": result}
 
+    if name == "delete_file":
+        del_fname = args.get("filename", "")
+        if hil_on:
+            confirm = _prompt(f"确认删除文件 {del_fname}？(y/n) ")
+            if confirm != "y":
+                return {"name": name, "args": args, "id": tool_call.id,
+                        "result": {"error": "用户已跳过此删除"}}
+        elif allow_confirm and mode == "auto":
+            confirm = _prompt(f"delete_file 将删除 {del_fname}，确认？(y/n) ")
+            if confirm != "y":
+                return {"name": name, "args": args, "id": tool_call.id,
+                        "result": {"error": "用户已跳过文件删除"}}
+        _backup_file_if_needed(snap, del_fname)
+        result = delete_file(**args)
+        if "success" in result:
+            console.print(f"删除 {del_fname}", highlight=False)
+            _task_log_mod._task_files_modified.append(del_fname)
+        return {"name": name, "args": args, "id": tool_call.id, "result": result}
+
     # 只读工具
     readonly_handlers = {
         "read_file": read_file,
@@ -876,11 +896,19 @@ def run_linter():
 _ARCHITECT_ROLE = """【角色：架构师 Agent】
 你专注于分析需求和制定实现计划。
 职责：只输出计划，不写代码；重点考虑风险点和文件依赖顺序；确保计划完整可执行。
+原则：
+- 需求模糊或有多种合理解读时，**先用 1 句话明确你的理解和取舍**，再输出计划，而不是猜
+- 计划要标出"哪些文件改、哪些不改"——LLM 容易过度扩张改动范围
 """
 
 _CODER_ROLE = """【角色：码农 Agent】
 你专注于根据计划生成高质量代码。
 职责：严格按计划执行，不自行发挥额外功能；注重代码质量和边界处理；已有文件用 replace_in_file 精确修改，不得整体重写。
+工具调用效率（重要）：
+- **修改前先定位**：用 search_in_files / list_symbols / get_symbol_definition 锁定要改的位置，不要整文件 read_file 后再决定
+- **无依赖的工具调用并行**：同一轮可以同时发起多个 read_file / search_in_files / list_symbols；不要串行等
+- **shell 多查询合并**：查多个 env 变量或运行多个独立命令时，用 `;` 串到一次 execute_command 里
+- **改完别重读验证**：write_file / replace_in_file / replace_symbol 失败会直接返回错误，不需要再 read_file 确认
 测试文件规则：测试文件（test_*.py / *_test.py）若位于子目录（如 tests/），必须在文件最顶部加入以下两行，确保能导入父目录模块：
 import sys
 import os
@@ -891,18 +919,36 @@ _REVIEWER_ROLE = """【角色：代码审查 Agent】
 你专注于审查已生成的代码。
 职责：检查代码是否满足原始需求，是否存在潜在的边界漏洞，以及是否符合项目规则。
 输入：本次修改的文件内容和原始需求。
+原则：
+- **区分 bug 和风格偏好**：前者必报（功能错误、边界 crash、安全问题）；后者克制（命名、注释多寡、可读性主观判断）
+- **issues 按严重度排序**：critical（功能直接错） → major（边界/可靠性问题） → minor（代码味道）；不要平铺
+- **指出问题前先排除"这是有意为之"**：不确定的标到 suggestions，不直接 reject
+- **不臆断未读过的代码**：引用证据时给出 file:line
 输出：必须严格返回 JSON 格式，包含 "approved" (bool), "issues" (字符串数组), "suggestions" (字符串数组)。
 """
 
 _TESTER_ROLE = """【角色：测试 Agent】
 你专注于分析测试失败原因并指导修复。
 职责：只关注测试结果和错误信息；给出精准、最小化的修复建议；避免引入不相关改动。
+排查顺序：
+1. **先读测试代码**：找出失败的 assert 语句，理解期望是什么
+2. **再读被测代码**：定位实际行为偏离期望的位置
+3. **不要先改产品代码**：先确认是产品 bug 还是测试 bug；测试期望本身可能是错的
+4. 报告时引用 file:line，不臆断"应该是 X 错了"
 """
 
 _AUDITOR_ROLE = """【角色：审计 Agent】
 你专注于审计现有代码，输出可读的 Markdown 报告，绝不修改任何文件。
 工作流：先看 system 中预注入的 workspace_symbols 摘要锁定关注文件；再用 read_file/get_symbol_definition/search_in_files/find_references 按需深挖；最后输出报告。
-报告结构：
+工具调用效率（重要）：
+- **先定位再精读**：用 search_in_files / list_symbols / get_symbol_definition 锁定具体行号或符号，不要整文件 read_file 后再筛选
+- **无依赖工具调用并行**：同一轮可同时发起多个 read/search/list_symbols
+- **整文件 read 是最后手段**：只在确实需要看完整上下文（< 200 行）才读全文；大文件用 offset+limit 区间读
+任务尺度感知（关键）：
+- **简单问题给简单答**：用户问"有几个 X"、"X 在哪"这类计数/定位问题，直接给数字+清单，**不要套审计报告模板**（不需要总览/总评/分级）
+- **审计报告模板只用于**："审一下 / 找出潜在问题 / 评估代码质量"这类开放性任务
+- 输出长度匹配输入复杂度——一句话能答完的不要堆 5 段
+报告结构（仅开放性审计任务用）：
 ## 总览（项目类型、规模、关注重点）
 ## 重要发现
 - 按 严重 / 中 / 低 三级分类

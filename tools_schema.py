@@ -5,7 +5,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "write_file",
-            "description": "在workspace目录下写入文件",
+            "description": "在workspace目录下写入文件（覆盖整个文件）。如果文件已存在且只改局部，应优先用 replace_in_file 或 replace_symbol——整体重写容易丢失现有上下文。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -20,7 +20,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "读取workspace目录下的文件，可选按行号区间截取（用于大文件分块读取）",
+            "description": "读取workspace目录下的文件，可选按行号区间截取（用于大文件分块读取）。注意：刚通过 write_file/replace_in_file/replace_symbol 修改过的文件不要再 read 验证——写工具失败会直接返回错误。优先用 search_in_files / list_symbols 定位再精读区间，而不是整文件 read。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -36,7 +36,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "execute_command",
-            "description": "在workspace目录下执行命令（30秒超时）",
+            "description": "在workspace目录下执行命令（30秒超时）。查询多个相关 env 变量或运行多个独立命令时，用 `;`（PowerShell）或 `&&`（bash）合并到一次调用，不要拆成多次。例：`$env:A; $env:B; $env:C` 一次拿三个值。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -113,6 +113,20 @@ TOOLS = [
                     "dst": {"type": "string", "description": "目标文件路径（相对于workspace）"}
                 },
                 "required": ["src", "dst"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_file",
+            "description": "删除 workspace 目录下的文件。破坏性操作：仅在用户明确要求删除文件时使用；普通的清理代码场景应用 replace_in_file 删除内容而非整个文件。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filename": {"type": "string", "description": "文件名（相对于workspace）"}
+                },
+                "required": ["filename"]
             }
         }
     },
