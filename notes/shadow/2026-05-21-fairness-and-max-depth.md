@@ -91,8 +91,67 @@ yansh 的 review/fix loop 是个**很丑的"全链路意识"补偿机制**——
 4. yansh 的 review/fix 是丑陋的补偿机制，能捞到 bug 但效率极低；正解是 prompt 教会 coder 主动审视全链路
 5. 公平测试本身比测试结果更值得记录——这种"我做错了什么"的反思才是 shadow 笔记的真正价值
 
+## 第二次公平测试：Sonnet subagent vs yansh（同模型）
+
+为了排除模型差距，重跑 subagent 时显式指定 `model: sonnet`。
+
+### 三方完整对比
+
+| 维度 | Sonnet subagent | Opus subagent | yansh (Sonnet, mode=code) |
+|---|---|---|---|
+| 架构 | 单 agent | 单 agent | plan/code/test 多阶段 |
+| 耗时 | 134s | 99s | 242s |
+| 工具调用 | 23 | 16 | 39 |
+| 改动文件数 | 3 | 3 | 4 |
+| 实现是否正确 | ✅ | ✅ | ❌ off-by-one |
+| 单测是否通过 | ✅ | ✅ | ❌ 实现/测试矛盾 |
+| **agent.py dispatch 是否修** | ❌ 漏 | ❌ 漏 | ✅ 修（fix loop 副产品） |
+| 任务判定 | 完成 | 完成 | 失败 |
+
+### 排除模型差距后的真·结论
+
+1. **同模型（Sonnet）下，yansh 比 subagent 慢 1.8x、多 70% 工具调用、还做错**
+   - 慢 1.8x 是**架构差距**（plan/code/test 多阶段串行 vs 单 agent）
+   - 多工具调用是**协议差距**（角色间传递必须重新读取上下文）
+   - 实现错误是 **plan→code 上下文割裂**——不是 Sonnet 模型不行（subagent 同模型做对了）
+
+2. **dispatch 漏修是所有 LLM agent 的共性盲区**
+   - Opus subagent 漏 → Sonnet subagent 漏 → 不是模型能力问题
+   - 是**全链路意识盲区**：LLM agent 普遍严格执行任务措辞，不主动越界检查
+   - **Anthropic 的 Claude Code subagent 也没解决这个**
+
+3. **yansh 的"找到 dispatch"是补偿机制的副产品**
+   - 不是主动审视全链路，是因为 impl 错了，fix loop 反复跑追到的
+   - 多花 100+ 秒最后判失败，效率极低
+   - 但**确实捕获了 subagent 错过的问题**
+
+4. **Sonnet subagent 的"踩坑自查"展示单 agent 优势**
+   - subagent 自报："第一次 `>= max_depth` 写错了，自己测出问题，改成 `>= max_depth - 1`"
+   - **自我验证回路在同一个上下文里发生**——这是单 agent 设计的核心优势
+   - yansh 的 mode=code 没有这种自查（它的"测试"是被自己污染的）
+
+### 之前的认知 vs 数据告诉我的
+
+| 之前我以为 | 数据告诉我 |
+|---|---|
+| Claude Code 比 yansh 快 9 倍 | **同模型下单 agent 比多 agent 快约 2 倍**——9 倍是开卷选手作弊数据 |
+| reviewer 是 yansh 的核心问题 | reviewer 已删但**架构差距还在**——plan/code/test 多阶段也比单 agent 慢 |
+| yansh 的"全链路意识"是优点 | 那是 fix loop 副产品；**Claude Code 同样没主动审视全链路** |
+| 模型能力是关键变量 | **架构 + prompt > 模型**——同 Sonnet 下 yansh 慢且错，subagent 快且对 |
+
+### 给 ROADMAP 的优先级调整
+
+| ROADMAP 项 | 调整 |
+|---|---|
+| P0 #2 prompt 调优 | **拔高第一条**："修改函数签名时必须 grep 所有调用点"——连 Claude Code subagent 也没解决的共性盲区，yansh 做对了反而能领先 |
+| P0 #3 错误恢复闭环 | **降低优先级**——subagent 不需要这个机制也跑得很好。把"主动审视全链路"和"减少 plan/code 协议割裂"做好后，错误恢复的需求会大幅减少 |
+
+新洞察：**架构升级（单 agent 化 + prompt 教全链路意识）**比错误恢复闭环 ROI 高得多。
+
+---
+
 ## 后续
 
-- 改用 sonnet 重跑 subagent，彻底排除模型变量（task #26）
-- 把"修改函数签名时 grep 所有调用点"加到 _CODER_ROLE
-- 新做对照实验时默认用 subagent，不要再用我自己跑
+- 把"修改函数签名时必须 grep 所有调用点"作为下一条 prompt 改进，加到 _ARCHITECT_ROLE 和 _CODER_ROLE
+- 新做对照实验**默认用 subagent，永远显式指定模型**——这次踩的坑不要再踩
+- ROADMAP P0 #3（错误恢复闭环）优先级降低，可以后做
