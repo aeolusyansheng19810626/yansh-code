@@ -41,6 +41,11 @@ def set_quality_cascade(cascade):
     QUALITY_CASCADE = list(cascade)
 
 
+def get_session_total_tokens() -> int:
+    """累计 prompt+completion token 数，跨模型求和。供 fix/audit 计算 token 预算用。"""
+    return sum(b["prompt"] + b["completion"] for b in _session_tokens_by_model.values())
+
+
 def _get_gemini_client():
     """每次调用刷新 OAuth token，供 Vertex AI 端点使用"""
     from config import GEMINI_BASE_URL

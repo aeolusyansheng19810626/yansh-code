@@ -7,7 +7,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
-from tools import write_file, read_file, delete_file, list_files, execute_command, replace_in_file, move_file, search_in_files
+from tools import write_file, read_file, delete_file, list_files, execute_command, replace_in_file, move_file, search_in_files, task_complete, ERROR_KINDS, _err
 from config import WORKSPACE_DIR
 
 TEST_SUBDIR = "test_tools_workspace"
@@ -416,3 +416,106 @@ def test_build_vision_content_multiple_images():
     assert content[0]["image_url"]["url"] == "data:image/png;base64,img1"
     assert content[1]["image_url"]["url"] == "data:image/jpeg;base64,img2"
     assert content[2]["text"] == "对比两图"
+
+
+# ── #P0_3 错误恢复闭环 ────────────────────────────────────────────────────────
+
+
+def test_task_complete_returns_sentinel():
+    """task_complete 返回 _task_complete=True，含 success/summary"""
+    r = task_complete(True, "all done")
+    assert r["_task_complete"] is True
+    assert r["success"] is True
+    assert r["summary"] == "all done"
+
+    r2 = task_complete(False, "gave up")
+    assert r2["_task_complete"] is True
+    assert r2["success"] is False
+    assert r2["summary"] == "gave up"
+
+
+def test_err_helper_attaches_error_kind():
+    """_err(kind, msg) 返回含 error 和 error_kind"""
+    e = _err("permission", "blocked")
+    assert e["error"] == "blocked"
+    assert e["error_kind"] == "permission"
+    assert e["error_kind"] in ERROR_KINDS
+
+
+def test_err_helper_rejects_unknown_kind():
+    """未知 kind 触发 assert"""
+    with pytest.raises(AssertionError):
+        _err("nonexistent_kind", "x")
+
+
+def test_error_kind_write_file_path_traversal():
+    """路径越界 → permission"""
+    r = write_file("../secret.txt", "hack")
+    assert "error" in r
+    assert r["error_kind"] == "permission"
+
+
+def test_error_kind_read_file_not_found():
+    """读不存在文件 → not_found"""
+    r = read_file("nonexistent_file_xyz.txt")
+    assert "error" in r
+    assert r["error_kind"] == "not_found"
+
+
+def test_error_kind_delete_file_not_found():
+    """删不存在文件 → not_found"""
+    r = delete_file("nonexistent_xyz.txt")
+    assert "error" in r
+    assert r["error_kind"] == "not_found"
+
+
+def test_error_kind_execute_command_security():
+    """黑名单命令 → security"""
+    r = execute_command("rm -rf /")
+    assert "error" in r
+    assert r["error_kind"] == "security"
+
+
+def test_error_kind_execute_command_python_inline_security():
+    """python -c 被列入黑名单 → security（覆盖 pre-existing test_execute_command_timeout 同场景，但断言新字段）"""
+    r = execute_command("python -c \"import time; time.sleep(60)\"")
+    assert "error" in r
+    assert r["error_kind"] == "security"
+
+
+def test_error_kind_replace_in_file_multiple_matches():
+    """old_str 多处匹配 → invalid_args"""
+    write_file("multi.txt", "aaa aaa aaa")
+    r = replace_in_file("multi.txt", "aaa", "bbb")
+    assert "error" in r
+    assert r["error_kind"] == "invalid_args"
+
+
+def test_error_kind_replace_in_file_not_found_string():
+    """old_str 未找到 → not_found"""
+    write_file("nomatch.txt", "hello")
+    r = replace_in_file("nomatch.txt", "nonexistent", "x")
+    assert "error" in r
+    assert r["error_kind"] == "not_found"
+
+
+def test_error_kind_move_file_src_not_exist():
+    """move src 不存在 → not_found"""
+    r = move_file("nonexistent_src.txt", "dst.txt")
+    assert "error" in r
+    assert r["error_kind"] == "not_found"
+
+
+def test_error_kind_move_file_path_traversal():
+    """move 路径越界 → permission"""
+    r = move_file("../outside.txt", "inside.txt")
+    assert "error" in r
+    assert r["error_kind"] == "permission"
+
+
+def test_error_field_preserved_for_legacy_callers():
+    """老调用方读 result['error'] 仍能拿到原中文文案（兼容性）"""
+    r = read_file("does_not_exist.txt")
+    assert "不存在" in r["error"]
+    # 同时新字段也在
+    assert r["error_kind"] == "not_found"

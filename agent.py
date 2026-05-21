@@ -18,7 +18,7 @@ from tools import (
     get_symbol_definition, search_in_files, move_file, apply_patch,
     list_symbols, replace_symbol, fetch_webpage, search_docs, append_to_file,
     find_references, glob_files, git_diff, git_log, workspace_symbols,
-    delete_file,
+    delete_file, task_complete,
 )
 import interrupt
 import tools as _tools_mod
@@ -42,6 +42,7 @@ from llm_client import (
     _is_gemini, _is_claude, _client_for, _call_single_model,
     _is_transient_error, call_llm, _StreamToolCall, _handle_stream,
     show_stats, LLM_TIMEOUT_SEC, LLM_MAX_RETRIES_PER_MODEL,
+    get_session_total_tokens,
 )
 
 console = Console()
@@ -77,6 +78,14 @@ _MAX_CONTEXT_FILE_SIZE = 100 * 1024  # 100KB
 
 # #50 多模态视觉：当前轮次待注入的图片，plan()/chat() 消费后清空
 _pending_images: list = []
+
+# #P0_3 错误恢复闭环：fix/audit 软上限 + token 预算
+# - 软上限：原硬上限翻倍。LLM 用 task_complete 主动早退是正常路径；硬退是兜底。
+# - token 预算：进入 loop 时记起点，超阈值往 messages 注一条 system 提醒"快收尾"，只警告一次。
+_FIX_SOFT_LIMIT     = 12       # 原 6
+_FIX_TOKEN_BUDGET   = 60_000   # fix loop token 增量预算
+_AUDIT_SOFT_LIMIT   = 16       # 原 8
+_AUDIT_TOKEN_BUDGET = 120_000  # audit loop token 增量预算
 
 
 def _cfg(key):
@@ -848,6 +857,11 @@ def _dispatch_tool_call(tool_call, *, mode="auto", allow_hil=True, allow_confirm
             _task_log_mod._task_files_modified.append(del_fname)
         return {"name": name, "args": args, "id": tool_call.id, "result": result}
 
+    # task_complete: sentinel 退出信号；fix()/audit() 检测后跳出循环
+    if name == "task_complete":
+        result = task_complete(**args)
+        return {"name": name, "args": args, "id": tool_call.id, "result": result}
+
     # 只读工具
     readonly_handlers = {
         "read_file": read_file,
@@ -869,11 +883,11 @@ def _dispatch_tool_call(tool_call, *, mode="auto", allow_hil=True, allow_confirm
         try:
             result = readonly_handlers[name](**args)
         except Exception as e:
-            result = {"error": f"工具调用异常: {e}"}
+            result = _tools_mod._err("internal", f"工具调用异常: {e}")
         return {"name": name, "args": args, "id": tool_call.id, "result": result}
 
     return {"name": name, "args": args, "id": tool_call.id,
-            "result": {"error": f"未预期的工具: {name}"}}
+            "result": _tools_mod._err("invalid_args", f"未预期的工具: {name}")}
 
 
 def _record_dispatch(out: dict, msgs: list):
@@ -981,6 +995,12 @@ _TESTER_ROLE = """【角色：测试 Agent】
 3. **再读被测代码**：定位实际行为偏离期望的位置
 4. **不要先改产品代码**：先确认是产品 bug 还是测试 bug；测试期望本身可能是错的
 5. 报告时引用 file:line，不臆断"应该是 X 错了"
+任务收尾：
+- 完成或确认无法继续时，**调用 `task_complete(success, summary)` 显式收尾**。
+  沉默退出（这一轮不调任何工具）= 默认成功；显式声明 success=False 用来表达"做不了"。
+- 注意：error_kind 字段只是错误**分类标签**（让你判断该 retry 还是放弃），
+  **不是改测试期望的依据**——pre-existing 测试用 "超时" 期望但工具返回 security 错误时，
+  按归属规则（第 1 条）跳过这个失败，**不要把测试 assert 改成匹配 error_kind**。
 """
 
 _AUDITOR_ROLE = """【角色：审计 Agent】
@@ -1004,6 +1024,10 @@ _AUDITOR_ROLE = """【角色：审计 Agent】
 - 区分 bug 与风格偏好；指出问题前先排除"这是有意为之的设计选择"
 - 不臆断未读过的代码；引用证据时给出 file:line
 - 对小问题保持比例感，不要为凑数堆砌
+任务收尾：
+- 报告输出完整后，**调用 `task_complete(success=True, summary='审计完成: ...')` 显式收尾**。
+  不能完成（如 workspace 为空、目标不存在）时调 `task_complete(success=False, summary='...')`。
+  沉默退出 = 默认成功，但显式声明更清晰。
 """
 
 def _get_project_rules():
@@ -1303,14 +1327,33 @@ def audit(requirement):
     ]
 
     audit_tools = _filter_tools(READONLY_TOOL_NAMES)
-    max_audit_rounds = 8
     rounds_used = 0
     last_text = ""
 
-    while rounds_used < max_audit_rounds:
+    # P0 #3 token 预算
+    start_tokens = get_session_total_tokens()
+    budget_warned = False
+
+    while rounds_used < _AUDIT_SOFT_LIMIT:
         rounds_used += 1
         if interrupt.is_interrupted():
             raise interrupt.Interrupted()
+
+        # token 预算检查（每轮开头）：超阈值时往 messages 注一条 system 提醒，只警告一次
+        if not budget_warned:
+            used = get_session_total_tokens() - start_tokens
+            if used > _AUDIT_TOKEN_BUDGET:
+                console.print(f"[预算] audit token 增量 {used} > {_AUDIT_TOKEN_BUDGET}，提醒 LLM 收尾",
+                              style="yellow", highlight=False)
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        f"⚠️ 本次 audit 累计已用 {used} tokens（预算 {_AUDIT_TOKEN_BUDGET}）。"
+                        "请尽快用 task_complete(success, summary) 收尾，不要再发起新的探索性工具调用。"
+                    ),
+                })
+                budget_warned = True
+
         response = call_llm(messages, tools=audit_tools, tool_choice="auto", stream=False)
         msg = response.choices[0].message
         messages.append({
@@ -1327,13 +1370,21 @@ def audit(requirement):
             for tc in msg.tool_calls:
                 out = _dispatch_tool_call(tc, mode="audit", allow_hil=False, allow_confirm=False, snap=None)
                 _record_dispatch(out, messages)
+                # P0 #3 sentinel：LLM 主动声明任务结束
+                if out["result"].get("_task_complete"):
+                    success = bool(out["result"].get("success"))
+                    summary = out["result"].get("summary", "")
+                    console.print(f"审计完成（task_complete: {'成功' if success else '放弃'}）：{summary}")
+                    console.print()
+                    console.print(last_text or summary or "（无报告内容）", highlight=False)
+                    return {"success": success, "report": last_text or summary}
         else:
             console.print(f"审计完成（{rounds_used} 轮）")
             console.print()
             console.print(last_text or "（无报告内容）", highlight=False)
             return {"success": True, "report": last_text}
 
-    console.print(f"[警告] audit 已达 {max_audit_rounds} 轮上限，输出当前报告", style="yellow", highlight=False)
+    console.print(f"[警告] audit 已达 {_AUDIT_SOFT_LIMIT} 轮上限，输出当前报告", style="yellow", highlight=False)
     console.print()
     console.print(last_text or "（无报告内容）", highlight=False)
     return {"success": bool(last_text), "report": last_text}
@@ -1456,11 +1507,31 @@ def fix(test_result, plan, reason="test_failure"):
         {"role": "user", "content": content}
     ]
 
-    # #4 防止 LLM 反复调工具不收敛
-    max_fix_rounds = 6
+    # P0 #3 软上限 + token 预算 + sentinel 退出
     rounds_used = 0
-    while rounds_used < max_fix_rounds:
+    start_tokens = get_session_total_tokens()
+    budget_warned = False
+
+    while rounds_used < _FIX_SOFT_LIMIT:
         rounds_used += 1
+        if interrupt.is_interrupted():
+            raise interrupt.Interrupted()
+
+        # token 预算检查（每轮开头）
+        if not budget_warned:
+            used = get_session_total_tokens() - start_tokens
+            if used > _FIX_TOKEN_BUDGET:
+                console.print(f"[预算] fix token 增量 {used} > {_FIX_TOKEN_BUDGET}，提醒 LLM 收尾",
+                              style="yellow", highlight=False)
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        f"⚠️ 本次 fix 累计已用 {used} tokens（预算 {_FIX_TOKEN_BUDGET}）。"
+                        "请尽快用 task_complete(success, summary) 收尾——确认无法继续就 success=false。"
+                    ),
+                })
+                budget_warned = True
+
         response = call_llm(messages, tools=TOOLS, tool_choice="auto")
         response_message = response.choices[0].message
         # 显式序列化为 dict，避免 Pydantic 对象在不同 SDK 版本下序列化异常
@@ -1478,10 +1549,17 @@ def fix(test_result, plan, reason="test_failure"):
                     tool_call, mode="code", allow_hil=True, allow_confirm=False, snap=_CURRENT_SNAPSHOT
                 )
                 _record_dispatch(out, messages)
+                # P0 #3 sentinel：LLM 主动声明任务结束
+                if out["result"].get("_task_complete"):
+                    success = bool(out["result"].get("success"))
+                    summary = out["result"].get("summary", "")
+                    console.print(f"修复结束（task_complete: {'成功' if success else '放弃'}）：{summary}",
+                                  style="yellow" if not success else None, highlight=False)
+                    return
         else:
             console.print("修复完成")
             return
-    console.print(f"[警告] fix 已达 {max_fix_rounds} 轮上限，强制退出", style="yellow", highlight=False)
+    console.print(f"[警告] fix 已达 {_FIX_SOFT_LIMIT} 轮上限，强制退出", style="yellow", highlight=False)
 
 def test(test_command):
     """执行测试命令"""

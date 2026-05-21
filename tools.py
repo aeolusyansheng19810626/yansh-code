@@ -9,6 +9,42 @@ from config import WORKSPACE_DIR
 _WORKSPACE_ROOT = Path(WORKSPACE_DIR).resolve()
 
 
+# #P0_3 错误恢复闭环：标准化 error_kind 分类
+ERROR_KINDS = frozenset({
+    "invalid_args",  # 参数格式/取值错
+    "not_found",     # 文件/符号不存在
+    "permission",    # 路径越界 / 权限
+    "security",      # 黑名单命令拦截
+    "timeout",       # 执行/网络超时
+    "transient",     # 网络/外部依赖一时挂
+    "internal",      # 工具自身 bug / 解析失败 / 兜底 Exception
+})
+
+
+def _err(kind: str, msg: str, **extra) -> dict:
+    """统一错误构造：保留 'error' 键兼容老调用方，新增 'error_kind'。
+    extra 用于附加 returncode/stdout/stderr 之类的辅助字段。"""
+    assert kind in ERROR_KINDS, f"unknown error_kind: {kind}"
+    out = {"error": msg, "error_kind": kind}
+    if extra:
+        out.update(extra)
+    return out
+
+
+def task_complete(success: bool, summary: str) -> dict:
+    """LLM 主动声明任务结束（fix/audit 循环识别 sentinel 后退出）。
+
+    success=True  → 任务完成；success=False → 主动放弃（"我做不了"）。
+    summary 用一句话说清楚做了什么/为什么放弃。
+    沉默退出（这一轮不调任何工具）= 默认 success=True。
+    """
+    return {
+        "_task_complete": True,
+        "success": bool(success),
+        "summary": str(summary or ""),
+    }
+
+
 def _reinit_paths():
     """--cwd 变更后重新初始化模块级路径变量（由 main.py 调用）"""
     global _WORKSPACE_ROOT
@@ -97,12 +133,12 @@ def _validate_path(filename):
     返回 (resolved_path, None) 或 (None, error_dict)。"""
     p = Path(filename)
     if p.is_absolute():
-        return None, {"error": "路径越界：不允许访问workspace外的文件"}
+        return None, _err("permission", "路径越界：不允许访问workspace外的文件")
     if ".." in p.parts:
-        return None, {"error": "路径越界：不允许访问workspace外的文件"}
+        return None, _err("permission", "路径越界：不允许访问workspace外的文件")
     candidate = (_WORKSPACE_ROOT / p).resolve()
     if not candidate.is_relative_to(_WORKSPACE_ROOT):
-        return None, {"error": "路径越界：不允许访问workspace外的文件"}
+        return None, _err("permission", "路径越界：不允许访问workspace外的文件")
     return candidate, None
 
 def _check_dangerous(command):
@@ -110,8 +146,8 @@ def _check_dangerous(command):
     for pattern, label in _DANGEROUS_PATTERNS:
         if re.search(pattern, command, re.IGNORECASE | re.DOTALL):
             _con().print(f"[安全拦截] 检测到危险命令：{label}", highlight=False)
-            return {"error": f"安全拦截：检测到危险命令（{label}），已阻止执行",
-                    "returncode": -2, "stdout": "", "stderr": ""}
+            return _err("security", f"安全拦截：检测到危险命令（{label}），已阻止执行",
+                        returncode=-2, stdout="", stderr="")
     return None
 
 def write_file(filename, content):
@@ -126,7 +162,7 @@ def write_file(filename, content):
         _invalidate_ast_cache(resolved)
         return {"success": f"文件 {filename} 写入成功"}
     except Exception as e:
-        return {"error": str(e)}
+        return _err("internal", str(e))
 
 def read_file(filename, offset=None, limit=None):
     """读取workspace目录下的文件。
@@ -137,8 +173,10 @@ def read_file(filename, offset=None, limit=None):
         return err
     try:
         text = resolved.read_text(encoding='utf-8')
+    except FileNotFoundError:
+        return _err("not_found", f"文件 {filename} 不存在")
     except Exception as e:
-        return {"error": str(e)}
+        return _err("internal", str(e))
     if offset is None and limit is None:
         return {"content": text}
     lines = text.splitlines(keepends=True)
@@ -175,7 +213,7 @@ def execute_command(command):
         )
         if _BATCH_MODE and _BATCH_STRICT:
             _con().print(f"[batch-strict] 拒绝执行: {label} -> {command}", highlight=False)
-            return {"error": f"批处理严格模式拒绝执行: {label}", "returncode": -1, "stdout": "", "stderr": ""}
+            return _err("security", f"批处理严格模式拒绝执行: {label}", returncode=-1, stdout="", stderr="")
         if _BATCH_MODE:
             _con().print(f"[batch] 自动确认执行 ({label}): {command}", highlight=False)
         else:
@@ -186,7 +224,7 @@ def execute_command(command):
             except EOFError:
                 answer = "n"
             if answer != "y":
-                return {"error": "用户取消执行", "returncode": -1, "stdout": "", "stderr": ""}
+                return _err("security", "用户取消执行", returncode=-1, stdout="", stderr="")
 
     import threading
 
@@ -238,11 +276,11 @@ def execute_command(command):
                 except subprocess.TimeoutExpired:
                     if time.time() - start_time > 30:
                         process.kill()
-                        return {"error": "命令执行超时（30秒）"}
+                        return _err("timeout", "命令执行超时（30秒）")
         except interrupt.Interrupted:
             raise
         except Exception as e:
-            return {"error": str(e)}
+            return _err("internal", str(e))
 
         t_out.join()
         t_err.join()
@@ -253,7 +291,7 @@ def execute_command(command):
             "returncode": process.returncode
         }
     except Exception as e:
-        return {"error": str(e)}
+        return _err("internal", str(e))
 
 def delete_file(filename):
     """删除workspace目录下的文件"""
@@ -264,9 +302,9 @@ def delete_file(filename):
         resolved.unlink()
         return {"success": f"文件 {filename} 删除成功"}
     except FileNotFoundError:
-        return {"error": f"文件 {filename} 不存在"}
+        return _err("not_found", f"文件 {filename} 不存在")
     except Exception as e:
-        return {"error": str(e)}
+        return _err("internal", str(e))
 
 def replace_in_file(filename, old_str, new_str):
     """在workspace文件中精确替换字符串。old_str必须唯一匹配，否则返回错误"""
@@ -277,19 +315,19 @@ def replace_in_file(filename, old_str, new_str):
     try:
         content = resolved.read_text(encoding='utf-8')
     except FileNotFoundError:
-        return {"error": f"文件 {filename} 不存在"}
+        return _err("not_found", f"文件 {filename} 不存在")
     except Exception as e:
-        return {"error": str(e)}
+        return _err("internal", str(e))
 
     count = content.count(old_str)
     if count == 0:
-        return {"error": f"在 {filename} 中未找到要替换的字符串"}
+        return _err("not_found", f"在 {filename} 中未找到要替换的字符串")
     if count > 1:
-        return {"error": (
+        return _err("invalid_args", (
             f"在 {filename} 中找到 {count} 处匹配，需唯一匹配。"
             "请在 old_str 中增加上下文行（前后多带几行代码）以确保唯一；"
             "或改用 replace_symbol 按函数/类名整体替换。"
-        )}
+        ))
 
     content = content.replace(old_str, new_str, 1)
     try:
@@ -302,7 +340,7 @@ def replace_in_file(filename, old_str, new_str):
             "new_str": new_str
         }
     except Exception as e:
-        return {"error": str(e)}
+        return _err("internal", str(e))
 
 def _get_ignore_spec():
     import pathspec
@@ -332,6 +370,7 @@ def list_files():
                 continue
             files.append(rel_path)
     return {"files": files}
+
 def move_file(src, dst):
     """移动文件从src到dst（相对于workspace）
     - 自动创建dst父目录
@@ -346,17 +385,17 @@ def move_file(src, dst):
         return err
 
     if not src_path.exists():
-        return {"error": f"Source file {src} does not exist"}
-    
+        return _err("not_found", f"Source file {src} does not exist")
+
     # Create dst parent directory
     dst_path.parent.mkdir(parents=True, exist_ok=True)
-    
+
     # Move file
     try:
         shutil.move(str(src_path), str(dst_path))
         return {"success": f"File moved from {src} to {dst} successfully"}
     except Exception as e:
-        return {"error": str(e)}
+        return _err("internal", str(e))
 
 def search_in_files(pattern, workspace=None, regex=False, extensions=None):
     """在workspace目录下搜索文件内容
@@ -383,9 +422,9 @@ def search_in_files(pattern, workspace=None, regex=False, extensions=None):
     
     try:
         if not abs_search_path.is_relative_to(abs_workspace):
-            return {"error": "Search path exceeds workspace directory"}
+            return _err("permission", "Search path exceeds workspace directory")
     except ValueError:
-        return {"error": "Search path exceeds workspace directory"}
+        return _err("permission", "Search path exceeds workspace directory")
     
     matches = []
     spec = _get_ignore_spec()
@@ -489,7 +528,7 @@ def get_symbol_definition(symbol_name, file_path=None):
             results.extend(_search_file(py_file))
 
     if not results:
-        return {"error": f"未找到符号 '{symbol_name}'"}
+        return _err("not_found", f"未找到符号 '{symbol_name}'")
     return {"matches": results, "total": len(results)}
 
 def apply_patch(patch_text, file_path=None):
@@ -508,7 +547,7 @@ def apply_patch(patch_text, file_path=None):
                 file_path = path
                 break
         if file_path is None:
-            return {"error": "无法从 patch 推断目标文件路径，请指定 file_path"}
+            return _err("invalid_args", "无法从 patch 推断目标文件路径，请指定 file_path")
 
     resolved, err = _validate_path(file_path)
     if err:
@@ -517,9 +556,9 @@ def apply_patch(patch_text, file_path=None):
     try:
         file_lines = resolved.read_text(encoding='utf-8').splitlines(keepends=True)
     except FileNotFoundError:
-        return {"error": f"文件 {file_path} 不存在"}
+        return _err("not_found", f"文件 {file_path} 不存在")
     except Exception as e:
-        return {"error": str(e)}
+        return _err("internal", str(e))
 
     hunk_re = re.compile(r'^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@')
     hunks = []
@@ -530,11 +569,11 @@ def apply_patch(patch_text, file_path=None):
         if m:
             old_start = int(m.group(1))
             if old_start < 1:
-                return {"error": f"补丁行号不合法: 行号 {old_start} < 1"}
+                return _err("invalid_args", f"补丁行号不合法: 行号 {old_start} < 1")
             if old_start > len(file_lines):
-                return {"error": f"补丁行号不合法: 起始行号 {old_start} > 文件总行数 {len(file_lines)}"}
+                return _err("invalid_args", f"补丁行号不合法: 起始行号 {old_start} > 文件总行数 {len(file_lines)}")
             if m.group(2) and old_start > int(m.group(2)):
-                return {"error": f"补丁行号不合法: start ({old_start}) > end ({int(m.group(2))})"}
+                return _err("invalid_args", f"补丁行号不合法: start ({old_start}) > end ({int(m.group(2))})")
 
             if current is not None:
                 hunks.append(current)
@@ -549,7 +588,7 @@ def apply_patch(patch_text, file_path=None):
         hunks.append(current)
 
     if not hunks:
-        return {"error": "patch 中未找到有效的 hunk"}
+        return _err("invalid_args", "patch 中未找到有效的 hunk")
 
     result = list(file_lines)
     offset = 0  # 已应用 hunk 导致的行号偏移
@@ -573,7 +612,7 @@ def apply_patch(patch_text, file_path=None):
         _invalidate_ast_cache(resolved)
         return {"success": f"patch 应用成功: {file_path}"}
     except Exception as e:
-        return {"error": str(e)}
+        return _err("internal", str(e))
 
 
 # ---------- #41 符号级编辑 ----------
@@ -597,7 +636,7 @@ def _load_ts_parser():
         _TS_PARSER = Parser(py_lang)
         return _TS_PARSER, None
     except ImportError:
-        return None, {"error": "tree-sitter 未安装，请运行: pip install tree-sitter tree-sitter-python"}
+        return None, _err("internal", "tree-sitter 未安装，请运行: pip install tree-sitter tree-sitter-python")
 
 
 def _invalidate_ast_cache(abs_path):
@@ -614,8 +653,10 @@ def _parse_symbols_cached(abs_path):
         return None, err
     try:
         mtime = abs_path.stat().st_mtime
+    except FileNotFoundError as e:
+        return None, _err("not_found", str(e))
     except Exception as e:
-        return None, {"error": str(e)}
+        return None, _err("internal", str(e))
 
     key = str(abs_path)
     cached = _AST_CACHE.get(key)
@@ -624,8 +665,10 @@ def _parse_symbols_cached(abs_path):
 
     try:
         src_bytes = abs_path.read_bytes()
+    except FileNotFoundError as e:
+        return None, _err("not_found", str(e))
     except Exception as e:
-        return None, {"error": str(e)}
+        return None, _err("internal", str(e))
 
     tree = parser.parse(src_bytes)
     symbols = []
@@ -671,8 +714,10 @@ def replace_symbol(symbol_name, new_code, file_path):
     try:
         src_bytes = resolved.read_bytes()
         content = resolved.read_text(encoding="utf-8")
+    except FileNotFoundError as e:
+        return _err("not_found", str(e))
     except Exception as e:
-        return {"error": str(e)}
+        return _err("internal", str(e))
 
     tree = parser.parse(src_bytes)
 
@@ -696,7 +741,7 @@ def replace_symbol(symbol_name, new_code, file_path):
 
     target = _find(tree.root_node)
     if target is None:
-        return {"error": f"未找到符号 '{symbol_name}'"}
+        return _err("not_found", f"未找到符号 '{symbol_name}'")
 
     start_line = target.start_point[0]   # 0-based
     end_line   = target.end_point[0]     # 0-based, inclusive
@@ -730,7 +775,7 @@ def replace_symbol(symbol_name, new_code, file_path):
             "lines_replaced": end_line - start_line + 1,
         }
     except Exception as e:
-        return {"error": str(e)}
+        return _err("internal", str(e))
 
 _WORKSPACE_SYMBOLS_IGNORE = {".git", ".yansh", "__pycache__", "node_modules", "venv", ".venv", ".pytest_cache"}
 
@@ -781,7 +826,13 @@ def fetch_webpage(url):
         text = soup.get_text(separator='\n', strip=True)
         return {"content": text[:3000]}
     except Exception as e:
-        return {"error": str(e)}
+        # 网络/HTTP 类错误一律视为 transient，让 LLM 自行决定 retry
+        msg = str(e).lower()
+        if "timeout" in msg or "timed out" in msg:
+            return _err("timeout", str(e))
+        if "invalid url" in msg or "missing schema" in msg or "no host" in msg:
+            return _err("invalid_args", str(e))
+        return _err("transient", str(e))
 
 def search_docs(query):
     """搜索文档，优先使用 ddgs（duckduckgo_search 新包名），返回前3条结果的标题+摘要+URL"""
@@ -867,7 +918,7 @@ def append_to_file(filename, content):
         _invalidate_ast_cache(resolved)
         return {"success": f"文件 {filename} 追加成功"}
     except Exception as e:
-        return {"error": str(e)}
+        return _err("internal", str(e))
 
 
 def glob_files(pattern, path="."):
@@ -925,11 +976,11 @@ def git_diff(path=None, staged=False):
         try:
             rel = str(resolved.relative_to(_WORKSPACE_ROOT)).replace("\\", "/")
         except ValueError:
-            return {"error": "path 越界"}
+            return _err("permission", "path 越界")
         args.append(rel)
     rc, stdout, stderr = _git_run_ws(args, timeout=15)
     if rc != 0 and not stdout:
-        return {"error": stderr.strip() or "git diff 失败（非 git 仓库？）"}
+        return _err("invalid_args", stderr.strip() or "git diff 失败（非 git 仓库？）")
     truncated = len(stdout) > 20000
     return {"diff": stdout[:20000], "truncated": truncated}
 
@@ -938,7 +989,7 @@ def git_log(limit=10):
     """git log --oneline -n <limit>"""
     rc, stdout, stderr = _git_run_ws(["log", "--oneline", f"-{int(limit)}"], timeout=10)
     if rc != 0:
-        return {"error": stderr.strip() or "git log 失败"}
+        return _err("invalid_args", stderr.strip() or "git log 失败")
     return {"log": stdout}
 
 

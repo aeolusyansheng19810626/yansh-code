@@ -294,15 +294,32 @@ TOOLS = [
                 "required": []
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "task_complete",
+            "description": "显式声明本次任务结束（fix/audit 循环识别后退出）。完成时调 task_complete(success=true, summary='做了什么')；确认无法继续时调 task_complete(success=false, summary='为什么放弃')。沉默退出（这一轮不调任何工具）= 默认成功，但显式声明更清晰。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "success": {"type": "boolean", "description": "true=任务完成；false=主动放弃"},
+                    "summary": {"type": "string", "description": "一句话说明做了什么或为什么放弃"}
+                },
+                "required": ["success", "summary"]
+            }
+        }
     }
 ]
 
 
 # 审计模式 / 只读人格使用的工具白名单。任何写/执行类工具都不应在此集合内。
+# task_complete 也加入——audit 流程也要靠它显式收尾。
 READONLY_TOOL_NAMES = {
     "read_file", "list_files", "glob_files", "search_in_files",
     "list_symbols", "get_symbol_definition", "find_references",
     "workspace_symbols",
     "git_diff", "git_log",
     "fetch_webpage", "search_docs",
+    "task_complete",
 }
