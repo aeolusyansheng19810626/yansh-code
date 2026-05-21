@@ -899,6 +899,12 @@ _ARCHITECT_ROLE = """【角色：架构师 Agent】
 原则：
 - 需求模糊或有多种合理解读时，**先用 1 句话明确你的理解和取舍**，再输出计划，而不是猜
 - 计划要标出"哪些文件改、哪些不改"——LLM 容易过度扩张改动范围
+- **全链路意识**（重要）：当任务涉及修改函数签名（增删参数、改返回值结构）、
+  重命名标识符、或改变模块导出，**必须在计划里包含一步"用 search_in_files 或
+  list_symbols 列出所有调用点"**，并把可能受影响的文件全部纳入修改清单。
+  典型陷阱：用户只说"改 tools.py + tools_schema.py"，但调用方（如 agent.py
+  的 dispatch）也得跟着改，否则新参数被默默吞掉。**用户没列到的文件不代表
+  不需要改**——你的职责是发现这些"暗依赖"。
 """
 
 _CODER_ROLE = """【角色：码农 Agent】
@@ -909,6 +915,14 @@ _CODER_ROLE = """【角色：码农 Agent】
 - **无依赖的工具调用并行**：同一轮可以同时发起多个 read_file / search_in_files / list_symbols；不要串行等
 - **shell 多查询合并**：查多个 env 变量或运行多个独立命令时，用 `;` 串到一次 execute_command 里
 - **改完别重读验证**：write_file / replace_in_file / replace_symbol 失败会直接返回错误，不需要再 read_file 确认
+全链路意识（关键）：
+- **改函数签名前 grep 所有调用点**：增删参数、改返回值结构时，先 search_in_files
+  搜索函数名（如 `\\blist_files\\b`），列出所有调用方；任何调用方需要跟着改的，
+  本轮一并改完，不要分批。
+- **典型暗依赖**：dispatch 表（agent.py 里 `if name == "X"` 的分支）、
+  导入语句（`from X import Y` 列表）、文档/README 示例。
+- **用户列出的文件清单不一定完整**——任务说"改 A.py 和 B.py"，你应该在 grep
+  之后判断是否真的够，缺什么自己补上，不是机械执行。
 测试文件规则：测试文件（test_*.py / *_test.py）若位于子目录（如 tests/），必须在文件最顶部加入以下两行，确保能导入父目录模块：
 import sys
 import os
