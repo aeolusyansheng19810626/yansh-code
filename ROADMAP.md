@@ -18,11 +18,32 @@
 
 已建：18 个工具、4 类角色、tree-sitter 符号索引（带 mtime 缓存）、HIL diff 确认、git 快照与回滚、任务日志、流式输出、ESC 中断、命令安全沙箱、--cwd 多项目支持。
 
+### 进度速览（2026-05-21）
+
+| # | 项目 | 状态 |
+|---|---|---|
+| P0 #1 | 分层符号索引 | 🟡 部分（单层在，分层未做） |
+| P0 #2 | Prompt 调优 | 🟢 活跃迭代 |
+| P0 #3 | 错误恢复闭环 | ⬜ 未着手 |
+| P1 #4 | JSON 解析健壮性 | 🟡 部分（基础校验在，retry 未做） |
+| P1 #5 | 全局状态重构 | ⬜ 未着手 |
+| P1 #6 | 沙箱模式 opt-in | ⬜ 未着手 |
+| P2 #7 | Plan Mode | ⬜ 未着手 |
+| P2 #8 | Skills 系统 | ⬜ 未着手 |
+| P2 #9 | 子 Agent | ⬜ 未着手 |
+| P2 #10 | MCP 协议 | ⬜ 未着手 |
+| P2 #11 | Hooks | ⬜ 未着手 |
+| P2 #12 | 跨 Session 记忆 | ⬜ 未着手 |
+
+每项的具体进度细节见对应章节顶部的「**进度（YYYY-MM-DD）**」行。维护方式：做了改动就回这里更新该行 + 速览表里的状态。
+
 ---
 
 ## 优先级 P0：从"玩具"到"真正能用"的分水岭
 
-### 1. 分层符号索引（大型项目支持）
+### 1. 分层符号索引（大型项目支持） 🟡 部分
+
+**进度（2026-05-21）**：单层 `workspace_symbols` + AST mtime 缓存已实现（commit `9ba0c47`）。分层下钻、`directory_summary(path)`、audit 不再预注入全量摘要——**未做**。
 
 **Claude Code 怎么做**：用户感知不到全局符号索引这种东西。Claude Code 在大项目里靠 `Glob` + `Grep` + 智能的"先看顶层目录，再按需深挖"——本质是**懒加载 + 信息收益最大化**。
 
@@ -42,7 +63,9 @@
 
 ---
 
-### 2. Prompt 调优（角色 + 工具描述）
+### 2. Prompt 调优（角色 + 工具描述） 🟢 活跃迭代
+
+**进度（2026-05-21）**：6 轮迭代笔记 [_01~_06](./notes/shadow/) + 多个 commit（`f2ac054` `cca5d03` `dbc25e2` `34f22ce`）：4 类任务模板、全链路意识、pre-existing 失败识别、部分写工具的反向警告。**待做**：系统性 few-shot；架构师层的 grep 强制；持续收集误用 case。
 
 **Claude Code 怎么做**：系统 prompt 精心调过——"how to be a great developer"级别的行为约束、错误恢复模式、何时问问题。每个工具 description 也调过：包括什么时候用、怎么避免误用、典型陷阱。
 
@@ -62,7 +85,9 @@
 
 ---
 
-### 3. 错误恢复闭环
+### 3. 错误恢复闭环 ⬜ 未着手
+
+**进度（2026-05-21）**：fix() / audit() 仍是硬上限轮数；没有 `task_complete()`、没有 `error_kind` 标准化。
 
 **Claude Code 怎么做**：工具失败 → LLM 看到错误 → 自然换路（换工具、换参数、问用户、放弃并报告原因）。整个 agent loop 没有硬性的"6 轮上限"——它通过其他机制（context 占用、用户中断、明确的"我做不了"声明）来收敛。
 
@@ -84,7 +109,9 @@
 
 ## 优先级 P1：长期工程健康
 
-### 4. JSON 解析健壮性（已部分做）
+### 4. JSON 解析健壮性 🟡 部分
+
+**进度（2026-05-21）**：Pydantic 校验 + 失败 log 已加（commit `fa9f991`）。**待做**：调研 ICA 网关 `response_format`、解析失败自动 retry 1 次。
 
 **Claude Code 怎么做**：tool calling 用的是 OpenAI 兼容的 function calling，schema 由后端校验。模型偶尔生成不合法 JSON 会被 SDK 层 retry。结构化输出走 strict json schema mode（OpenAI/Anthropic 都支持）。
 
@@ -103,7 +130,7 @@
 
 ---
 
-### 5. 全局状态重构
+### 5. 全局状态重构 ⬜ 未着手
 
 **Claude Code 怎么做**：每个 session 独立进程，session 内状态局部封装。多个 Claude Code 实例可以并行跑而互不干扰。
 
@@ -122,7 +149,9 @@
 
 ---
 
-### 6. 沙箱模式（opt-in）
+### 6. 沙箱模式（opt-in） ⬜ 未着手
+
+**进度（2026-05-21）**：已有命令安全沙箱（黑名单 + 未识别确认）。**待做**：`--sandbox docker` opt-in。
 
 **Claude Code 怎么做**：默认运行在用户机器上，但 IDE 集成时有 read-only file mode、explicit auth 提示。本身不强制 docker 沙箱。
 
@@ -145,7 +174,9 @@
 
 这些是"做了能学到核心设计、不做也不影响基本功能"的功能。每项可独立做。
 
-### 7. Plan Mode（真正的 plan，不是输出 JSON）
+### 7. Plan Mode（真正的 plan，不是输出 JSON） ⬜ 未着手
+
+**进度（2026-05-21）**：工具白名单机制已有（audit mode 复用）。**待做**："审核 → 批准 → 实施"状态机；plan 阶段禁用写工具。
 
 **Claude Code 怎么做**：进入 plan mode 后**禁用所有写工具**，LLM 只读探索、产出 markdown 计划，用户批准后才退出 plan mode 开始实施。
 
@@ -160,7 +191,7 @@
 
 ---
 
-### 8. Skills 系统
+### 8. Skills 系统 ⬜ 未着手
 
 **Claude Code 怎么做**：Skills 是用户自定义的 prompt 包，按用户输入或上下文自动触发。本质是**可复用的角色 + 工作流模板**。
 
@@ -179,7 +210,7 @@
 
 ---
 
-### 9. 子 Agent / 任务分派
+### 9. 子 Agent / 任务分派 ⬜ 未着手
 
 **Claude Code 怎么做**：`Task` 工具能派生子 agent，子 agent 有自己的 context window，结果作为单个消息回到主 agent。
 
@@ -194,7 +225,7 @@
 
 ---
 
-### 10. MCP 协议支持
+### 10. MCP 协议支持 ⬜ 未着手
 
 **Claude Code 怎么做**：原生支持 MCP（Model Context Protocol），用户能接入第三方工具服务器（Linear、Sentry、GitHub MCP 等）。
 
@@ -209,7 +240,7 @@
 
 ---
 
-### 11. Hooks
+### 11. Hooks ⬜ 未着手
 
 **Claude Code 怎么做**：用户能在 settings.json 配置事件钩子（PreToolUse / PostToolUse / Stop / UserPromptSubmit），命令行脚本响应事件。
 
@@ -224,7 +255,9 @@
 
 ---
 
-### 12. 跨 Session 持久记忆
+### 12. 跨 Session 持久记忆 ⬜ 未着手
+
+**进度（2026-05-21）**：有 `.agent_rules`（项目静态规则）+ task_log（任务历史）。**待做**：LLM 主动写的 memory；按相关性调取。
 
 **Claude Code 怎么做**：内置 memory 系统（你正在体验它），按类型分类（user/feedback/project/reference），对话间可调取。
 
