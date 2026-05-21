@@ -2,7 +2,7 @@
 
 ## 背景
 
-之前的三方公平对比（[fairness 笔记](./2026-05-21-fairness-and-max-depth.md)）发现：
+之前的三方公平对比（[fairness 笔记](./2026-05-21_03-fairness-and-max-depth.md)）发现：
 
 - **dispatch 漏修是 Anthropic Claude Code subagent 也有的共性盲区**
 - Opus 和 Sonnet subagent 都没主动检查 agent.py 里的 dispatch 表
@@ -82,7 +82,7 @@
 写 "dispatch 表（agent.py 里 `if name == "X"` 的分支）" 是具体名词，
 LLM 立刻有锚点知道要看什么。
 
-这是 [list-tools 笔记](./2026-05-21-list-tools.md) 里 Claude Code 那条
+这是 [list-tools 笔记](./2026-05-21_01-list-tools.md) 里 Claude Code 那条
 "Do NOT re-read a file you just edited" 的同型——**一句具体的反向警告**
 比一段抽象指南强 10 倍。
 

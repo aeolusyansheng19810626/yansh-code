@@ -2,7 +2,7 @@
 
 ## 背景
 
-A/B 对比 [list-tools 笔记](./2026-05-21-list-tools.md) 后做了第二轮 bug 修复对比，
+A/B 对比 [list-tools 笔记](./2026-05-21_01-list-tools.md) 后做了第二轮 bug 修复对比，
 发现 yansh 在 reviewer 环节死循环——但 coder 第一遍其实就修对了。
 
 进一步追问：**Claude Code 有 reviewer 这一步吗？** 答案是没有。
