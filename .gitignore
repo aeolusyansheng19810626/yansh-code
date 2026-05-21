@@ -5,3 +5,4 @@ __pycache__/
 workspace/
 .claude/
 .yansh/
+.yansh_history.json

@@ -1568,50 +1568,10 @@ def _run(requirement, mode):
     # code / auto（确认后）：生成代码 + 测试
     console.print("\n阶段2：生成代码")
     code(plan_result, mode=mode, requirement=original_requirement)
-    
-    # #48 Review Agent：在阶段2和阶段3之间进行代码审查
-    review_attempts = 0
-    max_review_attempts = 3
-    review_passed = False
-    last_review_result = None
-    while review_attempts < max_review_attempts:
-        review_result = review(original_requirement, _task_log_mod._task_files_modified)
-        last_review_result = review_result
-        if review_result.get("approved"):
-            console.print("代码审查通过！")
-            review_passed = True
-            break
-        else:
-            console.print(f"代码审查未通过 (尝试 {review_attempts + 1}/{max_review_attempts})")
-            issues = review_result.get("issues", [])
-            suggestions = review_result.get("suggestions", [])
-            for issue in issues:
-                console.print(f"- 问题: {issue}", style="red")
-            for sug in suggestions:
-                console.print(f"- 建议: {sug}", style="yellow")
 
-            # 使用 fix 逻辑修改代码
-            mock_test_result = {
-                "returncode": 1,
-                "stderr": "代码审查未通过：\n" + "\n".join(i if isinstance(i, str) else json.dumps(i, ensure_ascii=False) for i in issues) + "\n建议：\n" + "\n".join(s if isinstance(s, str) else json.dumps(s, ensure_ascii=False) for s in suggestions),
-                "stdout": ""
-            }
-            fix(mock_test_result, plan_result, reason="review_rejection")
-            review_attempts += 1
-
-    # 达到上限仍未通过：列出剩余问题，询问用户是否继续
-    if not review_passed:
-        _task_log_mod._current_task_log["review_failed"] = True
-        _task_log_mod._current_task_log["review_last"] = last_review_result or {}
-        remaining_issues = (last_review_result or {}).get("issues", [])
-        console.print("[审查未通过] 已达到最大尝试次数，以下问题未能自动修复：", style="bold yellow")
-        for issue in remaining_issues:
-            console.print(f"  - {issue}", style="red")
-        ans = _prompt("是否继续进入测试阶段？(y/n) ", default="n")
-        if ans != "y":
-            cleanup_snapshot(current_snapshot)
-            finish_task_log(False, 0, {"returncode": -1, "stdout": "", "stderr": "审查未通过，用户终止"})
-            return {"success": False, "test_result": {"returncode": -1, "stdout": "", "stderr": "审查未通过，用户终止"}}
+    # 砍掉独立的 reviewer agent 循环：对标 Claude Code 单 agent 设计——
+    # coder 自己负责"做+验证"，由后面的"测试与修复"循环承担质量把关。
+    # review() 函数保留为独立可调用工具（如未来加 /review skill 时复用）。
 
     console.print("\n阶段3：测试与修复")
     attempts = 0
