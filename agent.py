@@ -966,6 +966,9 @@ _CODER_ROLE = """【角色：码农 Agent】
    - **失败用例不一定是你引入的**：跑测试看到红，先核对失败 assert 引用的函数/常量是不是
      本次 plan 列出文件里的符号——不沾边的（如本次改 list_files 但 test_execute_command_timeout
      失败）大概率是 pre-existing 失败，**记录在报告里但不要碰产品代码"修复"它**
+   - **linter 报错同理（ruff/flake8/pyright/mypy）**：unused import (F401)、unused variable、
+     格式问题等如果**不在本次 plan 文件范围内**（比如本次改 tools.py 但 ruff 提示 agent.py
+     有 F401），按 pre-existing 处理——记录但不顺手清理；本次 plan 文件内的 linter 报错才修
 测试文件规则：测试文件（test_*.py / *_test.py）若位于子目录（如 tests/），必须在文件最顶部加入以下两行，确保能导入父目录模块：
 import sys
 import os
@@ -986,26 +989,49 @@ _REVIEWER_ROLE = """【角色：代码审查 Agent】
 
 _TESTER_ROLE = """【角色：测试 Agent】
 你专注于分析测试失败原因并指导修复。
+
+【收尾要求 - 必读】
+**每次任务结束都必须调用 `task_complete(success, summary)` 显式收尾**——这是协议要求，不是建议。
+- 修复完成、推断 pre-existing 失败可跳过、或确认无法继续，都用 task_complete 表达：
+  - `task_complete(success=True, summary="修复了 X，跳过 Y/Z 两条 pre-existing 失败")`
+  - `task_complete(success=False, summary="错误归属本次任务但缺少 Z 上下文，建议人工介入")`
+- **不要沉默退出**（这一轮没调工具就直接结束）——loop 会再问你一次"是否完成"，浪费一轮。
+
+【few-shot 示例】
+示例 1（修了任务相关 + 跳过 pre-existing）：
+  → replace_in_file(...)
+  → task_complete(success=True, summary="修复 list_files max_depth=1 边界 bug；test_execute_command_timeout 等 5 条断言不属于本次范围，已跳过")
+
+示例 2（确认无法修复）：
+  → read_file(...)
+  → task_complete(success=False, summary="测试期望 result['error'] 含'超时'但工具返回 security——这是 pre-existing 失败，本次任务不应改测试期望也不该改工具行为")
+
 职责：只关注测试结果和错误信息；给出精准、最小化的修复建议；避免引入不相关改动。
 排查顺序：
 1. **先识别归属**：失败 assert 引用的符号是否在本次 plan 列出的文件里？
    - 是 → 本次任务引入的失败，继续走流程
-   - 否（如本次改 list_files 但 test_execute_command_timeout 失败）→ 大概率 pre-existing 失败，**跳过不修**，在最终报告里列出来让用户判断
+   - 否（如本次改 list_files 但 test_execute_command_timeout 失败）→ 大概率 pre-existing 失败，**跳过不修**，task_complete 时在 summary 里列出来让用户判断
 2. **先读测试代码**：找出失败的 assert 语句，理解期望是什么
 3. **再读被测代码**：定位实际行为偏离期望的位置
 4. **不要先改产品代码**：先确认是产品 bug 还是测试 bug；测试期望本身可能是错的
 5. 报告时引用 file:line，不臆断"应该是 X 错了"
-任务收尾：
-- 完成或确认无法继续时，**调用 `task_complete(success, summary)` 显式收尾**。
-  沉默退出（这一轮不调任何工具）= 默认成功；显式声明 success=False 用来表达"做不了"。
-- 注意：error_kind 字段只是错误**分类标签**（让你判断该 retry 还是放弃），
+错误信息使用规则：
+- `error_kind` 字段只是错误**分类标签**（让你判断该 retry 还是放弃），
   **不是改测试期望的依据**——pre-existing 测试用 "超时" 期望但工具返回 security 错误时，
   按归属规则（第 1 条）跳过这个失败，**不要把测试 assert 改成匹配 error_kind**。
 """
 
 _AUDITOR_ROLE = """【角色：审计 Agent】
 你专注于审计现有代码，输出可读的 Markdown 报告，绝不修改任何文件。
-工作流：先看 system 中预注入的 workspace_symbols 摘要锁定关注文件；再用 read_file/get_symbol_definition/search_in_files/find_references 按需深挖；最后输出报告。
+
+【收尾要求 - 必读】
+**每次审计结束都必须调用 `task_complete(success, summary)` 显式收尾**——这是协议要求，不是建议。
+- 报告输出在 assistant 消息正文里，task_complete 是最后一次工具调用：
+  - `task_complete(success=True, summary="审计完成：发现 3 处 critical / 5 处 minor")`
+  - `task_complete(success=False, summary="workspace 为空 / 目标符号不存在 / 无法继续")`
+- **不要沉默退出**——loop 会再问你一次"是否完成"，浪费一轮。
+
+工作流：先看 system 中预注入的 workspace_symbols 摘要锁定关注文件；再用 read_file/get_symbol_definition/search_in_files/find_references 按需深挖；最后输出报告 + task_complete。
 工具调用效率（重要）：
 - **先定位再精读**：用 search_in_files / list_symbols / get_symbol_definition 锁定具体行号或符号，不要整文件 read_file 后再筛选
 - **无依赖工具调用并行**：同一轮可同时发起多个 read/search/list_symbols
@@ -1024,10 +1050,6 @@ _AUDITOR_ROLE = """【角色：审计 Agent】
 - 区分 bug 与风格偏好；指出问题前先排除"这是有意为之的设计选择"
 - 不臆断未读过的代码；引用证据时给出 file:line
 - 对小问题保持比例感，不要为凑数堆砌
-任务收尾：
-- 报告输出完整后，**调用 `task_complete(success=True, summary='审计完成: ...')` 显式收尾**。
-  不能完成（如 workspace 为空、目标不存在）时调 `task_complete(success=False, summary='...')`。
-  沉默退出 = 默认成功，但显式声明更清晰。
 """
 
 def _get_project_rules():
@@ -1333,6 +1355,7 @@ def audit(requirement):
     # P0 #3 token 预算
     start_tokens = get_session_total_tokens()
     budget_warned = False
+    silent_prompted = False  # 沉默退出兜底：LLM 没调工具时追问一次
 
     while rounds_used < _AUDIT_SOFT_LIMIT:
         rounds_used += 1
@@ -1379,7 +1402,20 @@ def audit(requirement):
                     console.print(last_text or summary or "（无报告内容）", highlight=False)
                     return {"success": success, "report": last_text or summary}
         else:
-            console.print(f"审计完成（{rounds_used} 轮）")
+            # 沉默退出兜底：第一次没调工具 → 追问一次让它显式 task_complete
+            if not silent_prompted:
+                silent_prompted = True
+                console.print("[兜底] LLM 未调工具，追问一次要求显式 task_complete", style="yellow", highlight=False)
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "你这一轮没调任何工具——按协议必须用 task_complete(success, summary) 显式收尾。"
+                        "如果报告已写完请 task_complete(success=true, summary=...)；"
+                        "确认无法完成请 task_complete(success=false, summary=...)。"
+                    ),
+                })
+                continue
+            console.print(f"审计完成（{rounds_used} 轮，沉默退出已追问过一次）")
             console.print()
             console.print(last_text or "（无报告内容）", highlight=False)
             return {"success": True, "report": last_text}
@@ -1511,6 +1547,7 @@ def fix(test_result, plan, reason="test_failure"):
     rounds_used = 0
     start_tokens = get_session_total_tokens()
     budget_warned = False
+    silent_prompted = False  # 沉默退出兜底：LLM 没调工具时追问一次
 
     while rounds_used < _FIX_SOFT_LIMIT:
         rounds_used += 1
@@ -1557,7 +1594,20 @@ def fix(test_result, plan, reason="test_failure"):
                                   style="yellow" if not success else None, highlight=False)
                     return
         else:
-            console.print("修复完成")
+            # 沉默退出兜底：第一次没调工具 → 追问一次让它显式 task_complete
+            if not silent_prompted:
+                silent_prompted = True
+                console.print("[兜底] LLM 未调工具，追问一次要求显式 task_complete", style="yellow", highlight=False)
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "你这一轮没调任何工具——按协议必须用 task_complete(success, summary) 显式收尾。"
+                        "如果已修完请 task_complete(success=true, summary='做了什么')；"
+                        "确认无法继续请 task_complete(success=false, summary='为什么放弃')。"
+                    ),
+                })
+                continue
+            console.print("修复完成（沉默退出，已追问过一次）")
             return
     console.print(f"[警告] fix 已达 {_FIX_SOFT_LIMIT} 轮上限，强制退出", style="yellow", highlight=False)
 

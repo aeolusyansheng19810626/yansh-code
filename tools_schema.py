@@ -299,7 +299,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "task_complete",
-            "description": "显式声明本次任务结束（fix/audit 循环识别后退出）。完成时调 task_complete(success=true, summary='做了什么')；确认无法继续时调 task_complete(success=false, summary='为什么放弃')。沉默退出（这一轮不调任何工具）= 默认成功，但显式声明更清晰。",
+            "description": "显式声明本次任务结束。**每次任务都必须以此工具收尾**（fix/audit loop 识别后退出）。完成时 task_complete(success=true, summary='做了什么')；确认无法继续时 task_complete(success=false, summary='为什么放弃')。不要沉默退出——没调任何工具时 loop 会再追问一次浪费一轮。",
             "parameters": {
                 "type": "object",
                 "properties": {
