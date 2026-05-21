@@ -359,17 +359,73 @@ def _prompt(msg: str, default: str = "y") -> str:
 REVIEW_MODEL = None  # None = 跟随写代码模型
 
 
+# ---------- LLM 结构化输出 schema（plan / review 用）----------
+
+from pydantic import BaseModel, ConfigDict, ValidationError, Field
+from typing import List, Optional, Union
+
+
+class PlanFile(BaseModel):
+    """plan() 输出中单个文件条目"""
+    model_config = ConfigDict(extra="allow")  # LLM 偶尔加额外字段，不当成错误
+    filename: str
+    intent: Optional[str] = ""
+    description: Optional[str] = ""
+
+
+class PlanResult(BaseModel):
+    """plan() 输出 schema。允许 files 元素是 dict 或裸字符串。"""
+    model_config = ConfigDict(extra="allow")
+    files: List[Union[PlanFile, str]] = Field(default_factory=list)
+    test_command: str = ""
+
+
+class ReviewResult(BaseModel):
+    """review() 输出 schema"""
+    model_config = ConfigDict(extra="allow")
+    approved: bool
+    issues: List[Union[str, dict]] = Field(default_factory=list)
+    suggestions: List[Union[str, dict]] = Field(default_factory=list)
+
+
+def _truncate(text: str, head: int = 400, tail: int = 200) -> str:
+    """截断长文本以便日志展示"""
+    if not text or len(text) <= head + tail:
+        return text or ""
+    return text[:head] + f"\n... (省略 {len(text) - head - tail} 字符) ...\n" + text[-tail:]
+
+
+def _log_json_failure(stage: str, raw_content: str, error: str) -> None:
+    """JSON 解析或 schema 校验失败时统一打印（替换原本的静默 pass）"""
+    console.print(
+        f"[警告] {stage} 输出 JSON 校验失败：{error}",
+        style="yellow", highlight=False,
+    )
+    console.print(
+        f"[原始内容] {_truncate(raw_content)}",
+        style="yellow", highlight=False,
+    )
+
+
 def _extract_json(text: str) -> str:
-    """从 LLM 响应中提取 JSON 字符串（兼容 markdown 代码块）"""
+    """从 LLM 响应中提取 JSON 字符串（兼容 markdown 代码块、顶层数组、顶层对象）"""
     import re
     text = text.strip()
     m = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
     if m:
         return _sanitize_json_strings(m.group(1).strip())
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        return _sanitize_json_strings(text[start:end + 1])
+    # 顶层数组 / 顶层对象：取最早出现的那个边界对
+    obj_start = text.find("{")
+    obj_end = text.rfind("}")
+    arr_start = text.find("[")
+    arr_end = text.rfind("]")
+    obj_ok = obj_start != -1 and obj_end > obj_start
+    arr_ok = arr_start != -1 and arr_end > arr_start
+    # 数组开头早于对象开头时，优先按数组截取
+    if arr_ok and (not obj_ok or arr_start < obj_start):
+        return _sanitize_json_strings(text[arr_start:arr_end + 1])
+    if obj_ok:
+        return _sanitize_json_strings(text[obj_start:obj_end + 1])
     return text
 
 
@@ -924,9 +980,21 @@ def plan(requirement):
     )
     console.print("[Agent: Architect]", highlight=False)
     system_prompt = f"""{_ARCHITECT_ROLE}{project_rules}
-你是一个代码规划助手。根据用户需求，返回JSON格式的计划，包含：
-- files：数组，每个元素为 {{"filename": "文件名", "description": "修改意图/需求说明"}}；对于已有文件只需填写修改意图，不要重复列出完整内容
-- test_command：测试命令
+你是一个代码规划助手。根据用户需求，返回严格符合以下 JSON Schema 的计划：
+
+{{
+  "files": [
+    {{"filename": "<相对路径>", "description": "<修改意图>"}}
+  ],
+  "test_command": "<执行测试的命令>"
+}}
+
+完整示例：
+{{"files": [{{"filename": "add.py", "description": "实现 add(a,b) 函数"}}, {{"filename": "tests/test_add.py", "description": "覆盖正常/边界用例"}}], "test_command": "python tests/test_add.py"}}
+
+字段约束：
+- files 元素必填 filename；description 描述本次修改意图（不要包含完整代码）
+- 对已有文件只描述要追加/修改什么，不要重新创建
 
 注意目录结构：实现文件放workspace/根目录（如add.py），测试文件必须放workspace/tests/目录（如tests/test_add.py）。
 filename 字段只填相对路径，不要加 "workspace/" 前缀，正确示例：hello.py、tests/test_hello.py；错误示例：workspace/hello.py。
@@ -952,16 +1020,48 @@ test_command 禁止使用 python -c 内联执行（会被安全策略拦截）�
         {"role": "user", "content": user_content}
     ]
     response = call_llm(messages, response_format={"type": "json_object"})
-    content = response.choices[0].message.content
-    if not content:
-        content = "{}"
-    try:
-        result = json.loads(_extract_json(content))
-        if isinstance(result, list):
-            return {"files": result, "test_command": ""}
-        return result
-    except json.JSONDecodeError:
+    content = response.choices[0].message.content or ""
+    return _parse_plan_response(content)
+
+
+def _parse_plan_response(content: str) -> dict:
+    """解析 plan() 的 LLM 响应。失败时 log raw 内容（不静默 pass），返回空 plan。"""
+    if not content.strip():
+        _log_json_failure("plan", content, "LLM 返回空内容")
         return {"files": [], "test_command": ""}
+    extracted = _extract_json(content)
+    try:
+        raw = json.loads(extracted)
+    except json.JSONDecodeError as e:
+        _log_json_failure("plan", content, f"json.loads 失败：{e}")
+        return {"files": [], "test_command": ""}
+
+    # 兼容 LLM 直接返回数组的旧形态
+    if isinstance(raw, list):
+        raw = {"files": raw, "test_command": ""}
+    if not isinstance(raw, dict):
+        _log_json_failure("plan", content, f"顶层不是 dict/list，而是 {type(raw).__name__}")
+        return {"files": [], "test_command": ""}
+
+    try:
+        validated = PlanResult(**raw)
+    except ValidationError as e:
+        _log_json_failure("plan", content, f"schema 校验失败：{e.errors()}")
+        # 校验失败仍返回原 dict，让下游尽力处理（向后兼容）
+        return raw
+
+    # 序列化回 plain dict（与历史行为保持兼容：files 元素可能是 str 或 dict）
+    files_out = []
+    for f in validated.files:
+        if isinstance(f, PlanFile):
+            d = f.model_dump()
+            # 兼容：旧代码读 description；保留 intent 别名
+            if d.get("description") and not d.get("intent"):
+                d["intent"] = d["description"]
+            files_out.append(d)
+        else:
+            files_out.append(f)
+    return {"files": files_out, "test_command": validated.test_command}
 
 def code(plan, mode="auto", requirement=""):
     """根据计划逐个文件生成/修改代码。文件已存在优先用replace_in_file做精确修改；不存在则用write_file新建。"""
@@ -1188,18 +1288,47 @@ def review(requirement, modified_files):
         else:
             response = call_llm(messages, stream=True)
         content = response.choices[0].message.content or ""
-        return json.loads(_extract_json(content))
-    except json.JSONDecodeError as e:
-        return {
-            "approved": False,
-            "issues": [f"review_error: LLM 返回非 JSON（{e}）"],
-            "suggestions": [],
-        }
+        return _parse_review_response(content)
     except Exception as e:
         return {
             "approved": False,
             "issues": [f"review_error: {e}"],
             "suggestions": [],
+        }
+
+
+def _parse_review_response(content: str) -> dict:
+    """解析 review() 的 LLM 响应。失败时 log raw 并把错误带回 issues。"""
+    if not content.strip():
+        _log_json_failure("review", content, "LLM 返回空内容")
+        return {"approved": False,
+                "issues": ["review_error: LLM 返回空内容"],
+                "suggestions": []}
+    extracted = _extract_json(content)
+    try:
+        raw = json.loads(extracted)
+    except json.JSONDecodeError as e:
+        _log_json_failure("review", content, f"json.loads 失败：{e}")
+        return {"approved": False,
+                "issues": [f"review_error: LLM 返回非 JSON（{e}）"],
+                "suggestions": []}
+
+    if not isinstance(raw, dict):
+        _log_json_failure("review", content, f"顶层不是 dict，而是 {type(raw).__name__}")
+        return {"approved": False,
+                "issues": [f"review_error: 顶层非 dict"],
+                "suggestions": []}
+
+    try:
+        validated = ReviewResult(**raw)
+        return validated.model_dump()
+    except ValidationError as e:
+        _log_json_failure("review", content, f"schema 校验失败：{e.errors()}")
+        # 兜底：尽力按字段类型抢救
+        return {
+            "approved": bool(raw.get("approved", False)),
+            "issues": list(raw.get("issues", [])) or [f"review_error: schema 校验失败"],
+            "suggestions": list(raw.get("suggestions", [])),
         }
 
 def fix(test_result, plan, reason="test_failure"):
