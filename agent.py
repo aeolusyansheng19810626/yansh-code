@@ -1064,6 +1064,17 @@ def _dispatch_tool_call_inner(tool_call, args, *, mode="auto", allow_hil=True,
     if name == "list_files":
         return {"name": name, "args": args, "id": tool_call.id, "result": list_files()}
     if name in readonly_handlers:
+        # P0 安全：audit/plan 上下文下，dispatch_subagent 强制降级为只读 role——
+        # 否则 LLM 调 dispatch_subagent(role="general") 派出的子 agent 会用 dispatch_mode="auto"
+        # 拿到全工具集（含 write_file / execute_command），绕过 audit 的"只读承诺"。
+        if name == "dispatch_subagent" and mode == "audit":
+            req_role = args.get("role", "explorer")
+            if req_role not in ("explorer", "auditor"):
+                console.print(
+                    f"[security] audit 上下文：子 agent role '{req_role}' 强制降级为 'auditor'",
+                    style="yellow", highlight=False,
+                )
+                args["role"] = "auditor"
         try:
             result = readonly_handlers[name](**args)
         except Exception as e:

@@ -632,6 +632,146 @@ def test_subagent_stats_lock_concurrent_increments(tmp_path):
         assert stats["total_steps"] >= N
 
 
+# ---------- P0-1 安全：audit 模式强制降级 subagent role ----------
+
+def test_audit_mode_forces_general_subagent_to_auditor(tmp_path):
+    """audit 父 mode 下，LLM 调 dispatch_subagent(role='general') → 自动降级为 auditor。
+    这是 P0 安全修复：否则 audit 的"只读承诺"被绕过（general 子 agent 拿全工具集）。
+    """
+    captured = {}
+
+    def fake_run_subagent(task, role="explorer", max_steps=8):
+        captured["role"] = role
+        return {"success": True, "summary": "ok", "steps": 1, "role": role}
+
+    with state.scoped_session(tmp_path):
+        orig = agent._run_subagent
+        try:
+            agent._run_subagent = fake_run_subagent
+            tc = _mk_tool_call("s1", "dispatch_subagent",
+                               {"task": "写 pwned.txt", "role": "general"})
+            out = agent._dispatch_tool_call(tc, mode="audit",
+                                             allow_hil=False, allow_confirm=False)
+        finally:
+            agent._run_subagent = orig
+
+    # role 已被降级
+    assert captured["role"] == "auditor", (
+        f"audit 模式下 general 应被降级为 auditor，实际收到 {captured.get('role')}"
+    )
+    # tool result 反映降级后的 role
+    assert out["result"]["role"] == "auditor"
+
+
+def test_audit_mode_keeps_explorer_role_unchanged(tmp_path):
+    """audit 模式 + role='explorer'：本就是只读，不动。"""
+    captured = {}
+
+    def fake_run_subagent(task, role="explorer", max_steps=8):
+        captured["role"] = role
+        return {"success": True, "summary": "ok", "steps": 1, "role": role}
+
+    with state.scoped_session(tmp_path):
+        orig = agent._run_subagent
+        try:
+            agent._run_subagent = fake_run_subagent
+            tc = _mk_tool_call("s1", "dispatch_subagent",
+                               {"task": "查 X", "role": "explorer"})
+            agent._dispatch_tool_call(tc, mode="audit",
+                                       allow_hil=False, allow_confirm=False)
+        finally:
+            agent._run_subagent = orig
+
+    assert captured["role"] == "explorer"
+
+
+def test_audit_mode_keeps_auditor_role_unchanged(tmp_path):
+    """audit 模式 + role='auditor'：本就是只读，不动。"""
+    captured = {}
+
+    def fake_run_subagent(task, role="explorer", max_steps=8):
+        captured["role"] = role
+        return {"success": True, "summary": "ok", "steps": 1, "role": role}
+
+    with state.scoped_session(tmp_path):
+        orig = agent._run_subagent
+        try:
+            agent._run_subagent = fake_run_subagent
+            tc = _mk_tool_call("s1", "dispatch_subagent",
+                               {"task": "审计", "role": "auditor"})
+            agent._dispatch_tool_call(tc, mode="auto",
+                                       allow_hil=False, allow_confirm=False)
+        finally:
+            agent._run_subagent = orig
+
+    assert captured["role"] == "auditor"
+
+
+def test_non_audit_mode_keeps_general_role(tmp_path):
+    """auto/code 模式（非 audit）下不降级——general 子 agent 应拿到全工具集。
+    防止 P0 修复过度——只有 audit 上下文才该降级，正常 code/fix 流不受影响。
+    """
+    captured = {}
+
+    def fake_run_subagent(task, role="explorer", max_steps=8):
+        captured["role"] = role
+        return {"success": True, "summary": "ok", "steps": 1, "role": role}
+
+    with state.scoped_session(tmp_path):
+        orig = agent._run_subagent
+        try:
+            agent._run_subagent = fake_run_subagent
+            tc = _mk_tool_call("s1", "dispatch_subagent",
+                               {"task": "写代码", "role": "general"})
+            agent._dispatch_tool_call(tc, mode="auto",
+                                       allow_hil=False, allow_confirm=False)
+        finally:
+            agent._run_subagent = orig
+
+    assert captured["role"] == "general", "auto 模式不该降级"
+
+
+def test_audit_mode_subagent_cannot_write_file_e2e(tmp_path):
+    """端到端：audit 父 mode → LLM 调 dispatch_subagent(role='general') →
+    子 agent 真跑 LLM loop → 子 agent 试图调 write_file 应被 audit 模式拦截。
+
+    这是 P0-1 完整链路验证：role 降级 → 子 agent 内 dispatch_mode=audit →
+    write_file 被 _dispatch_tool_call_inner:916 拦截。
+    """
+    pwned_target = tmp_path / "pwned.txt"
+
+    with state.scoped_session(tmp_path):
+        # 子 agent 的 fake LLM：第一轮试图 write_file，第二轮收到错误后 task_complete
+        sub_call_count = {"n": 0}
+
+        def fake_sub_llm(msgs, **kw):
+            sub_call_count["n"] += 1
+            if sub_call_count["n"] == 1:
+                return _mk_resp(tool_calls=[
+                    ("w1", "write_file",
+                     {"filename": "pwned.txt", "content": "owned"}),
+                ])
+            return _mk_resp(tool_calls=[
+                ("tc", "task_complete",
+                 {"success": False, "summary": "write 被拒"}),
+            ])
+
+        orig = agent.call_llm
+        try:
+            agent.call_llm = fake_sub_llm
+            tc = _mk_tool_call("s1", "dispatch_subagent",
+                               {"task": "写 pwned.txt", "role": "general", "max_steps": 4})
+            out = agent._dispatch_tool_call(tc, mode="audit",
+                                             allow_hil=False, allow_confirm=False)
+        finally:
+            agent.call_llm = orig
+
+    # 子 agent role 已被强制降级
+    assert out["result"]["role"] == "auditor"
+    # 文件没被写
+    assert not pwned_target.exists(), "audit 链路被绕过——pwned.txt 被写出来了"
+
+
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, "-v"])
