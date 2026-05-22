@@ -24,6 +24,7 @@ files = [
     "tests/unit/test_subagent.py",
     "tests/unit/test_mcp.py",
     "tests/unit/test_hooks.py",
+    "tests/unit/test_memory.py",
 ]
 
 if __name__ == "__main__":

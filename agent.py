@@ -20,6 +20,7 @@ from tools import (
     find_references, glob_files, git_diff, git_log, workspace_symbols,
     directory_summary, delete_file, task_complete,
     update_plan_draft, exit_plan_mode_signal, dispatch_subagent,
+    save_memory, recall_memory,
 )
 import interrupt
 import tools as _tools_mod
@@ -75,6 +76,9 @@ _PLAN_HISTORY: list = []   # plan 模式独立对话历史（不混入 conversat
 # P2 #8 Skills：当前任务/对话激活的 skill prompt 片段。run() 入口算一次写入；
 # plan/code/audit/fix 各自的 system prompt 末尾拼这个变量。空字符串=无命中。
 _ACTIVE_SKILLS_PROMPT: str = ""
+
+# P2 #12 Memory 索引（每次 run 入口刷新；plan/code/audit/fix system prompt 拼接）
+_ACTIVE_MEMORY_INDEX: str = ""
 
 # P2 #9 子 Agent：递归防护 + 进程级累计 stats（用于 /subagent stats 命令）。
 # stats 是 process 生命周期的累加，不参与 Session.snapshot/restore（重启清零无所谓）。
@@ -1053,6 +1057,9 @@ def _dispatch_tool_call_inner(tool_call, args, *, mode="auto", allow_hil=True,
         "exit_plan_mode_signal": exit_plan_mode_signal,
         # P2 #9 子 Agent：handler 内嵌套跑独立 LLM loop，递归被 _IN_SUBAGENT 锁住
         "dispatch_subagent": _subagent_handler,
+        # P2 #12 跨 Session 记忆：写读 .yansh/memory/ 不动 workspace 代码
+        "save_memory": save_memory,
+        "recall_memory": recall_memory,
     }
     if name == "list_files":
         return {"name": name, "args": args, "id": tool_call.id, "result": list_files()}
@@ -1428,6 +1435,8 @@ test_command 禁止使用 python -c 内联执行（会被安全策略拦截）�
 注意：不要重复创建已有文件，尽量基于已有文件做增量修改。对已有文件只描述要追加/修改什么。"""
     if _ACTIVE_SKILLS_PROMPT:
         system_prompt += _ACTIVE_SKILLS_PROMPT
+    if _ACTIVE_MEMORY_INDEX:
+        system_prompt += _ACTIVE_MEMORY_INDEX
     # #50 若有待注入图片，构造 vision content（消费后清空）
     user_text = f"需求：{requirement}"
     if _pending_images:
@@ -1547,6 +1556,8 @@ def code(plan, mode="auto", requirement=""):
 - 每次调用 replace_in_file 只修改一处，如有多处修改需要多次调用"""
             if _ACTIVE_SKILLS_PROMPT:
                 sys_prompt += _ACTIVE_SKILLS_PROMPT
+            if _ACTIVE_MEMORY_INDEX:
+                sys_prompt += _ACTIVE_MEMORY_INDEX
         else:
             console.print(f"{filename} 是新建文件...")
             req_block = f"\n原始需求（必须严格遵守，包括变量名、库名、API key 名称等技术细节）：\n{requirement}\n" if requirement else ""
@@ -1561,6 +1572,8 @@ def code(plan, mode="auto", requirement=""):
 注意：必须使用 write_file 写入文件，文件名严格使用 `{filename}`，不要修改路径或添加目录前缀。"""
             if _ACTIVE_SKILLS_PROMPT:
                 sys_prompt += _ACTIVE_SKILLS_PROMPT
+            if _ACTIVE_MEMORY_INDEX:
+                sys_prompt += _ACTIVE_MEMORY_INDEX
 
         # 构建消息
         user_content = f"当前文件：{filename}\n修改意图：{intent}"
@@ -1662,6 +1675,8 @@ def audit(requirement):
     sys_prompt = f"{_AUDITOR_ROLE}{_get_project_rules()}\n\n{symbols_brief}"
     if _ACTIVE_SKILLS_PROMPT:
         sys_prompt += _ACTIVE_SKILLS_PROMPT
+    if _ACTIVE_MEMORY_INDEX:
+        sys_prompt += _ACTIVE_MEMORY_INDEX
     messages = [
         {"role": "system", "content": sys_prompt},
         {"role": "user", "content": f"审计需求：{requirement}"}
@@ -1853,6 +1868,14 @@ def plan_chat(user_input: str) -> str:
                               highlight=False)
     except Exception:
         pass
+    # P2 #12 Memory：plan_chat 独立扫索引
+    try:
+        import memory as _mem_mod
+        mem_idx = _mem_mod.load_memory_index(_get_workspace())
+        if mem_idx:
+            sys_prompt += mem_idx
+    except Exception:
+        pass
     if _PLAN_DRAFT:
         sys_prompt += f"\n\n【当前 plan 草稿】\n{_PLAN_DRAFT}"
 
@@ -1987,6 +2010,14 @@ def _build_subagent_system_prompt(role: str) -> str:
                 f"\n\nworkspace 顶层结构（{ws.get('total_files', 0)} 顶层文件 / "
                 f"{ws.get('total_symbols', 0)} 顶层符号）：\n" + "\n".join(lines)
             )
+    except Exception:
+        pass
+    # P2 #12 Memory：子 agent 也能看到索引并 recall（READONLY 白名单含 save/recall_memory）
+    try:
+        import memory as _mem_mod
+        mem_idx = _mem_mod.load_memory_index(_get_workspace())
+        if mem_idx:
+            sp += mem_idx
     except Exception:
         pass
     return sp
@@ -2269,11 +2300,15 @@ def fix(test_result, plan, reason="test_failure"):
         sys_role = f"{_TESTER_ROLE}\n{_get_project_rules()}你是代码审查修复助手。请严格按审查意见逐条修复，每条对应一次 replace_in_file 精确修改。不要改与审查意见无关的代码。"
         if _ACTIVE_SKILLS_PROMPT:
             sys_role += _ACTIVE_SKILLS_PROMPT
+        if _ACTIVE_MEMORY_INDEX:
+            sys_role += _ACTIVE_MEMORY_INDEX
     else:
         content = f"测试失败！\n错误输出：\n{error_info}\n\n计划：{json.dumps(plan)}"
         sys_role = f"{_TESTER_ROLE}\n{_get_project_rules()}你是代码修复助手。根据错误信息精准修复代码，优先使用 replace_in_file 做最小化修改，必要时才用 write_file 重写整个文件。"
         if _ACTIVE_SKILLS_PROMPT:
             sys_role += _ACTIVE_SKILLS_PROMPT
+        if _ACTIVE_MEMORY_INDEX:
+            sys_role += _ACTIVE_MEMORY_INDEX
 
     messages = [
         {"role": "system", "content": sys_role},
@@ -2472,7 +2507,7 @@ def _run(requirement, mode):
     init_task_log(requirement, mode)
 
     # P2 #8 Skills：每次 run() 入口扫描 + 匹配 skill；后续 plan/code/audit/fix 共用 _ACTIVE_SKILLS_PROMPT
-    global _ACTIVE_SKILLS_PROMPT
+    global _ACTIVE_SKILLS_PROMPT, _ACTIVE_MEMORY_INDEX
     try:
         import skills as _skills_mod
         prompt_frag, matched = _skills_mod.load_and_format(
@@ -2485,6 +2520,17 @@ def _run(requirement, mode):
     except Exception as e:
         _ACTIVE_SKILLS_PROMPT = ""
         console.print(f"[skills] 加载失败（不影响主流程）：{e}", style="yellow", highlight=False)
+
+    # P2 #12 Memory：每次 run() 入口加载 MEMORY.md 索引
+    try:
+        import memory as _mem_mod
+        _ACTIVE_MEMORY_INDEX = _mem_mod.load_memory_index(_get_workspace())
+        if _ACTIVE_MEMORY_INDEX:
+            n_total = len(_mem_mod.discover_memories(_get_workspace()))
+            console.print(f"[memory] 加载 {n_total} 条索引", highlight=False)
+    except Exception as e:
+        _ACTIVE_MEMORY_INDEX = ""
+        console.print(f"[memory] 加载失败（不影响主流程）：{e}", style="yellow", highlight=False)
 
     # audit 模式：完全独立路径，不进 plan/code/review/fix
     if mode == "audit":

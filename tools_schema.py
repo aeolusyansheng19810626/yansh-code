@@ -323,6 +323,58 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "save_memory",
+            "description": "[跨 Session 记忆] 把一个值得长期记住的事实写进持久 memory，下次启动 yansh 仍能调取。\n\n何时主动调：\n- 用户明确说\"记住 X\" / \"以后都按 Y 来\"\n- 发现用户偏好 / 工作风格（type=user）\n- 用户给了反馈纠正你（type=feedback；body 末尾建议加 'Why:' / 'How to apply:' 两行）\n- 项目背景 / 关键决策 / 不会变的事实（type=project）\n- 重要外部资源 URL / 文档链接（type=reference）\n\n何时不要写：\n- 当下这次任务的细节（用 task_complete summary 即可）\n- 代码里能查到的信息（README / git log / 函数定义）\n- 已有的 memory 已经覆盖（先 recall_memory 看是否重复）\n\nname 用 kebab-case slug，descripition 是一行索引（决定下次调取相关性）；body 是事实本体。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "kebab-case slug，唯一标识；同名会覆盖。例：'user-prefers-vim'、'project-uses-pytest'"
+                    },
+                    "type": {
+                        "type": "string",
+                        "enum": ["user", "feedback", "project", "reference"],
+                        "description": "user=用户是谁/偏好；feedback=用户反馈如何工作；project=项目背景/决策；reference=外部资源指针"
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "一行索引（≤80 字符）。下次启动 LLM 看到这行决定要不要 recall_memory 拉详情"
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "memory 主体（markdown）。feedback/project 建议带 'Why: ...' 和 'How to apply: ...' 两行"
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["project", "global"],
+                        "description": "project=只对当前项目生效（<ws>/.yansh/memory/，跟代码库走）；global=跨项目（~/.yansh/memory/）。默认 project。"
+                    }
+                },
+                "required": ["name", "type", "description", "body"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "recall_memory",
+            "description": "[跨 Session 记忆] 按 name 读一条 memory 完整内容。system prompt 里只给索引（一行 description），看到相关索引时调这个拉详情——不要凭印象猜。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "memory 的 name slug（系统 prompt 索引里给出的）"
+                    }
+                },
+                "required": ["name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "dispatch_subagent",
             "description": "派发一个独立子 agent 跑子任务，返回 summary 字符串。**核心价值：context 隔离**——子 agent 烧自己的 context 跑探索，主 agent 只看到一段总结。\n\n用法场景：\n- 大型代码库探索（'查 X 模块怎么用的，列出所有调用点'）\n- 重活：跑测试 + 修复 + 复测整套（role='general'）\n- **多分支并行调研**——一次 response 里发多个 dispatch_subagent tool_call，会**并发跑**（最多 4 个同时），总耗时≈max(单个) 而不是 sum。例：分析 A/B/C 三个模块怎么用，一次发 3 个 dispatch_subagent 比串行查快 3×。\n\n约束：\n- 子 agent **不能再派子 agent**（递归被禁，避免失控）\n- 子 agent 的工具集按 role 限定\n- max_steps 上限 16，超出即截断\n\n何时不要用：单文件读 / 一次 grep 这种简单任务直接调底层工具更便宜——dispatch_subagent 多一次 LLM cascade 起步就 1k+ token。",
             "parameters": {
@@ -405,4 +457,8 @@ READONLY_TOOL_NAMES = {
     # P2 #9：派子 agent 不直接修改 workspace（子 agent role=explorer 时也是只读），
     # 所以加进 READONLY 让 audit/plan 也能用。子 agent 内部不再看到这个工具（递归禁用）。
     "dispatch_subagent",
+    # P2 #12：memory 写的是 .yansh/memory/ 不是 workspace 代码，
+    # audit / plan / explorer 子 agent 都该能写——比如 audit 跑出"这个项目用 pytest"
+    # 这种 project memory 自然该沉淀
+    "save_memory", "recall_memory",
 }

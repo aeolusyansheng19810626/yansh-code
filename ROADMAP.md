@@ -33,7 +33,7 @@
 | P2 #9 | 子 Agent | 🟢 完成（dispatch_subagent + role 切工具集 + 禁递归 + 多个并发跑 + /subagent stats） |
 | P2 #10 | MCP 协议 | 🟢 完成（stdio 传输 + tools/list+call + mcp.json 兼容 + /mcp 命令） |
 | P2 #11 | Hooks | 🟢 完成（4 事件 + block/modify + shell stdin/stdout + 跨平台超时杀进程树） |
-| P2 #12 | 跨 Session 记忆 | ⬜ 未着手 |
+| P2 #12 | 跨 Session 记忆 | 🟢 完成（4 type + 双路径 + MEMORY.md 索引注入 + LLM 主动 save_memory/recall_memory） |
 
 每项的具体进度细节见对应章节顶部的「**进度（YYYY-MM-DD）**」行。维护方式：做了改动就回这里更新该行 + 速览表里的状态。
 
@@ -359,9 +359,25 @@
 
 ---
 
-### 12. 跨 Session 持久记忆 ⬜ 未着手
+### 12. 跨 Session 持久记忆 🟢 完成
 
-**进度（2026-05-21）**：有 `.agent_rules`（项目静态规则）+ task_log（任务历史）。**待做**：LLM 主动写的 memory；按相关性调取。
+**进度（2026-05-22）**：笔记 [_22](./notes/shadow/2026-05-22_22-memory.md)。
+- `memory.py` 新模块：Memory dataclass + 双路径扫描（项目级覆盖全局）+ save/delete + 索引自动维护
+- 4 type 对齐 Claude Code：user / feedback / project / reference
+- 文件格式：frontmatter（含 metadata.type 嵌套）+ markdown body；约定 feedback/project body 末尾带 Why / How to apply
+- MEMORY.md 索引每个目录一份，每行 `- [type] name — description`，session 启动时自动注入 system prompt
+- 工具：save_memory / recall_memory 加进 TOOLS + READONLY 白名单（写的是 .yansh/memory/，不是 workspace 代码）
+- agent.py 集成：5 个 system prompt 注入点 + plan_chat 独立扫 + 子 agent system prompt 也加索引
+- main.py：/memory list / show / delete 命令
+
+**集成验证（端到端跨 Session）**：
+- Session 1（Python 进程 A）让子 agent 真调 save_memory 写 project-uses-pytest 到 workspace/.yansh/memory/
+- Session 2（**全新 Python 进程 B**）启动后 MEMORY.md 索引自动注入 system prompt → LLM 看到调 recall_memory 拉完整内容（含 Why / How to apply 全保留）
+- 这是"重启不丢"的硬证据，不是"同进程内存里能存"。
+
+**核心 prompt 调优**：schema description 必须写"**何时不要写**"——光说要写不说不要写 LLM 会写一堆没用的。
+
+**单测**：tests/unit/test_memory.py 31 条全过；run_unit.py 16 文件全过。
 
 **Claude Code 怎么做**：内置 memory 系统（你正在体验它），按类型分类（user/feedback/project/reference），对话间可调取。
 

@@ -66,6 +66,35 @@ def exit_plan_mode_signal(reason: str = "") -> dict:
     }
 
 
+def save_memory(name: str, type: str, description: str, body: str,
+                scope: str = "project") -> dict:
+    """[P2 #12] 写一条跨 session memory。LLM 主动调——遇到值得长期记住的事实就写。
+    透传到 memory.save_memory（避免 tools 模块依赖 LLM 模块；workspace_dir 这里取）。
+    """
+    import memory as _mem
+    return _mem.save_memory(
+        name=name, type=type, description=description, body=body,
+        scope=scope, workspace_dir=_get_workspace(),
+    )
+
+
+def recall_memory(name: str) -> dict:
+    """[P2 #12] 按 name 读一条 memory 的完整内容。索引在 system prompt 里给了，
+    LLM 看到相关索引调这个工具拉详情——不要凭印象猜。
+    """
+    import memory as _mem
+    mem = _mem.find_memory(name, workspace_dir=_get_workspace())
+    if mem is None:
+        return {"error": f"memory 不存在: {name}"}
+    return {
+        "name": mem.name,
+        "type": mem.type,
+        "description": mem.description,
+        "scope": mem.scope,
+        "body": mem.body,
+    }
+
+
 def dispatch_subagent(task: str, role: str = "explorer", max_steps: int = 8) -> dict:
     """[P2 #9] Sentinel：LLM 调时返回标记，由 agent._subagent_handler 拦截并实际执行。
 

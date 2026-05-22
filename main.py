@@ -36,6 +36,7 @@ _SLASH_COMMANDS = [
     ("/subagent", "子 Agent 统计：/subagent stats"),
     ("/mcp",      "MCP servers：/mcp list | /mcp tools [name]"),
     ("/hooks",    "Hooks 配置：/hooks list（查 hooks.json）"),
+    ("/memory",   "跨 Session 记忆：/memory list | show <name> | delete <name>"),
 ]
 
 
@@ -514,6 +515,52 @@ def main():
                     console.print(hit.body, highlight=False)
             else:
                 console.print("用法：/skill list | /skill show <name>", highlight=False)
+            continue
+
+        # P2 #12 Memory 命令
+        if user_input == "/memory" or user_input.startswith("/memory "):
+            import memory as _mem_mod
+            parts = user_input.split(maxsplit=2)
+            sub = parts[1] if len(parts) > 1 else "list"
+            if sub == "list":
+                items = _mem_mod.list_all(WORKSPACE_DIR)
+                if not items:
+                    console.print(f"[memory] 无记忆。LLM 调 save_memory 主动写，或在 {WORKSPACE_DIR}/.yansh/memory/ 或 ~/.yansh/memory/ 手写", highlight=False)
+                else:
+                    by_scope = {"project": [], "global": []}
+                    for it in items:
+                        by_scope[it["scope"]].append(it)
+                    console.print(f"\n[bold cyan]=== Memory ({len(items)} 条) ===[/bold cyan]", highlight=False)
+                    for scope, lst in by_scope.items():
+                        if not lst:
+                            continue
+                        console.print(f"\n[{scope}] ({len(lst)} 条)", highlight=False)
+                        for it in lst:
+                            console.print(f"  [{it['type']}] {it['name']} — {it['description']}", highlight=False)
+            elif sub == "show" and len(parts) >= 3:
+                target = parts[2]
+                mem = _mem_mod.find_memory(target, WORKSPACE_DIR)
+                if mem is None:
+                    console.print(f"未找到 memory: {target}", highlight=False)
+                else:
+                    console.print(f"\n[bold cyan]=== {mem.name} ({mem.scope}/{mem.type}) ===[/bold cyan]", highlight=False)
+                    console.print(f"description: {mem.description}", highlight=False)
+                    console.print(f"source: {mem.source_path}\n", highlight=False)
+                    console.print(mem.body, highlight=False)
+            elif sub == "delete" and len(parts) >= 3:
+                target = parts[2]
+                # 默认先项目级删；不存在再全局
+                r = _mem_mod.delete_memory(target, scope="project",
+                                            workspace_dir=WORKSPACE_DIR)
+                if "error" in r:
+                    r = _mem_mod.delete_memory(target, scope="global",
+                                                workspace_dir=WORKSPACE_DIR)
+                if "error" in r:
+                    console.print(f"[memory] 删除失败：{r['error']}", style="yellow", highlight=False)
+                else:
+                    console.print(f"[memory] 已删除 {r['name']} ({r['scope']})", highlight=False)
+            else:
+                console.print("用法：/memory list | /memory show <name> | /memory delete <name>", highlight=False)
             continue
 
         # P2 #11 Hooks 命令（仅查看；编辑直接改 hooks.json）
