@@ -26,4 +26,14 @@ dependencies = [
 yansh = "main:main"
 
 [tool.setuptools]
-py-modules = ["main", "agent", "tools", "config", "monitor", "interrupt", "snapshot", "hil", "task_log", "linter", "llm_client", "tools_schema"]
+py-modules = [
+    "main", "agent", "tools", "config", "monitor", "interrupt",
+    "snapshot", "hil", "task_log", "linter", "llm_client", "tools_schema",
+    # P1-P4 新增模块（遗漏会导致 pip install 的 yansh 启动 ModuleNotFoundError）
+    "state", "sandbox",
+    "skills",
+    "mcp_client",
+    "hooks", "procutil", "workspace_trust",
+    "memory",
+    "frontmatter", "subagent",
+]
