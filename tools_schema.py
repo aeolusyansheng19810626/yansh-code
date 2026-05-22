@@ -324,7 +324,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "dispatch_subagent",
-            "description": "派发一个独立子 agent 跑子任务，返回 summary 字符串。**核心价值：context 隔离**——子 agent 烧自己的 context 跑探索，主 agent 只看到一段总结。\n\n用法场景：\n- 大型代码库探索（'查 X 模块怎么用的，列出所有调用点'）\n- 重活：跑测试 + 修复 + 复测整套（role='general'）\n- 多分支调研同时进行（多个 dispatch_subagent 并行）\n\n约束：\n- 子 agent **不能再派子 agent**（递归被禁，避免失控）\n- 子 agent 的工具集按 role 限定\n- max_steps 上限 16，超出即截断\n\n何时不要用：单文件读 / 一次 grep 这种简单任务直接调底层工具更便宜——dispatch_subagent 多一次 LLM cascade 起步就 1k+ token。",
+            "description": "派发一个独立子 agent 跑子任务，返回 summary 字符串。**核心价值：context 隔离**——子 agent 烧自己的 context 跑探索，主 agent 只看到一段总结。\n\n用法场景：\n- 大型代码库探索（'查 X 模块怎么用的，列出所有调用点'）\n- 重活：跑测试 + 修复 + 复测整套（role='general'）\n- **多分支并行调研**——一次 response 里发多个 dispatch_subagent tool_call，会**并发跑**（最多 4 个同时），总耗时≈max(单个) 而不是 sum。例：分析 A/B/C 三个模块怎么用，一次发 3 个 dispatch_subagent 比串行查快 3×。\n\n约束：\n- 子 agent **不能再派子 agent**（递归被禁，避免失控）\n- 子 agent 的工具集按 role 限定\n- max_steps 上限 16，超出即截断\n\n何时不要用：单文件读 / 一次 grep 这种简单任务直接调底层工具更便宜——dispatch_subagent 多一次 LLM cascade 起步就 1k+ token。",
             "parameters": {
                 "type": "object",
                 "properties": {

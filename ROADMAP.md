@@ -30,7 +30,7 @@
 | P1 #6 | 沙箱模式 opt-in | 🟢 完成（--sandbox docker[:image]，仅包 execute_command） |
 | P2 #7 | Plan Mode | 🟢 完成（方案 C：session 级 flag + 多轮探索 + /approve） |
 | P2 #8 | Skills 系统 | 🟢 完成（关键字匹配 + LLM 智能匹配双路径，fast path 零成本） |
-| P2 #9 | 子 Agent | 🟢 完成（dispatch_subagent + role 切工具集 + 禁递归 + /subagent stats） |
+| P2 #9 | 子 Agent | 🟢 完成（dispatch_subagent + role 切工具集 + 禁递归 + 多个并发跑 + /subagent stats） |
 | P2 #10 | MCP 协议 | ⬜ 未着手 |
 | P2 #11 | Hooks | ⬜ 未着手 |
 | P2 #12 | 跨 Session 记忆 | ⬜ 未着手 |
@@ -276,14 +276,17 @@
 
 ### 9. 子 Agent / 任务分派 🟢 完成
 
-**进度（2026-05-22）**：笔记 [_18](./notes/shadow/2026-05-22_18-subagent.md)。
+**进度（2026-05-22）**：笔记 [_18](./notes/shadow/2026-05-22_18-subagent.md) + [_19](./notes/shadow/2026-05-22_19-subagent-concurrent.md)。
 - `dispatch_subagent(task, role, max_steps)` 工具：role enum `["explorer","general","auditor"]`，独立 messages list / 独立 system prompt / context 完全隔离
-- 防递归：物理隔离（子 agent 工具集中删除 dispatch_subagent）+ `_IN_SUBAGENT` flag 双重保险
+- 防递归：物理隔离（子 agent 工具集中删除 dispatch_subagent）+ thread-local in_subagent flag 双重保险
+- **多个 subagent 一次发并发跑**（_19）：`_dispatch_tool_calls` helper 用 ThreadPoolExecutor，cap=4；只对 dispatch_subagent 并发，本地工具仍串行；outs 按原顺序拼回 messages（OpenAI 协议要求）
 - main.py 加 `/subagent stats` 命令查累计调用次数 / 步数 / 最近一次任务
 
-**集成验证**：让 audit() 主 agent 派 explorer 子 agent 查 _dispatch_tool_call 函数。子 agent 用 2 步给出精准签名（含类型注解），主 agent **直接基于 200 字 summary** 给出审计结论（"未知工具抛 ValueError"），全程**没有直接 read_file**——节约 ~10× token。
+**集成验证**：
+1. 让 audit() 主 agent 派 explorer 子 agent 查 _dispatch_tool_call 函数。子 agent 用 2 步给出精准签名（含类型注解），主 agent **直接基于 200 字 summary** 给出审计结论（"未知工具抛 ValueError"），全程**没有直接 read_file**——节约 ~10× token。
+2. 并发基准：3 个完全独立 subagent 任务串行 33.3s，并发 13.9s，**加速比 2.4×**（理论上限 3×；差距来自 prompt cache miss + ICA 网关 token 速率限制）。
 
-**单测**：tests/unit/test_subagent.py 22 条全过；run_unit.py 13 文件全过。
+**单测**：tests/unit/test_subagent.py 29 条全过；run_unit.py 13 文件全过。
 
 **Claude Code 怎么做**：`Task` 工具能派生子 agent，子 agent 有自己的 context window，结果作为单个消息回到主 agent。
 

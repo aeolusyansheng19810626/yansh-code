@@ -76,7 +76,11 @@ _ACTIVE_SKILLS_PROMPT: str = ""
 
 # P2 #9 子 Agent：递归防护 + 进程级累计 stats（用于 /subagent stats 命令）。
 # stats 是 process 生命周期的累加，不参与 Session.snapshot/restore（重启清零无所谓）。
-_IN_SUBAGENT: bool = False
+#
+# P2 #9b 并发：_IN_SUBAGENT 用 threading.local——多个线程同时跑子 agent 时各自独立。
+# 注意：_run_subagent 内的递归防护本质靠"工具集物理过滤 dispatch_subagent"——
+# threading.local 的 flag 只是一道额外保险（同一线程内不能再派子 agent）。
+_subagent_state = threading.local()
 _SUBAGENT_STATS: dict = {
     "calls": 0,
     "total_steps": 0,
@@ -86,8 +90,20 @@ _SUBAGENT_STATS: dict = {
     "last_steps": 0,
     "last_success": False,
 }
+_SUBAGENT_STATS_LOCK = threading.Lock()   # 并发更新计数器
 # 子 agent loop 上限——max_steps 参数会被 clamp 到 [1, _SUBAGENT_HARD_CAP]。
 _SUBAGENT_HARD_CAP: int = 16
+# 同时并发的子 agent 上限（thread pool size 上限）。
+_SUBAGENT_CONCURRENCY_CAP: int = 4
+
+
+def _is_in_subagent() -> bool:
+    """当前线程是否处于子 agent 执行中（防递归）"""
+    return bool(getattr(_subagent_state, "in_subagent", False))
+
+
+def _set_in_subagent(value: bool) -> None:
+    _subagent_state.in_subagent = bool(value)
 
 # 对话历史管理
 conversation_history = []
@@ -982,6 +998,68 @@ def _record_dispatch(out: dict, msgs: list):
         "content": json.dumps(out["result"]),
     })
 
+
+def _dispatch_tool_calls(tool_calls, *, mode, allow_hil, allow_confirm, snap, messages,
+                         console_label: str = "") -> list:
+    """[P2 #9b] 批跑一次 LLM 返回的多个 tool_calls。
+
+    精准并发策略：**只对 dispatch_subagent 用 ThreadPoolExecutor 并发**——
+    本地工具（read/grep/list_files）几毫秒，并发开销得不偿失；
+    写工具必须串行（HIL/confirm 顺序依赖、console 输出可读）；
+    子 agent 是唯一长耗时（多轮 LLM call），并发收益最大。
+
+    返回 outs 列表（按原 tool_calls 顺序），并已按顺序拼回 messages——
+    OpenAI tool_calls 协议要求 tool result 顺序与 tool_calls 顺序一致。
+    """
+    n = len(tool_calls)
+    if n == 0:
+        return []
+    outs: list = [None] * n
+
+    # 找出 dispatch_subagent 的 index 集合
+    sub_indices = [i for i, tc in enumerate(tool_calls)
+                   if tc.function.name == "dispatch_subagent"]
+
+    # ≥2 个子 agent：并发跑（用 thread pool）
+    if len(sub_indices) >= 2:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        prefix = f"{console_label} " if console_label else ""
+        console.print(
+            f"{prefix}[subagent 并发] {len(sub_indices)} 个子 agent 同时启动",
+            highlight=False,
+        )
+        max_workers = min(len(sub_indices), _SUBAGENT_CONCURRENCY_CAP)
+        with ThreadPoolExecutor(max_workers=max_workers,
+                                thread_name_prefix="yansh-subagent") as ex:
+            futs = {
+                ex.submit(_dispatch_tool_call, tool_calls[i],
+                          mode=mode, allow_hil=allow_hil,
+                          allow_confirm=allow_confirm, snap=snap): i
+                for i in sub_indices
+            }
+            for fut in as_completed(futs):
+                idx = futs[fut]
+                try:
+                    outs[idx] = fut.result()
+                except Exception as e:
+                    outs[idx] = {
+                        "name": tool_calls[idx].function.name,
+                        "args": {}, "id": tool_calls[idx].id,
+                        "result": _tools_mod._err("internal", f"并发 dispatch 异常: {e}"),
+                    }
+
+    # 串行处理剩余（含单个 subagent 的情况、所有非 subagent 工具）
+    for i, tc in enumerate(tool_calls):
+        if outs[i] is None:
+            outs[i] = _dispatch_tool_call(tc, mode=mode, allow_hil=allow_hil,
+                                          allow_confirm=allow_confirm, snap=snap)
+
+    # 按原顺序拼回 messages（OpenAI 协议要求 tool_call_id 与顺序一致）
+    for out in outs:
+        _record_dispatch(out, messages)
+
+    return outs
+
 # ---------- #26 Linter / #27 项目类型检测：已迁移至 linter.py ----------
 
 def run_linter():
@@ -1420,10 +1498,13 @@ def code(plan, mode="auto", requirement=""):
             msgs.append(response_message)
 
             if response_message.tool_calls:
+                outs = _dispatch_tool_calls(
+                    response_message.tool_calls, mode=mode,
+                    allow_hil=True, allow_confirm=True, snap=_CURRENT_SNAPSHOT,
+                    messages=msgs, console_label="",
+                )
                 _early_exit_inner = False  # 收到 task_complete sentinel 时用来跳出 inner while
-                for tool_call in response_message.tool_calls:
-                    out = _dispatch_tool_call(tool_call, mode=mode, snap=_CURRENT_SNAPSHOT)
-                    _record_dispatch(out, msgs)
+                for out in outs:
                     # P0 #3 sentinel：Coder 主动声明任务结束
                     if out["result"].get("_task_complete"):
                         _success = bool(out["result"].get("success"))
@@ -1539,10 +1620,12 @@ def audit(requirement):
 
         if msg.tool_calls:
             console.print(f"审计轮 {rounds_used}: {len(msg.tool_calls)} 次工具调用")
-            for tc in msg.tool_calls:
-                out = _dispatch_tool_call(tc, mode="audit", allow_hil=False, allow_confirm=False, snap=None)
-                _record_dispatch(out, messages)
-                # P0 #3 sentinel：LLM 主动声明任务结束
+            outs = _dispatch_tool_calls(
+                msg.tool_calls, mode="audit", allow_hil=False, allow_confirm=False,
+                snap=None, messages=messages, console_label=f"审计轮 {rounds_used}",
+            )
+            # P0 #3 sentinel：LLM 主动声明任务结束（多个 tool_call 并发后统一扫一遍）
+            for out in outs:
                 if out["result"].get("_task_complete"):
                     success = bool(out["result"].get("success"))
                     summary = out["result"].get("summary", "")
@@ -1712,10 +1795,12 @@ def plan_chat(user_input: str) -> str:
 
         if msg.tool_calls:
             console.print(f"[plan 轮 {rounds_used}] {len(msg.tool_calls)} 次工具调用", highlight=False)
+            outs = _dispatch_tool_calls(
+                msg.tool_calls, mode="audit", allow_hil=False, allow_confirm=False,
+                snap=None, messages=messages, console_label=f"plan 轮 {rounds_used}",
+            )
             done = False
-            for tc in msg.tool_calls:
-                out = _dispatch_tool_call(tc, mode="audit", allow_hil=False, allow_confirm=False, snap=None)
-                _record_dispatch(out, messages)
+            for out in outs:
                 # plan 草稿更新
                 if out["result"].get("_plan_draft_update"):
                     _PLAN_DRAFT = out["result"].get("content", "")
@@ -1822,11 +1907,12 @@ def _run_subagent(task: str, role: str = "explorer", max_steps: int = 8) -> dict
     """跑一个子 agent，返回 {"success": bool, "summary": str, "steps": int, "role": str}.
 
     上下文完全隔离：独立 messages list，独立 sentinel 检测；不污染父 agent。
-    防递归：进入时设 _IN_SUBAGENT=True，子 agent 看不到 dispatch_subagent 工具（双重保险）。
+    防递归：进入时设 thread-local in_subagent=True，子 agent 看不到 dispatch_subagent 工具（双重保险）。
+    并发：多个线程同时跑 _run_subagent 互不干扰（threading.local + stats 锁）。
     """
-    global _IN_SUBAGENT, _SUBAGENT_STATS
+    global _SUBAGENT_STATS
 
-    if _IN_SUBAGENT:
+    if _is_in_subagent():
         return {"success": False,
                 "summary": "子 agent 不能再派子 agent（递归被禁用）。请在父 agent 直接做。",
                 "steps": 0, "role": role}
@@ -1849,7 +1935,7 @@ def _run_subagent(task: str, role: str = "explorer", max_steps: int = 8) -> dict
     steps = 0
     silent_prompted = False
 
-    _IN_SUBAGENT = True
+    _set_in_subagent(True)
     try:
         while steps < max_steps_clamped:
             steps += 1
@@ -1866,11 +1952,15 @@ def _run_subagent(task: str, role: str = "explorer", max_steps: int = 8) -> dict
             })
 
             if msg.tool_calls:
+                # 子 agent 内部本就看不到 dispatch_subagent 工具（工具集物理过滤），
+                # 所以并发逻辑实际不会触发——但用 helper 保持一致性
+                outs = _dispatch_tool_calls(
+                    msg.tool_calls, mode=dispatch_mode,
+                    allow_hil=False, allow_confirm=False, snap=None,
+                    messages=messages, console_label="",
+                )
                 done = False
-                for tc in msg.tool_calls:
-                    out = _dispatch_tool_call(tc, mode=dispatch_mode,
-                                              allow_hil=False, allow_confirm=False, snap=None)
-                    _record_dispatch(out, messages)
+                for out in outs:
                     if out["name"] == "task_complete":
                         success = bool(out["result"].get("success"))
                         summary = str(out["result"].get("summary") or "")
@@ -1891,19 +1981,20 @@ def _run_subagent(task: str, role: str = "explorer", max_steps: int = 8) -> dict
                     summary = msg.content
                 break
     finally:
-        _IN_SUBAGENT = False
+        _set_in_subagent(False)
 
     if not summary:
         summary = "（子 agent 未声明 task_complete，已截断）"
 
-    # 更新 stats（截断防止历史污染日志）
-    _SUBAGENT_STATS["calls"] += 1
-    _SUBAGENT_STATS["total_steps"] += steps
-    _SUBAGENT_STATS["last_task"] = (task or "")[:200]
-    _SUBAGENT_STATS["last_summary"] = summary[:500]
-    _SUBAGENT_STATS["last_role"] = role
-    _SUBAGENT_STATS["last_steps"] = steps
-    _SUBAGENT_STATS["last_success"] = success
+    # 更新 stats（截断防止历史污染日志）；并发场景需加锁保证计数器原子
+    with _SUBAGENT_STATS_LOCK:
+        _SUBAGENT_STATS["calls"] += 1
+        _SUBAGENT_STATS["total_steps"] += steps
+        _SUBAGENT_STATS["last_task"] = (task or "")[:200]
+        _SUBAGENT_STATS["last_summary"] = summary[:500]
+        _SUBAGENT_STATS["last_role"] = role
+        _SUBAGENT_STATS["last_steps"] = steps
+        _SUBAGENT_STATS["last_success"] = success
 
     return {"success": success, "summary": summary, "steps": steps, "role": role}
 
@@ -2099,13 +2190,14 @@ def fix(test_result, plan, reason="test_failure"):
 
         if response_message.tool_calls:
             console.print(f"执行 {len(response_message.tool_calls)} 个修复操作...")
-            for tool_call in response_message.tool_calls:
-                # fix 阶段不弹覆盖确认（已经是修复路径，再问无意义），但仍允许 HIL
-                out = _dispatch_tool_call(
-                    tool_call, mode="code", allow_hil=True, allow_confirm=False, snap=_CURRENT_SNAPSHOT
-                )
-                _record_dispatch(out, messages)
-                # P0 #3 sentinel：LLM 主动声明任务结束
+            # fix 阶段不弹覆盖确认（已经是修复路径，再问无意义），但仍允许 HIL
+            outs = _dispatch_tool_calls(
+                response_message.tool_calls, mode="code",
+                allow_hil=True, allow_confirm=False, snap=_CURRENT_SNAPSHOT,
+                messages=messages, console_label="",
+            )
+            for out in outs:
+                # P0 #3 sentinel：LLM 主动声明任务结束（多个 tool_call 并发后统一扫一遍）
                 if out["result"].get("_task_complete"):
                     success = bool(out["result"].get("success"))
                     summary = out["result"].get("summary", "")
