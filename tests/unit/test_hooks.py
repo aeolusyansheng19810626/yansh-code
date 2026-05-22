@@ -493,6 +493,59 @@ def test_list_configured_returns_summary(tmp_path, monkeypatch):
     assert "Stop" in out
 
 
+# ---------- P2-2 stdout 大小上限 ----------
+
+def test_run_one_hook_stdout_size_cap_kills_runaway_hook(tmp_path):
+    """失控 hook 输出大量 stdout → 应被 cap 截断 + kill_tree 清掉，
+    不会把整个进程内存撑爆。"""
+    import time as _time
+    import sys as _sys
+
+    py = _sys.executable.replace("\\", "/")
+    # 写一个会无限输出 stdout 的 Python 脚本
+    runaway_script = tmp_path / "runaway.py"
+    runaway_script.write_text(
+        # 写 5 MB 数据（远超 1 MB cap），不响应 stdin，不退出
+        "import sys\n"
+        "for _ in range(5000):\n"
+        "    sys.stdout.write('A' * 1024)\n"
+        "    sys.stdout.flush()\n"
+        "import time\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+
+    # 构造 hook 配置
+    h = {"command": f'{py} "{runaway_script}"', "timeout": 30}
+
+    t0 = _time.time()
+    result = hooks._run_one_hook(h, payload={"event": "test"})
+    elapsed = _time.time() - t0
+
+    # 应该触发 size cap 错误，而非 timeout
+    assert "_hook_error" in result, f"应返回 _hook_error，实际 {result}"
+    err = result["_hook_error"]
+    assert "上限" in err or "cap" in err.lower() or "超过" in err, \
+        f"错误信息应提示大小上限，实际：{err}"
+    # 不应等到 timeout（30s）——cap 命中后立即返回
+    assert elapsed < 10, f"cap 触发不及时：{elapsed:.2f}s（应 < 10s）"
+
+
+def test_run_one_hook_normal_output_under_cap_works(tmp_path):
+    """正常大小 hook 输出（< cap）应被完整接收"""
+    import sys as _sys
+    py = _sys.executable.replace("\\", "/")
+    script = tmp_path / "normal.py"
+    script.write_text(
+        'import json\nprint(json.dumps({"system_message": "hello"}))\n',
+        encoding="utf-8",
+    )
+    h = {"command": f'{py} "{script}"', "timeout": 5}
+    result = hooks._run_one_hook(h, payload={"event": "test"})
+    assert "_hook_error" not in result, f"正常 hook 不应报错：{result}"
+    assert result.get("system_message") == "hello"
+
+
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, "-v"])

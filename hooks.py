@@ -62,6 +62,10 @@ from typing import Optional
 _VALID_EVENTS = ("PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop")
 _DEFAULT_TIMEOUT_SEC = 10
 _HOOKS_DISABLED = False  # 测试 / 批处理可临时关掉
+# P2 安全：hook stdout/stderr 大小上限，防失控 hook OOM。
+# 1 MB 远高于正常 hook 用量（典型 < 1 KB）但能挡住意外/恶意的几百 MB 输出。
+_HOOK_STDOUT_CAP = 1 * 1024 * 1024
+_HOOK_STDERR_CAP = 256 * 1024
 
 
 def set_disabled(disabled: bool) -> None:
@@ -154,57 +158,87 @@ def _run_one_hook(hook: dict, payload: dict, cwd: Optional[str] = None) -> dict:
     timeout = max(1, int(hook.get("timeout", _DEFAULT_TIMEOUT_SEC)))
     stdin_text = json.dumps(payload, ensure_ascii=False)
 
-    popen_kwargs = dict(
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        shell=True,
-        cwd=cwd,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    # 平台相关：开新进程组/任务对象，这样超时时能一并 kill 孙进程
-    if _sys.platform == "win32":
-        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-    else:
-        popen_kwargs["start_new_session"] = True   # POSIX：开新 session 便于 killpg
-
+    # P2 重构：spawn + kill_tree 走 procutil，逻辑跟 mcp_client 共用
+    from procutil import spawn_with_pgroup as _spawn, kill_tree as _kill_tree
     try:
-        proc = subprocess.Popen(cmd, **popen_kwargs)
+        proc = _spawn(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=True,
+            cwd=cwd,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
     except Exception as e:
         return {"_hook_error": f"hook 启动失败: {e}"}
 
-    try:
-        stdout, stderr = proc.communicate(input=stdin_text, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        # 平台相关 kill
-        try:
-            if _sys.platform == "win32":
-                # taskkill /T /F 杀进程树（包括 cmd.exe 派生的孙进程）
-                subprocess.run(
-                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                    capture_output=True, timeout=3,
-                )
-            else:
-                import os as _os
-                import signal as _signal
-                _os.killpg(_os.getpgid(proc.pid), _signal.SIGKILL)
-        except Exception:
-            pass
-        # wait 一下避免僵尸
-        try:
-            proc.communicate(timeout=2)
-        except Exception:
-            pass
-        return {"_hook_error": f"hook 超时 {timeout}s: {cmd}"}
-    except Exception as e:
-        try:
-            proc.kill()
-        except Exception:
-            pass
-        return {"_hook_error": f"hook IO 异常: {e}"}
+    # P2 安全：手动循环读 + size cap，防 communicate 把失控 hook 的几百 MB
+    # stdout 全读进内存导致 OOM。读到 cap 立即 kill_tree。
+    import threading as _threading
+    import time as _time
+    stdout_buf: list = []
+    stderr_buf: list = []
+    cap_exceeded = _threading.Event()
 
+    def _write_stdin():
+        try:
+            if proc.stdin:
+                proc.stdin.write(stdin_text)
+                proc.stdin.close()
+        except Exception:
+            pass
+
+    def _read_stream(stream, buf, cap):
+        total = 0
+        if stream is None:
+            return
+        try:
+            while True:
+                chunk = stream.read(4096)
+                if not chunk:
+                    break
+                buf.append(chunk)
+                total += len(chunk)
+                if total > cap:
+                    cap_exceeded.set()
+                    break
+        except Exception:
+            pass
+
+    t_in = _threading.Thread(target=_write_stdin, daemon=True)
+    t_out = _threading.Thread(
+        target=_read_stream, args=(proc.stdout, stdout_buf, _HOOK_STDOUT_CAP), daemon=True)
+    t_err = _threading.Thread(
+        target=_read_stream, args=(proc.stderr, stderr_buf, _HOOK_STDERR_CAP), daemon=True)
+    t_in.start(); t_out.start(); t_err.start()
+
+    deadline = _time.time() + timeout
+    while _time.time() < deadline:
+        if cap_exceeded.is_set():
+            break
+        if not t_out.is_alive() and not t_err.is_alive():
+            break
+        _time.sleep(0.05)
+
+    if cap_exceeded.is_set():
+        _kill_tree(proc)
+        return {"_hook_error": f"hook 输出超过 {_HOOK_STDOUT_CAP} bytes 上限：{cmd}"}
+
+    if t_out.is_alive() or t_err.is_alive():
+        # 超时
+        _kill_tree(proc)
+        return {"_hook_error": f"hook 超时 {timeout}s: {cmd}"}
+
+    # 正常退出——等进程收尾
+    try:
+        proc.wait(timeout=2)
+    except Exception:
+        pass
+
+    stdout = "".join(stdout_buf)
     out = (stdout or "").strip()
     if not out:
         return {}   # 空输出 = allow

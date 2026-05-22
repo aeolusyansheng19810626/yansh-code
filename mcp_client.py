@@ -21,6 +21,7 @@ import os
 import subprocess
 import sys as _sys
 import threading
+from collections import deque
 from pathlib import Path
 from typing import Optional
 
@@ -65,7 +66,9 @@ class MCPServer:
         self._reader_thread: Optional[threading.Thread] = None
         self._stderr_thread: Optional[threading.Thread] = None
         self._initialized = False
-        self.stderr_buffer: list = []   # 最近的 stderr 行，用于报错诊断
+        # P2-5：deque(maxlen=50) 自动淘汰旧元素，避免 list.pop(0) 与读取的 race。
+        # 读 stderr_buffer[-3:] / list(stderr_buffer) 在 deque 上都安全。
+        self.stderr_buffer: deque = deque(maxlen=50)
 
     # ---------- 生命周期 ----------
 
@@ -74,25 +77,21 @@ class MCPServer:
         if self.proc is not None:
             raise RuntimeError(f"server {self.name} 已启动")
         full_env = {**os.environ, **self.env}
-        # P1 安全：开新进程组，shutdown 时能 kill 整棵进程树。
-        # 否则 npx → node → mcp-server.js 这条链上的孙进程会变孤儿。
-        popen_kwargs = dict(
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=full_env,
-            cwd=self.cwd,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,   # line-buffered
-        )
-        if _sys.platform == "win32":
-            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-        else:
-            popen_kwargs["start_new_session"] = True
+        # P1 安全：开新进程组，shutdown 时能 kill 整棵进程树（procutil 处理）
         try:
-            self.proc = subprocess.Popen([self.command, *self.args], **popen_kwargs)
+            from procutil import spawn_with_pgroup
+            self.proc = spawn_with_pgroup(
+                [self.command, *self.args],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=full_env,
+                cwd=self.cwd,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,   # line-buffered
+            )
         except FileNotFoundError as e:
             raise RuntimeError(f"找不到命令 {self.command!r}：{e}")
         # reader 线程读 stdout（JSON-RPC 响应）
@@ -145,47 +144,9 @@ class MCPServer:
 
     @staticmethod
     def _kill_tree(proc: subprocess.Popen) -> None:
-        """跨平台杀进程树：Windows 优先 psutil（最可靠），fallback taskkill；POSIX killpg。
-
-        Windows 单 Popen + CREATE_NEW_PROCESS_GROUP 不构成 Job Object——taskkill /T
-        只能找到通过 cmd.exe 派生的孙进程，对 Popen → Popen 链失效。psutil 走
-        children(recursive=True) 是真"看见全树"的方案。
-        """
-        pid = proc.pid
-        # 路径 1: psutil（跨平台最可靠）
-        try:
-            import psutil as _psutil
-            try:
-                root = _psutil.Process(pid)
-                victims = root.children(recursive=True) + [root]
-                for p in victims:
-                    try:
-                        p.kill()
-                    except _psutil.NoSuchProcess:
-                        pass
-                _psutil.wait_procs(victims, timeout=2)
-                return
-            except _psutil.NoSuchProcess:
-                # 父已死——孤儿孙没法通过父枚举找到了，只能尽力
-                return
-        except ImportError:
-            pass
-
-        # 路径 2: 平台原生（无 psutil 时兜底）
-        try:
-            if _sys.platform == "win32":
-                subprocess.run(
-                    ["taskkill", "/F", "/T", "/PID", str(pid)],
-                    capture_output=True, timeout=3,
-                )
-            else:
-                import signal as _signal
-                os.killpg(os.getpgid(pid), _signal.SIGKILL)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
+        """杀进程树（透传到 procutil.kill_tree，保持向后兼容）"""
+        from procutil import kill_tree as _kt
+        _kt(proc)
 
     def is_alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
@@ -277,7 +238,9 @@ class MCPServer:
         finally:
             # server 死了——把所有 pending 全部唤醒，写一个错误响应。
             # 否则 _request 会死等到 _CALL_TIMEOUT_SEC（60s）才返回。
-            stderr_tail = list(self.stderr_buffer[-3:]) if self.stderr_buffer else []
+            # deque 不支持 slice：先转 list 再取末 3
+            _buf_snap = list(self.stderr_buffer)
+            stderr_tail = _buf_snap[-3:] if _buf_snap else []
             with self._pending_lock:
                 for mid, (ev, holder) in self._pending.items():
                     if "msg" not in holder:
@@ -294,15 +257,16 @@ class MCPServer:
                     ev.set()
 
     def _stderr_loop(self) -> None:
-        """收集 server 的 stderr（用于失败诊断）"""
+        """收集 server 的 stderr（用于失败诊断）。
+
+        P2-5：deque(maxlen=50) 自动 ringbuffer，append 即淘汰旧条目，
+        无需手动 pop——避免 pop(0) 与并发读 [-3:] 的 race。
+        """
         proc = self.proc
         if proc is None or proc.stderr is None:
             return
         for line in proc.stderr:
-            line = line.rstrip("\n")
-            self.stderr_buffer.append(line)
-            if len(self.stderr_buffer) > 50:
-                self.stderr_buffer.pop(0)
+            self.stderr_buffer.append(line.rstrip("\n"))
 
     # ---------- MCP 协议方法 ----------
 
@@ -464,7 +428,7 @@ def call_tool(prefixed_name: str, arguments: Optional[dict] = None,
     if srv is None:
         return {"error": f"MCP server 未启动: {server_name}"}
     if not srv.is_alive():
-        return {"error": f"MCP server {server_name} 已退出（stderr 末尾：{srv.stderr_buffer[-3:]}）"}
+        return {"error": f"MCP server {server_name} 已退出（stderr 末尾：{list(srv.stderr_buffer)[-3:]}）"}
     try:
         result = srv.call_tool(tool_name, arguments, timeout=timeout)
     except Exception as e:
