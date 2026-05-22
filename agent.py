@@ -102,6 +102,11 @@ _SUBAGENT_HARD_CAP: int = 16
 # 同时并发的子 agent 上限（thread pool size 上限）。
 _SUBAGENT_CONCURRENCY_CAP: int = 4
 
+# P2-4 安全：保护 TOOLS 列表的并发读写。init_mcp 用 TOOLS[:]=... 原地修改
+# 时，并发跑的子 agent 在 _subagent_tools_for_role 里迭代 TOOLS——会触发
+# RuntimeError: list changed size during iteration。所有写 + 读迭代都走此锁。
+_TOOLS_LOCK = threading.Lock()
+
 
 def _is_in_subagent() -> bool:
     """当前线程是否处于子 agent 执行中（防递归）"""
@@ -814,8 +819,13 @@ def _strip_workspace_prefix(args: dict, *keys: str):
 
 
 def _filter_tools(allowed_names):
-    """从 TOOLS 中筛选出名字在 allowed_names 集合内的工具。审计/只读人格用。"""
-    return [t for t in TOOLS if t["function"]["name"] in allowed_names]
+    """从 TOOLS 中筛选出名字在 allowed_names 集合内的工具。审计/只读人格用。
+
+    P2-4 并发：迭代 TOOLS 必须持 _TOOLS_LOCK，否则与 init_mcp 的 TOOLS[:]=...
+    原地修改并发时会 RuntimeError。
+    """
+    with _TOOLS_LOCK:
+        return [t for t in TOOLS if t["function"]["name"] in allowed_names]
 
 
 def _dispatch_tool_call(tool_call, *, mode="auto", allow_hil=True, allow_confirm=True, snap=None) -> dict:
@@ -943,7 +953,7 @@ def _dispatch_tool_call_inner(tool_call, args, *, mode="auto", allow_hil=True,
         result = write_file(**args)
         if "success" in result:
             console.print(f"写入{'(覆盖)' if overwrite else ''} {fname}", highlight=False)
-            _task_log_mod._task_files_modified.append(fname)
+            _task_log_mod.record_file_modified(fname)
         return {"name": name, "args": args, "id": tool_call.id, "result": result}
 
     if name == "replace_in_file":
@@ -976,7 +986,7 @@ def _dispatch_tool_call_inner(tool_call, args, *, mode="auto", allow_hil=True,
             result = replace_in_file(**args)
         if "success" in result:
             console.print(f"replace_in_file OK: {result.get('filename')}", highlight=False)
-            _task_log_mod._task_files_modified.append(rfname)
+            _task_log_mod.record_file_modified(rfname)
         else:
             console.print(f"替换失败: {result.get('error')}", highlight=False)
         return {"name": name, "args": args, "id": tool_call.id, "result": result}
@@ -996,21 +1006,21 @@ def _dispatch_tool_call_inner(tool_call, args, *, mode="auto", allow_hil=True,
         _backup_file_if_needed(snap, args.get("file_path", ""))
         result = apply_patch(**args)
         if "success" in result:
-            _task_log_mod._task_files_modified.append(args.get("file_path", ""))
+            _task_log_mod.record_file_modified(args.get("file_path", ""))
         return {"name": name, "args": args, "id": tool_call.id, "result": result}
 
     if name == "replace_symbol":
         _backup_file_if_needed(snap, args.get("file_path", ""))
         result = replace_symbol(**args)
         if "success" in result:
-            _task_log_mod._task_files_modified.append(args.get("file_path", ""))
+            _task_log_mod.record_file_modified(args.get("file_path", ""))
         return {"name": name, "args": args, "id": tool_call.id, "result": result}
 
     if name == "append_to_file":
         _backup_file_if_needed(snap, args.get("filename", ""))
         result = append_to_file(**args)
         if "success" in result:
-            _task_log_mod._task_files_modified.append(args.get("filename", ""))
+            _task_log_mod.record_file_modified(args.get("filename", ""))
         return {"name": name, "args": args, "id": tool_call.id, "result": result}
 
     if name == "delete_file":
@@ -1029,7 +1039,7 @@ def _dispatch_tool_call_inner(tool_call, args, *, mode="auto", allow_hil=True,
         result = delete_file(**args)
         if "success" in result:
             console.print(f"删除 {del_fname}", highlight=False)
-            _task_log_mod._task_files_modified.append(del_fname)
+            _task_log_mod.record_file_modified(del_fname)
         return {"name": name, "args": args, "id": tool_call.id, "result": result}
 
     # task_complete: sentinel 退出信号；fix()/audit() 检测后跳出循环
@@ -1097,7 +1107,7 @@ def _record_dispatch(out: dict, msgs: list):
     """把分发结果挂回 messages，并写入 task tool_calls 日志（敏感字段除外）"""
     args = out["args"]
     safe_args = {k: v for k, v in args.items() if k not in ("content", "new_str", "new_code")}
-    _task_log_mod._task_tool_calls.append({"name": out["name"], "args": safe_args})
+    _task_log_mod.record_tool_call(out["name"], safe_args)
     msgs.append({
         "tool_call_id": out["id"],
         "role": "tool",
@@ -1644,7 +1654,7 @@ def code(plan, mode="auto", requirement=""):
     console.print("代码生成/修改完成")
 
     # pyproject.toml 有变更时自动重装包，确保新增模块立即可用
-    if any("pyproject.toml" in (f or "") for f in _task_log_mod._task_files_modified):
+    if any("pyproject.toml" in (f or "") for f in _task_log_mod.snapshot_files_modified()):
         import subprocess as _sp
         console.print("[自动] 检测到 pyproject.toml 变更，执行 pip install -e . ...", highlight=False)
         r = _sp.run(["pip", "install", "-e", "."], capture_output=True, text=True)
@@ -1982,7 +1992,8 @@ _SUBAGENT_ROLE = """【你是子 Agent（被父 agent 派发的隔离工作单�
 
 def _subagent_tools_for_role(role: str) -> list:
     """根据 role 返回子 agent 可用的工具子集。物理隔离 dispatch_subagent 防递归。"""
-    all_names = {t["function"]["name"] for t in TOOLS}
+    with _TOOLS_LOCK:
+        all_names = {t["function"]["name"] for t in TOOLS}
     blocked = {"dispatch_subagent", "update_plan_draft", "exit_plan_mode_signal"}
     if role in ("explorer", "auditor"):
         allowed = (READONLY_TOOL_NAMES - blocked)
@@ -2167,14 +2178,15 @@ def init_mcp(verbose: bool = True) -> dict:
     started, errors = _mcp_mod.start_all_servers(_get_workspace(), verbose=verbose)
     if started:
         new_schemas = _mcp_mod.discover_tools_as_schemas()
-        # 防重复：去掉之前可能注入过的同名 mcp__ 工具，再注入新的
-        existing_mcp = {t["function"]["name"] for t in TOOLS
-                        if t["function"]["name"].startswith("mcp__")}
-        # 用 list 原地修改（保持引用稳定，agent/_subagent_tools_for_role 各路径读的是同一引用）
-        if existing_mcp:
-            TOOLS[:] = [t for t in TOOLS
-                        if not t["function"]["name"].startswith("mcp__")]
-        TOOLS.extend(new_schemas)
+        # P2-4：TOOLS 修改 + 子 agent 迭代必须互斥，否则 hot reload mcp 时
+        # 子 agent 的 _subagent_tools_for_role 会撞 RuntimeError
+        with _TOOLS_LOCK:
+            existing_mcp = {t["function"]["name"] for t in TOOLS
+                            if t["function"]["name"].startswith("mcp__")}
+            if existing_mcp:
+                TOOLS[:] = [t for t in TOOLS
+                            if not t["function"]["name"].startswith("mcp__")]
+            TOOLS.extend(new_schemas)
         if verbose:
             for n, cnt in started.items():
                 console.print(f"[mcp] {n} 启动（{cnt} 工具）", highlight=False)
@@ -2647,7 +2659,7 @@ def _run(requirement, mode):
         if not any(part in _ignore for part in f.relative_to(ws).parts)
     ])
     if not has_tests:
-        _auto_generate_tests(plan_result, _task_log_mod._task_files_modified[:])
+        _auto_generate_tests(plan_result, _task_log_mod.snapshot_files_modified())
 
 
 
@@ -2791,7 +2803,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
                     result = write_file(**args)
                     console.print(f"[自动测试] 生成: {args.get('filename')}", highlight=False)
                     if "success" in result:
-                        _task_log_mod._task_files_modified.append(args.get("filename", ""))
+                        _task_log_mod.record_file_modified(args.get("filename", ""))
                 else:
                     result = {"error": "测试生成阶段只允许 write_file"}
                 msgs.append({"tool_call_id": tc.id, "role": "tool", "name": fname, "content": json.dumps(result)})

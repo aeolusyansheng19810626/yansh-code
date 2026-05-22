@@ -2,8 +2,13 @@
 
 模块级状态由 record_* 函数维护；agent._dispatch_tool_call 通过 record_file_modified
 和 record_tool_call 写入。get_last_task_log 供批处理 --json 输出。
+
+P2 并发：所有读写都走 _log_lock。CPython GIL 下 list.append/clear 单条原子，
+但 finish_task_log 的 dict.fromkeys(_task_files_modified) 迭代期间如果有
+并发 append（multi-subagent），结果未定。加锁让多 subagent 写日志互不交错。
 """
 import json
+import threading
 import time as _time
 from datetime import datetime
 from pathlib import Path
@@ -19,6 +24,7 @@ _current_task_log: dict = {}
 _task_tool_calls: list = []
 _task_files_modified: list = []
 _last_task_log: dict = {}
+_log_lock = threading.Lock()
 
 
 def _reinit_paths():
@@ -30,24 +36,25 @@ def _reinit_paths():
 def init_task_log(requirement, mode):
     """重置当前任务日志（in-place 清空+更新，外部持有的 dict 引用仍有效）"""
     from config import get_config
-    _task_tool_calls.clear()
-    _task_files_modified.clear()
-    _current_task_log.clear()
-    _current_task_log.update({
-        "timestamp": datetime.now().isoformat(),
-        "requirement": requirement,
-        "mode": mode,
-        "model": get_config().get("model") or "unknown",
-        "plan": [],
-        "files_modified": [],
-        "tool_calls": [],
-        "test_command": "",
-        "test_result": "unknown",
-        "attempts": 0,
-        "error": None,
-        "duration_seconds": 0.0,
-        "_start": _time.time(),
-    })
+    with _log_lock:
+        _task_tool_calls.clear()
+        _task_files_modified.clear()
+        _current_task_log.clear()
+        _current_task_log.update({
+            "timestamp": datetime.now().isoformat(),
+            "requirement": requirement,
+            "mode": mode,
+            "model": get_config().get("model") or "unknown",
+            "plan": [],
+            "files_modified": [],
+            "tool_calls": [],
+            "test_command": "",
+            "test_result": "unknown",
+            "attempts": 0,
+            "error": None,
+            "duration_seconds": 0.0,
+            "_start": _time.time(),
+        })
 
 
 def finish_task_log(success, attempts, test_result=None, task_complete_signal=None):
@@ -55,31 +62,33 @@ def finish_task_log(success, attempts, test_result=None, task_complete_signal=No
     task_complete_signal: LLM 主动声明的 {early_exit, success, summary}。
       传 None 表示这次没收到主动信号（沉默退出 / 老路径），日志里不写该字段。
     """
-    if not _current_task_log:
-        return
-    _current_task_log["test_result"] = "pass" if success else "fail"
-    _current_task_log["attempts"] = attempts
-    _current_task_log["tool_calls"] = _task_tool_calls[:]
-    _current_task_log["files_modified"] = list(dict.fromkeys(_task_files_modified))
-    _current_task_log["duration_seconds"] = round(_time.time() - _current_task_log.pop("_start"), 2)
-    if test_result and not success:
-        err = test_result.get("stderr", "") or test_result.get("stdout", "")
-        _current_task_log["error"] = err[:300]
-    if task_complete_signal:
-        # 持久化 LLM 主动声明的事实——回放/统计能追溯
-        _current_task_log["task_complete_signal"] = {
-            "early_exit": bool(task_complete_signal.get("early_exit", False)),
-            "success": bool(task_complete_signal.get("success", False)),
-            "summary": str(task_complete_signal.get("summary", ""))[:500],
-        }
+    with _log_lock:
+        if not _current_task_log:
+            return
+        _current_task_log["test_result"] = "pass" if success else "fail"
+        _current_task_log["attempts"] = attempts
+        _current_task_log["tool_calls"] = _task_tool_calls[:]
+        _current_task_log["files_modified"] = list(dict.fromkeys(_task_files_modified))
+        _current_task_log["duration_seconds"] = round(_time.time() - _current_task_log.pop("_start"), 2)
+        if test_result and not success:
+            err = test_result.get("stderr", "") or test_result.get("stdout", "")
+            _current_task_log["error"] = err[:300]
+        if task_complete_signal:
+            _current_task_log["task_complete_signal"] = {
+                "early_exit": bool(task_complete_signal.get("early_exit", False)),
+                "success": bool(task_complete_signal.get("success", False)),
+                "summary": str(task_complete_signal.get("summary", ""))[:500],
+            }
+        # 在锁内构建好 payload，但实际写盘 IO 释放锁后做
+        snapshot = dict(_current_task_log)
+        _last_task_log.clear()
+        _last_task_log.update(_current_task_log)
+        _current_task_log.clear()
     _LOG_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     (_LOG_DIR / f"{ts}.jsonl").write_text(
-        json.dumps(_current_task_log, ensure_ascii=False), encoding="utf-8"
+        json.dumps(snapshot, ensure_ascii=False), encoding="utf-8"
     )
-    _last_task_log.clear()
-    _last_task_log.update(_current_task_log)
-    _current_task_log.clear()
 
 
 def show_recent_logs():
@@ -120,8 +129,22 @@ def get_current_log() -> dict:
 
 def record_file_modified(filename: str):
     if filename:
-        _task_files_modified.append(filename)
+        with _log_lock:
+            _task_files_modified.append(filename)
 
 
 def record_tool_call(name: str, safe_args: dict):
-    _task_tool_calls.append({"name": name, "args": safe_args})
+    with _log_lock:
+        _task_tool_calls.append({"name": name, "args": safe_args})
+
+
+def snapshot_files_modified() -> list:
+    """返回 _task_files_modified 的快照副本（线程安全）"""
+    with _log_lock:
+        return list(_task_files_modified)
+
+
+def snapshot_tool_calls() -> list:
+    """返回 _task_tool_calls 的快照副本（线程安全）"""
+    with _log_lock:
+        return list(_task_tool_calls)

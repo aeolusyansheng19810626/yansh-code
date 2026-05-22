@@ -731,6 +731,71 @@ def test_non_audit_mode_keeps_general_role(tmp_path):
     assert captured["role"] == "general", "auto 模式不该降级"
 
 
+# ---------- P2-4 TOOLS 并发读写 ----------
+
+def test_concurrent_init_mcp_and_subagent_tools_no_crash(tmp_path):
+    """并发：init_mcp 在改 TOOLS 时，多个 subagent 读 TOOLS——不应炸。
+
+    加锁前会 RuntimeError: list changed size during iteration。
+    """
+    import threading
+    import time
+    import agent as _agent
+    from tools_schema import TOOLS as _TOOLS
+
+    # 拷贝原始 TOOLS 用于复原
+    original_tools = list(_TOOLS)
+    errors = []
+
+    # 假装"重载 mcp"：反复在 TOOLS 末尾 add/remove 一组虚假 mcp__ 工具
+    # 用 _TOOLS_LOCK 保护
+    fake_schemas = [
+        {"type": "function", "function": {"name": f"mcp__fake__t{i}",
+                                            "description": "x",
+                                            "parameters": {"type": "object", "properties": {}}}}
+        for i in range(50)
+    ]
+
+    stop = threading.Event()
+
+    def writer():
+        try:
+            while not stop.is_set():
+                with _agent._TOOLS_LOCK:
+                    # remove 旧 mcp__fake__
+                    _TOOLS[:] = [t for t in _TOOLS
+                                 if not t["function"]["name"].startswith("mcp__fake__")]
+                    _TOOLS.extend(fake_schemas)
+        except Exception as e:
+            errors.append(("writer", e))
+
+    def reader():
+        try:
+            for _ in range(200):
+                # _subagent_tools_for_role 会迭代 TOOLS——加锁前会撞 RuntimeError
+                _ = _agent._subagent_tools_for_role("general")
+                _ = _agent._subagent_tools_for_role("explorer")
+        except Exception as e:
+            errors.append(("reader", e))
+
+    writers = [threading.Thread(target=writer, daemon=True) for _ in range(2)]
+    readers = [threading.Thread(target=reader, daemon=True) for _ in range(4)]
+    try:
+        for t in writers + readers:
+            t.start()
+        for t in readers:
+            t.join(timeout=10)
+        stop.set()
+        for t in writers:
+            t.join(timeout=2)
+    finally:
+        # 复原 TOOLS
+        with _agent._TOOLS_LOCK:
+            _TOOLS[:] = original_tools
+
+    assert not errors, f"并发 TOOLS 修改 + 读迭代崩了：{errors[:3]}"
+
+
 def test_audit_mode_subagent_cannot_write_file_e2e(tmp_path):
     """端到端：audit 父 mode → LLM 调 dispatch_subagent(role='general') →
     子 agent 真跑 LLM loop → 子 agent 试图调 write_file 应被 audit 模式拦截。
