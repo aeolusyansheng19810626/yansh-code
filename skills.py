@@ -34,9 +34,6 @@ from pathlib import Path
 from typing import List, Optional
 
 
-_FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?(.*)$", re.DOTALL)
-
-
 @dataclass
 class Skill:
     name: str
@@ -55,66 +52,8 @@ class Skill:
         return mode in self.modes
 
 
-def _parse_frontmatter(text: str) -> tuple[dict, str]:
-    """最简 YAML 子集：key: value（字符串或 [list]）。返回 (meta, body)"""
-    m = _FRONTMATTER_RE.match(text)
-    if not m:
-        return {}, text
-    fm_text, body = m.group(1), m.group(2)
-    meta = {}
-    for line in fm_text.splitlines():
-        line = line.rstrip()
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        if ":" not in line:
-            continue
-        key, _, val = line.partition(":")
-        key = key.strip()
-        val = val.strip()
-        # list: [a, b, "c d"]
-        if val.startswith("[") and val.endswith("]"):
-            inner = val[1:-1].strip()
-            if not inner:
-                meta[key] = []
-            else:
-                items = []
-                # 简单分隔：考虑双引号包围的项
-                for piece in _split_list(inner):
-                    p = piece.strip()
-                    if (p.startswith('"') and p.endswith('"')) or (p.startswith("'") and p.endswith("'")):
-                        p = p[1:-1]
-                    if p:
-                        items.append(p)
-                meta[key] = items
-        else:
-            # 标量：去引号
-            if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
-                val = val[1:-1]
-            meta[key] = val
-    return meta, body.strip("\n")
-
-
-def _split_list(s: str) -> list:
-    """支持引号包围逗号的简单分割"""
-    out = []
-    cur = []
-    in_str = None
-    for ch in s:
-        if in_str:
-            cur.append(ch)
-            if ch == in_str:
-                in_str = None
-        elif ch in ('"', "'"):
-            in_str = ch
-            cur.append(ch)
-        elif ch == ",":
-            out.append("".join(cur))
-            cur = []
-        else:
-            cur.append(ch)
-    if cur:
-        out.append("".join(cur))
-    return out
+# P4 重构：frontmatter 解析抽到 frontmatter.py，本模块透传以保留向后兼容。
+from frontmatter import parse as _parse_frontmatter
 
 
 def parse_skill_file(filepath: str) -> Optional[Skill]:

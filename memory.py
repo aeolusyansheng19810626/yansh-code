@@ -37,7 +37,6 @@ from typing import Optional
 
 
 VALID_TYPES = ("user", "feedback", "project", "reference")
-_FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?(.*)$", re.DOTALL)
 
 
 @dataclass
@@ -50,33 +49,8 @@ class Memory:
     source_path: Optional[str] = None
 
 
-def _parse_frontmatter(text: str) -> tuple[dict, str]:
-    """最简 YAML 子集：标量 + 嵌套 metadata.type。返回 (meta, body)"""
-    m = _FRONTMATTER_RE.match(text)
-    if not m:
-        return {}, text
-    fm_text, body = m.group(1), m.group(2)
-    meta: dict = {}
-    in_metadata = False
-    for line in fm_text.splitlines():
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        if line.startswith("metadata:"):
-            in_metadata = True
-            meta["metadata"] = {}
-            continue
-        if in_metadata and line.startswith("  ") and ":" in line:
-            key, _, val = line.strip().partition(":")
-            meta["metadata"][key.strip()] = val.strip().strip("'\"")
-            continue
-        if line.startswith(" "):
-            in_metadata = False
-        if ":" not in line:
-            continue
-        in_metadata = False
-        key, _, val = line.partition(":")
-        meta[key.strip()] = val.strip().strip("'\"")
-    return meta, body.strip("\n")
+# P4 重构：frontmatter 解析抽到 frontmatter.py，本模块透传以保留向后兼容。
+from frontmatter import parse as _parse_frontmatter
 
 
 def parse_memory_file(filepath: str, scope: str = "project") -> Optional[Memory]:
