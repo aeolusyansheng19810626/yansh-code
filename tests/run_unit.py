@@ -21,6 +21,7 @@ files = [
     "tests/unit/test_agent_loop.py",
     "tests/unit/test_plan_mode.py",
     "tests/unit/test_skills.py",
+    "tests/unit/test_subagent.py",
 ]
 
 if __name__ == "__main__":

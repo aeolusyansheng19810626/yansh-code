@@ -323,6 +323,32 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "dispatch_subagent",
+            "description": "派发一个独立子 agent 跑子任务，返回 summary 字符串。**核心价值：context 隔离**——子 agent 烧自己的 context 跑探索，主 agent 只看到一段总结。\n\n用法场景：\n- 大型代码库探索（'查 X 模块怎么用的，列出所有调用点'）\n- 重活：跑测试 + 修复 + 复测整套（role='general'）\n- 多分支调研同时进行（多个 dispatch_subagent 并行）\n\n约束：\n- 子 agent **不能再派子 agent**（递归被禁，避免失控）\n- 子 agent 的工具集按 role 限定\n- max_steps 上限 16，超出即截断\n\n何时不要用：单文件读 / 一次 grep 这种简单任务直接调底层工具更便宜——dispatch_subagent 多一次 LLM cascade 起步就 1k+ token。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": "给子 agent 的任务描述（自然语言，自包含——子 agent 看不到主 agent 上下文）"
+                    },
+                    "role": {
+                        "type": "string",
+                        "enum": ["explorer", "general", "auditor"],
+                        "description": "explorer=只读探索（默认，最常用，最便宜）；general=全工具（能写文件/跑命令）；auditor=只读审计（同 explorer）"
+                    },
+                    "max_steps": {
+                        "type": "integer",
+                        "description": "子 agent 最多跑几轮 LLM 循环，默认 8，上限 16"
+                    }
+                },
+                "required": ["task"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "task_complete",
             "description": "显式声明本次任务结束。**每次任务都必须以此工具收尾**（fix/audit loop 识别后退出）。完成时 task_complete(success=true, summary='做了什么')；确认无法继续时 task_complete(success=false, summary='为什么放弃')。不要沉默退出——没调任何工具时 loop 会再追问一次浪费一轮。",
             "parameters": {
@@ -376,4 +402,7 @@ READONLY_TOOL_NAMES = {
     "fetch_webpage", "search_docs",
     "task_complete",
     "update_plan_draft", "exit_plan_mode_signal",
+    # P2 #9：派子 agent 不直接修改 workspace（子 agent role=explorer 时也是只读），
+    # 所以加进 READONLY 让 audit/plan 也能用。子 agent 内部不再看到这个工具（递归禁用）。
+    "dispatch_subagent",
 }

@@ -33,6 +33,7 @@ _SLASH_COMMANDS = [
     ("/plan",     "查看当前 plan 草稿"),
     ("/approve",  "批准当前 plan 草稿并进入实施"),
     ("/skill",    "Skills 系统：/skill list | /skill show <name>"),
+    ("/subagent", "子 Agent 统计：/subagent stats"),
 ]
 
 
@@ -496,6 +497,27 @@ def main():
                     console.print(hit.body, highlight=False)
             else:
                 console.print("用法：/skill list | /skill show <name>", highlight=False)
+            continue
+
+        # P2 #9 子 Agent 命令
+        if user_input == "/subagent" or user_input.startswith("/subagent "):
+            parts = user_input.split(maxsplit=1)
+            sub = parts[1] if len(parts) > 1 else "stats"
+            if sub == "stats":
+                stats = agent.get_subagent_stats()
+                if stats["calls"] == 0:
+                    console.print("[subagent] 本 session 还没派过子 agent。", highlight=False)
+                else:
+                    avg_steps = stats["total_steps"] / stats["calls"]
+                    console.print(f"\n[bold cyan]=== 子 Agent 统计（本 session）===[/bold cyan]", highlight=False)
+                    console.print(f"  调用次数: {stats['calls']}", highlight=False)
+                    console.print(f"  累计步数: {stats['total_steps']}（平均 {avg_steps:.1f} 步/次）", highlight=False)
+                    console.print(f"  最近 role: {stats['last_role']}", highlight=False)
+                    console.print(f"  最近 steps: {stats['last_steps']} ({'✓' if stats['last_success'] else '✗'})", highlight=False)
+                    console.print(f"  最近 task: {stats['last_task']}", highlight=False)
+                    console.print(f"  最近 summary: {stats['last_summary']}\n", highlight=False)
+            else:
+                console.print("用法：/subagent stats", highlight=False)
             continue
 
         # P2 #7 Plan Mode 命令族

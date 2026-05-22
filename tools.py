@@ -66,6 +66,20 @@ def exit_plan_mode_signal(reason: str = "") -> dict:
     }
 
 
+def dispatch_subagent(task: str, role: str = "explorer", max_steps: int = 8) -> dict:
+    """[P2 #9] Sentinel：LLM 调时返回标记，由 agent._subagent_handler 拦截并实际执行。
+
+    这里只做参数透传——真正的子 agent loop 在 agent._run_subagent。这样保持 tools 模块
+    无 LLM 依赖（agent 模块才依赖 llm_client），避免 import 循环。
+    """
+    return {
+        "_subagent_dispatch": True,
+        "task": str(task or ""),
+        "role": str(role or "explorer"),
+        "max_steps": int(max_steps or 8),
+    }
+
+
 def _reinit_paths():
     """--cwd 变更后重新初始化模块级路径变量（由 main.py 调用）"""
     global _WORKSPACE_ROOT
