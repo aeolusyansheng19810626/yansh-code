@@ -130,15 +130,29 @@ def discover_memories(workspace_dir: Optional[str] = None) -> list:
 
 
 def find_memory(name: str, workspace_dir: Optional[str] = None) -> Optional[Memory]:
-    """按 name 找一条 memory（项目级优先）"""
+    """按 name 找一条 memory（项目级优先）。
+
+    P1 安全：name 必须先 _slugify——否则 recall_memory("../../README") 会读
+    workspace 下任意 .md 文件。即便 slugify 之后，仍用 resolve() + is_relative_to
+    再校验一次（防 slugify 后还能逃脱 target_dir 的边界情况）。
+    """
     name = str(name).strip()
     if not name:
         return None
+    slug = _slugify(name)
     for d, scope in ((_project_dir(workspace_dir), "project"),
                      (_global_dir(), "global")):
         if d is None or not d.exists():
             continue
-        f = d / f"{name}.md"
+        f = d / f"{slug}.md"
+        # 双校验：resolve 后必须在 target_dir 之内（防 symlink / slugify 边界）
+        try:
+            f_resolved = f.resolve()
+            d_resolved = d.resolve()
+            if not str(f_resolved).startswith(str(d_resolved)):
+                continue
+        except Exception:
+            continue
         if f.exists():
             return parse_memory_file(str(f), scope=scope)
     return None

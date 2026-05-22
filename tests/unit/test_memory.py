@@ -302,6 +302,68 @@ def test_find_memory_missing_returns_none(tmp_path):
     assert memory.find_memory("ghost", workspace_dir=str(tmp_path)) is None
 
 
+# ---------- P1-2 安全：find_memory 路径穿越 ----------
+
+def test_find_memory_path_traversal_blocked_dotdot(tmp_path, monkeypatch):
+    """recall_memory("../../README") 不能读 memory 目录之外的 .md 文件。
+
+    Codex 找出：find_memory 直接 d / f"{name}.md"，没 slugify。攻击向量：
+    LLM 拿到外部输入后调 recall_memory(name="../../README") → 读 workspace/README.md。
+    """
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path / "fake_home")
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    # 在 workspace 根目录放一个"机密" .md 文件
+    (ws / "secret.md").write_text("---\nname: secret\nmetadata:\n  type: user\n---\nSECRET DATA",
+                                   encoding="utf-8")
+    # find_memory("../../secret") 不能读到——slugify 应把它变成 "-secret"
+    mem = memory.find_memory("../../secret", workspace_dir=str(ws))
+    assert mem is None, "路径穿越未被阻止"
+
+
+def test_find_memory_path_traversal_blocked_absolute(tmp_path, monkeypatch):
+    """recall_memory 用绝对路径也不能逃出 memory 目录"""
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path / "fake_home")
+    ws = str(tmp_path / "ws")
+    abs_path = str(tmp_path / "evil")
+    mem = memory.find_memory(abs_path, workspace_dir=ws)
+    assert mem is None
+
+
+def test_find_memory_slugify_consistent_with_save(tmp_path, monkeypatch):
+    """save 走 slugify，find 也必须走 slugify——否则 save 后 find 不到"""
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path / "fake_home")
+    ws = str(tmp_path / "ws")
+    # save 用带空格的 name，slugify 成 "with-spaces"
+    memory.save_memory("With Spaces", "user", "d", "b body",
+                        scope="project", workspace_dir=ws)
+    # find 用同样 name（含空格）应能找到（双方都走 slugify）
+    mem = memory.find_memory("With Spaces", workspace_dir=ws)
+    assert mem is not None, "save/find slugify 不一致"
+    assert "b body" in mem.body
+
+
+def test_recall_memory_path_traversal_e2e(tmp_path, monkeypatch):
+    """端到端：tools.recall_memory 入口走 find_memory → 路径穿越被阻止。
+
+    模拟攻击：LLM 调 recall_memory(name="../../etc/passwd") 试图越界，
+    应拿到 error 而不是文件内容。
+    """
+    import tools as _tools
+    import config as _config_mod
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path / "fake_home")
+    monkeypatch.setattr(_config_mod, "WORKSPACE_DIR", str(tmp_path / "ws"))
+
+    # workspace 外面放一个会被读的"机密"
+    (tmp_path / "etc.md").write_text("---\nname: etc\nmetadata:\n  type: user\n---\nLEAK",
+                                      encoding="utf-8")
+
+    r = _tools.recall_memory(name="../etc")
+    # 不能拿到 LEAK
+    body = r.get("body", "") if isinstance(r, dict) else ""
+    assert "LEAK" not in body, f"路径穿越泄漏数据：{r}"
+
+
 # ---------- load_memory_index ----------
 
 def test_load_memory_index_empty_returns_empty_string(tmp_path, monkeypatch):
