@@ -70,6 +70,10 @@ _PLAN_MODE: bool = False
 _PLAN_DRAFT: str = ""
 _PLAN_HISTORY: list = []   # plan 模式独立对话历史（不混入 conversation_history）
 
+# P2 #8 Skills：当前任务/对话激活的 skill prompt 片段。run() 入口算一次写入；
+# plan/code/audit/fix 各自的 system prompt 末尾拼这个变量。空字符串=无命中。
+_ACTIVE_SKILLS_PROMPT: str = ""
+
 # 对话历史管理
 conversation_history = []
 MAX_HISTORY = 20
@@ -1238,6 +1242,8 @@ test_command 禁止使用 python -c 内联执行（会被安全策略拦截）�
 {files_list if files_list else "(空)"}
 
 注意：不要重复创建已有文件，尽量基于已有文件做增量修改。对已有文件只描述要追加/修改什么。"""
+    if _ACTIVE_SKILLS_PROMPT:
+        system_prompt += _ACTIVE_SKILLS_PROMPT
     # #50 若有待注入图片，构造 vision content（消费后清空）
     user_text = f"需求：{requirement}"
     if _pending_images:
@@ -1355,6 +1361,8 @@ def code(plan, mode="auto", requirement=""):
 - 已有文件**必须**使用 replace_in_file 做精确替换，不得使用 write_file 重写整个文件
 - write_file 只允许用于新建文件
 - 每次调用 replace_in_file 只修改一处，如有多处修改需要多次调用"""
+            if _ACTIVE_SKILLS_PROMPT:
+                sys_prompt += _ACTIVE_SKILLS_PROMPT
         else:
             console.print(f"{filename} 是新建文件...")
             req_block = f"\n原始需求（必须严格遵守，包括变量名、库名、API key 名称等技术细节）：\n{requirement}\n" if requirement else ""
@@ -1367,6 +1375,8 @@ def code(plan, mode="auto", requirement=""):
 需求/修改意图：{intent}
 
 注意：必须使用 write_file 写入文件，文件名严格使用 `{filename}`，不要修改路径或添加目录前缀。"""
+            if _ACTIVE_SKILLS_PROMPT:
+                sys_prompt += _ACTIVE_SKILLS_PROMPT
 
         # 构建消息
         user_content = f"当前文件：{filename}\n修改意图：{intent}"
@@ -1463,6 +1473,8 @@ def audit(requirement):
         )
 
     sys_prompt = f"{_AUDITOR_ROLE}{_get_project_rules()}\n\n{symbols_brief}"
+    if _ACTIVE_SKILLS_PROMPT:
+        sys_prompt += _ACTIVE_SKILLS_PROMPT
     messages = [
         {"role": "system", "content": sys_prompt},
         {"role": "user", "content": f"审计需求：{requirement}"}
@@ -1639,6 +1651,19 @@ def plan_chat(user_input: str) -> str:
         )
 
     sys_prompt = f"{_PLANNER_ROLE}{_get_project_rules()}\n\n{symbols_brief}"
+    # P2 #8 Skills：plan_mode 独立扫描（mode='plan'）
+    try:
+        import skills as _skills_mod
+        skill_frag, matched = _skills_mod.load_and_format(
+            user_input, _get_workspace(), mode="plan"
+        )
+        if skill_frag:
+            sys_prompt += skill_frag
+            if matched:
+                console.print(f"[skills] 命中 {len(matched)} 个：{', '.join(s.name for s in matched)}",
+                              highlight=False)
+    except Exception:
+        pass
     if _PLAN_DRAFT:
         sys_prompt += f"\n\n【当前 plan 草稿】\n{_PLAN_DRAFT}"
 
@@ -1824,9 +1849,13 @@ def fix(test_result, plan, reason="test_failure"):
     if reason == "review_rejection":
         content = f"代码审查未通过，请按以下审查意见逐条修复代码：\n\n{error_info}\n\n计划：{json.dumps(plan)}"
         sys_role = f"{_TESTER_ROLE}\n{_get_project_rules()}你是代码审查修复助手。请严格按审查意见逐条修复，每条对应一次 replace_in_file 精确修改。不要改与审查意见无关的代码。"
+        if _ACTIVE_SKILLS_PROMPT:
+            sys_role += _ACTIVE_SKILLS_PROMPT
     else:
         content = f"测试失败！\n错误输出：\n{error_info}\n\n计划：{json.dumps(plan)}"
         sys_role = f"{_TESTER_ROLE}\n{_get_project_rules()}你是代码修复助手。根据错误信息精准修复代码，优先使用 replace_in_file 做最小化修改，必要时才用 write_file 重写整个文件。"
+        if _ACTIVE_SKILLS_PROMPT:
+            sys_role += _ACTIVE_SKILLS_PROMPT
 
     messages = [
         {"role": "system", "content": sys_role},
@@ -1965,6 +1994,21 @@ def _run(requirement, mode):
     os.makedirs(_get_workspace(), exist_ok=True)  # 兜底：新目录首次运行时 workspace/ 可能不存在
     original_requirement = requirement
     init_task_log(requirement, mode)
+
+    # P2 #8 Skills：每次 run() 入口扫描 + 匹配 skill；后续 plan/code/audit/fix 共用 _ACTIVE_SKILLS_PROMPT
+    global _ACTIVE_SKILLS_PROMPT
+    try:
+        import skills as _skills_mod
+        prompt_frag, matched = _skills_mod.load_and_format(
+            requirement, _get_workspace(), mode=mode
+        )
+        _ACTIVE_SKILLS_PROMPT = prompt_frag
+        if matched:
+            console.print(f"[skills] 命中 {len(matched)} 个：{', '.join(s.name for s in matched)}",
+                          highlight=False)
+    except Exception as e:
+        _ACTIVE_SKILLS_PROMPT = ""
+        console.print(f"[skills] 加载失败（不影响主流程）：{e}", style="yellow", highlight=False)
 
     # audit 模式：完全独立路径，不进 plan/code/review/fix
     if mode == "audit":

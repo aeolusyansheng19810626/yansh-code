@@ -20,6 +20,7 @@ files = [
     "tests/unit/test_json_robustness.py",
     "tests/unit/test_agent_loop.py",
     "tests/unit/test_plan_mode.py",
+    "tests/unit/test_skills.py",
 ]
 
 if __name__ == "__main__":

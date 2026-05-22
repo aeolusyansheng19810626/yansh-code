@@ -32,6 +32,7 @@ _SLASH_COMMANDS = [
     ("/plan_off", "退出 Plan Mode（不实施，丢弃草稿）"),
     ("/plan",     "查看当前 plan 草稿"),
     ("/approve",  "批准当前 plan 草稿并进入实施"),
+    ("/skill",    "Skills 系统：/skill list | /skill show <name>"),
 ]
 
 
@@ -462,6 +463,39 @@ def main():
                     console.print("用法：/replay [list|load <id>]")
             else:
                 console.print("用法：/replay [list|load <id>]")
+            continue
+
+        # P2 #8 Skills 命令
+        if user_input == "/skill" or user_input.startswith("/skill "):
+            import skills as _skills_mod
+            parts = user_input.split(maxsplit=2)
+            sub = parts[1] if len(parts) > 1 else "list"
+            if sub == "list":
+                all_skills = _skills_mod.discover_skills(WORKSPACE_DIR)
+                if not all_skills:
+                    console.print(f"未发现 skill。把 .md 文件放到 {WORKSPACE_DIR}/skills/ 或 ~/.yansh/skills/", highlight=False)
+                else:
+                    console.print(f"\n[bold cyan]已发现 {len(all_skills)} 个 skill：[/bold cyan]", highlight=False)
+                    for sk in all_skills:
+                        modes_str = f" [{', '.join(sk.modes)}]" if sk.modes else ""
+                        triggers_str = ", ".join(sk.triggers[:5]) + ("..." if len(sk.triggers) > 5 else "")
+                        console.print(f"  {sk.name}{modes_str} — {sk.description}", highlight=False)
+                        console.print(f"      triggers: {triggers_str}", highlight=False)
+            elif sub == "show" and len(parts) >= 3:
+                target = parts[2]
+                all_skills = _skills_mod.discover_skills(WORKSPACE_DIR)
+                hit = next((s for s in all_skills if s.name == target), None)
+                if hit is None:
+                    console.print(f"未找到 skill: {target}", highlight=False)
+                else:
+                    console.print(f"\n[bold cyan]=== skill: {hit.name} ===[/bold cyan]", highlight=False)
+                    console.print(f"description: {hit.description}", highlight=False)
+                    console.print(f"triggers: {hit.triggers}", highlight=False)
+                    console.print(f"modes: {hit.modes or '(全部)'}", highlight=False)
+                    console.print(f"source: {hit.source_path}\n", highlight=False)
+                    console.print(hit.body, highlight=False)
+            else:
+                console.print("用法：/skill list | /skill show <name>", highlight=False)
             continue
 
         # P2 #7 Plan Mode 命令族

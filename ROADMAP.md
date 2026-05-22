@@ -29,7 +29,7 @@
 | P1 #5 | 全局状态重构 | 🟢 完成（state.Session + scoped_session 渐进式） |
 | P1 #6 | 沙箱模式 opt-in | 🟢 完成（--sandbox docker[:image]，仅包 execute_command） |
 | P2 #7 | Plan Mode | 🟢 完成（方案 C：session 级 flag + 多轮探索 + /approve） |
-| P2 #8 | Skills 系统 | ⬜ 未着手 |
+| P2 #8 | Skills 系统 | 🟢 完成（skills/*.md frontmatter triggers + 关键字匹配 + prompt 注入） |
 | P2 #9 | 子 Agent | ⬜ 未着手 |
 | P2 #10 | MCP 协议 | ⬜ 未着手 |
 | P2 #11 | Hooks | ⬜ 未着手 |
@@ -241,7 +241,19 @@
 
 ---
 
-### 8. Skills 系统 ⬜ 未着手
+### 8. Skills 系统 🟢 完成
+
+**进度（2026-05-22 夜）**：最小版落地（笔记 [_16](./notes/shadow/2026-05-22_16-skills-system.md)）。
+
+- 新建 `skills.py`：`Skill` dataclass + `parse_skill_file` / `discover_skills` / `match_skills` / `format_skills_prompt` / `load_and_format`
+- 目录约定：`<workspace>/skills/*.md`（项目级，优先）+ `~/.yansh/skills/*.md`（全局，备选）；同名时项目级覆盖
+- frontmatter：`name` / `description` / `triggers: ["a","b"]` / `modes: ["audit","plan"]`（可选；空=全 mode）；手写最简 YAML 子集解析器，不引 PyYAML
+- agent.py：模块级 `_ACTIVE_SKILLS_PROMPT`；`_run()` 入口扫描+匹配；plan/code/audit/fix/plan_chat 系统 prompt 末尾注入
+- main.py：`/skill list` / `/skill show <name>` 命令
+
+**集成验证**（Sonnet 4.6）：写 `code-review.md`（触发词"审查/review"，强制 markdown 表格 + 严重/中/低三档），跑 `audit "审查 calc.py"` → LLM 输出**严格按 skill 规定格式**——表格列名、分级标签、行号要求一字不差。
+
+**单测**：tests/unit/test_skills.py 20 条全过；全套 12 文件全过。
 
 **Claude Code 怎么做**：Skills 是用户自定义的 prompt 包，按用户输入或上下文自动触发。本质是**可复用的角色 + 工作流模板**。
 
