@@ -28,7 +28,7 @@
 | P1 #4 | JSON 解析健壮性 | 🟢 完成（retry 包装 + ICA response_format 探测/硬规则） |
 | P1 #5 | 全局状态重构 | 🟢 完成（state.Session + scoped_session 渐进式） |
 | P1 #6 | 沙箱模式 opt-in | 🟢 完成（--sandbox docker[:image]，仅包 execute_command） |
-| P2 #7 | Plan Mode | ⬜ 未着手 |
+| P2 #7 | Plan Mode | 🟢 完成（方案 C：session 级 flag + 多轮探索 + /approve） |
 | P2 #8 | Skills 系统 | ⬜ 未着手 |
 | P2 #9 | 子 Agent | ⬜ 未着手 |
 | P2 #10 | MCP 协议 | ⬜ 未着手 |
@@ -210,9 +210,23 @@
 
 这些是"做了能学到核心设计、不做也不影响基本功能"的功能。每项可独立做。
 
-### 7. Plan Mode（真正的 plan，不是输出 JSON） ⬜ 未着手
+### 7. Plan Mode（真正的 plan，不是输出 JSON） 🟢 完成
 
-**进度（2026-05-21）**：工具白名单机制已有（audit mode 复用）。**待做**："审核 → 批准 → 实施"状态机；plan 阶段禁用写工具。
+**进度（2026-05-22 夜）**：方案 C 完整状态机落地（笔记 [_15](./notes/shadow/2026-05-22_15-plan-mode-c.md)）。
+
+- `state.py`：Session 加 `plan_mode` / `plan_draft` / `plan_history`
+- `tools.py`：`update_plan_draft` / `exit_plan_mode_signal` sentinel 工具，进 `READONLY_TOOL_NAMES`
+- `agent.py`：`_PLANNER_ROLE` system prompt + `plan_chat()` 多轮循环 + `enter/cancel/approve/is/get` helper
+- `main.py`：`/plan_on` `/plan_off` `/plan` `/approve` 命令族；plan_mode 下普通输入走 plan_chat()
+
+**关键机制**：
+- **写工具物理屏蔽**：plan_chat 用 `_filter_tools(READONLY_TOOL_NAMES)`，LLM 看不见 write_file/replace_in_file/execute_command
+- **跨轮草稿连续性**：每轮 system prompt 末尾追加最新 `_PLAN_DRAFT`
+- **强约束 implementation**：`/approve` 把草稿拼进 `requirement` 作为"严格按此执行"的指令，进 `run()` 实施
+
+**集成验证**（Sonnet 4.6）：R1 写草稿（multiply）→ R2 增量加 divide（整体替换草稿，~600 → ~1500 字符）→ /approve 拼出 1404 字符 enriched requirement → run() 严格按草稿实施（只加 multiply 没引入计划外改动）→ 测试 rc=0。
+
+**单测**：tests/unit/test_plan_mode.py 17 条全过；全套 11 文件全过。
 
 **Claude Code 怎么做**：进入 plan mode 后**禁用所有写工具**，LLM 只读探索、产出 markdown 计划，用户批准后才退出 plan mode 开始实施。
 

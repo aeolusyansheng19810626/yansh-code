@@ -19,6 +19,7 @@ from tools import (
     list_symbols, replace_symbol, fetch_webpage, search_docs, append_to_file,
     find_references, glob_files, git_diff, git_log, workspace_symbols,
     directory_summary, delete_file, task_complete,
+    update_plan_draft, exit_plan_mode_signal,
 )
 import interrupt
 import tools as _tools_mod
@@ -63,6 +64,11 @@ _REPLAY_DIR    = _YANSH_DIR / "replay"
 
 # #37 当前任务的快照引用，code()/fix()/_auto_generate_tests 在写入前查它做增量备份
 _CURRENT_SNAPSHOT: dict | None = None
+
+# P2 #7 Plan Mode：会话级状态。state.Session 镜像这三个字段
+_PLAN_MODE: bool = False
+_PLAN_DRAFT: str = ""
+_PLAN_HISTORY: list = []   # plan 模式独立对话历史（不混入 conversation_history）
 
 # 对话历史管理
 conversation_history = []
@@ -926,6 +932,9 @@ def _dispatch_tool_call(tool_call, *, mode="auto", allow_hil=True, allow_confirm
         "glob_files": glob_files,
         "git_diff": git_diff,
         "git_log": git_log,
+        # P2 #7 Plan Mode 专用工具：sentinel 形态，由 plan_chat 循环识别
+        "update_plan_draft": update_plan_draft,
+        "exit_plan_mode_signal": exit_plan_mode_signal,
     }
     if name == "list_files":
         return {"name": name, "args": args, "id": tool_call.id, "result": list_files()}
@@ -1101,6 +1110,38 @@ _AUDITOR_ROLE = """【角色：审计 Agent】
 - 区分 bug 与风格偏好；指出问题前先排除"这是有意为之的设计选择"
 - 不臆断未读过的代码；引用证据时给出 file:line
 - 对小问题保持比例感，不要为凑数堆砌
+"""
+
+_PLANNER_ROLE = """【角色：Planner Agent（Plan Mode）】
+你正处于 Plan Mode——**所有写工具被禁用**，你只能用只读工具探索代码与思考方案。
+任务是：与用户多轮对话，沉淀一份清晰、可执行的实施方案（plan 草稿），由用户用 /approve 决定是否实施。
+
+【收尾要求 - 必读】
+- 每一轮工作完了用 `exit_plan_mode_signal(reason)` 表明"等待用户审阅"——不要沉默
+- 想沉淀/修改方案就调 `update_plan_draft(content)`——**整体替换**最新草稿（不是追加）。每次给完整版
+- **不要**调 `task_complete`——Plan Mode 的退出由用户 /approve 触发，不由你
+
+【对话节奏】
+- 用户提了新需求/补充信息 → 你先必要的探索（读关键文件、grep、看符号），再 update_plan_draft（如果方案有变），最后 exit_plan_mode_signal
+- 用户表示满意但还没 /approve → 简短确认即可（一句话），别再大改草稿
+- 用户要求修改方案 → 直接 update_plan_draft 改完，再 exit_plan_mode_signal
+
+【plan 草稿建议结构】
+## 目标
+（一句话：要解决什么问题/达到什么效果）
+## 改动文件
+- file_a.py：做什么 / 为什么
+- file_b.py：...
+## 步骤
+1. ...
+2. ...
+## 风险与权衡
+- ...
+
+【避免的反模式】
+- 一上来不探索就给方案——先读 1-3 个关键文件再下笔
+- 改一个字也大改方案——增量更新，复用前一版结构
+- 写代码或建议执行命令——这是实施期的事，Plan Mode 只产出方案
 """
 
 def _get_project_rules():
@@ -1509,6 +1550,161 @@ def audit(requirement):
     console.print()
     console.print(last_text or "（无报告内容）", highlight=False)
     return {"success": bool(last_text), "report": last_text}
+
+
+# ============================================================
+# P2 #7 Plan Mode 方案 C：会话级 plan_mode + 多轮探索 + /approve
+# ============================================================
+
+_PLAN_SOFT_LIMIT = 12  # plan_chat 单轮（一次用户输入）内的最大工具调用轮数
+
+
+def enter_plan_mode():
+    """打开 plan_mode flag。新对话历史从空开始。"""
+    global _PLAN_MODE, _PLAN_HISTORY
+    _PLAN_MODE = True
+    _PLAN_HISTORY = []
+    console.print("[Plan Mode] 已进入 plan 模式——写工具被禁用，多轮对话精炼方案；"
+                  "用 /plan 查看草稿，/approve 批准并实施，/plan_off 取消", highlight=False)
+
+
+def cancel_plan_mode():
+    """关 plan_mode 不实施。草稿丢弃。"""
+    global _PLAN_MODE, _PLAN_DRAFT, _PLAN_HISTORY
+    _PLAN_MODE = False
+    _PLAN_DRAFT = ""
+    _PLAN_HISTORY = []
+    console.print("[Plan Mode] 已退出，草稿已丢弃", highlight=False)
+
+
+def get_plan_draft() -> str:
+    return _PLAN_DRAFT
+
+
+def is_plan_mode() -> bool:
+    return _PLAN_MODE
+
+
+def approve_plan() -> str:
+    """用户 /approve：返回需要交给 run() 的 requirement（含原始上下文 + 草稿）。
+    草稿会作为强约束拼进 requirement。退出 plan_mode 但保留草稿到最后清理。
+    """
+    global _PLAN_MODE, _PLAN_DRAFT, _PLAN_HISTORY
+    if not _PLAN_DRAFT:
+        return ""
+    # 拼接 requirement：草稿作为强约束 + 历次用户指令的拼接（最近一条作为主诉求）
+    user_msgs = [m["content"] for m in _PLAN_HISTORY if m.get("role") == "user"]
+    headline = user_msgs[0] if user_msgs else "按以下方案实施"
+    enriched = (
+        f"{headline}\n\n"
+        f"【已批准的实施方案 - 严格按此执行】\n{_PLAN_DRAFT}"
+    )
+    _PLAN_MODE = False
+    _PLAN_DRAFT = ""
+    _PLAN_HISTORY = []
+    return enriched
+
+
+def plan_chat(user_input: str) -> str:
+    """Plan Mode 下的对话循环：READONLY tools + multi-round + sentinel 识别。
+
+    每次用户输入触发一次循环——LLM 探索 / 更新草稿 / 调 exit_plan_mode_signal 收尾。
+    返回最后一段 assistant 文本供主循环显示。
+    """
+    global _PLAN_DRAFT, _PLAN_HISTORY
+
+    # 注入 workspace 顶层结构（与 audit 同款）
+    try:
+        ws_symbols_result = workspace_symbols()
+    except Exception:
+        ws_symbols_result = {"error": "workspace_symbols 失败", "files": {}, "subdirs": {}}
+    if "error" in ws_symbols_result:
+        symbols_brief = f"（workspace_symbols 失败：{ws_symbols_result['error']}）"
+    else:
+        files_map = ws_symbols_result.get("files", {})
+        subdirs_map = ws_symbols_result.get("subdirs", {})
+        lines = []
+        for path, syms in sorted(files_map.items()):
+            head = ", ".join(f"{s['name']}({s['type'][0]}:L{s['line']})" for s in syms[:30])
+            extra = f" +{len(syms)-30}" if len(syms) > 30 else ""
+            lines.append(f"  {path}: {head}{extra}")
+        if subdirs_map:
+            lines.append("")
+            lines.append("子目录（按需深挖：workspace_symbols(path='...') / directory_summary(path='...')）:")
+            for d, info in sorted(subdirs_map.items()):
+                lines.append(f"  {d}/  ({info['py_files']} 个 .py / {info['total_symbols']} 个符号)")
+        symbols_brief = (
+            f"workspace 顶层符号索引（{ws_symbols_result['total_files']} 顶层文件 / "
+            f"{ws_symbols_result['total_symbols']} 顶层符号）：\n" + "\n".join(lines)
+        )
+
+    sys_prompt = f"{_PLANNER_ROLE}{_get_project_rules()}\n\n{symbols_brief}"
+    if _PLAN_DRAFT:
+        sys_prompt += f"\n\n【当前 plan 草稿】\n{_PLAN_DRAFT}"
+
+    # 用 plan_history 做对话连续性，但每次重新构造 messages（避免无限累积 system）
+    messages = [{"role": "system", "content": sys_prompt}]
+    messages.extend(_PLAN_HISTORY)
+    messages.append({"role": "user", "content": user_input})
+    _PLAN_HISTORY.append({"role": "user", "content": user_input})
+
+    plan_tools = _filter_tools(READONLY_TOOL_NAMES)
+    rounds_used = 0
+    last_text = ""
+    silent_prompted = False
+
+    while rounds_used < _PLAN_SOFT_LIMIT:
+        rounds_used += 1
+        if interrupt.is_interrupted():
+            raise interrupt.Interrupted()
+
+        response = call_llm(messages, tools=plan_tools, tool_choice="auto", stream=False)
+        msg = response.choices[0].message
+        messages.append({
+            "role": "assistant",
+            "content": msg.content,
+            "tool_calls": [tc.model_dump() for tc in msg.tool_calls] if msg.tool_calls else None,
+        })
+        if msg.content:
+            last_text = msg.content
+
+        if msg.tool_calls:
+            console.print(f"[plan 轮 {rounds_used}] {len(msg.tool_calls)} 次工具调用", highlight=False)
+            done = False
+            for tc in msg.tool_calls:
+                out = _dispatch_tool_call(tc, mode="audit", allow_hil=False, allow_confirm=False, snap=None)
+                _record_dispatch(out, messages)
+                # plan 草稿更新
+                if out["result"].get("_plan_draft_update"):
+                    _PLAN_DRAFT = out["result"].get("content", "")
+                    console.print(f"[plan 草稿已更新 / {len(_PLAN_DRAFT)} 字符]", highlight=False)
+                # exit signal：本轮收尾
+                if out["result"].get("_exit_plan_mode_signal"):
+                    reason = out["result"].get("reason", "")
+                    if reason:
+                        console.print(f"[plan 等待审阅] {reason}", highlight=False)
+                    done = True
+            if done:
+                break
+        else:
+            # 沉默退出兜底：追问一次
+            if not silent_prompted:
+                silent_prompted = True
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "你这一轮没调任何工具——按协议本轮结束应调 `exit_plan_mode_signal()` 表明等待审阅；"
+                        "若有方案变更先 `update_plan_draft(content=...)`。"
+                    ),
+                })
+                continue
+            break
+
+    # 把本轮 assistant 文本和草稿沉淀进 plan_history（不存 tool_calls，避免历史膨胀）
+    if last_text:
+        _PLAN_HISTORY.append({"role": "assistant", "content": last_text})
+
+    return last_text or "（无文本输出）"
 
 
 def review(requirement, modified_files):

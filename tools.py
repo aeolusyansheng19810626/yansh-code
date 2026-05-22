@@ -45,6 +45,27 @@ def task_complete(success: bool, summary: str) -> dict:
     }
 
 
+def update_plan_draft(content: str) -> dict:
+    """[P2 #7] Plan Mode 专用：写入/更新当前 plan 草稿。
+    返回 sentinel `_plan_draft_update`，由 plan_chat() 循环捕获后写入 state。
+    草稿是 markdown 文本，建议结构：## 目标 / ## 步骤 / ## 关键文件 / ## 风险。
+    """
+    return {
+        "_plan_draft_update": True,
+        "content": str(content or ""),
+    }
+
+
+def exit_plan_mode_signal(reason: str = "") -> dict:
+    """[P2 #7] Plan Mode 专用：LLM 表示当前轮次的探索/写草稿已完成，等待用户审批。
+    不强制退出 Plan Mode——用户可继续追问 / 调整。仅作为"请审阅"的礼貌信号。
+    """
+    return {
+        "_exit_plan_mode_signal": True,
+        "reason": str(reason or ""),
+    }
+
+
 def _reinit_paths():
     """--cwd 变更后重新初始化模块级路径变量（由 main.py 调用）"""
     global _WORKSPACE_ROOT

@@ -29,6 +29,10 @@ class Session:
     project_type: Optional[str] = None
     project_test_cmd: Optional[str] = None
     current_snapshot: Optional[dict] = None
+    # P2 #7：Plan Mode 会话级状态
+    plan_mode: bool = False
+    plan_draft: str = ""
+    plan_history: list = field(default_factory=list)
     # AST 缓存按引用持有 tools._AST_CACHE（不复制）；只在 reset 时清空
     _ast_cache_ref: Optional[dict] = field(default=None, repr=False)
 
@@ -45,6 +49,9 @@ class Session:
         self.project_type = getattr(_a, "_PROJECT_TYPE", None)
         self.project_test_cmd = getattr(_a, "_PROJECT_TEST_CMD", None)
         self.current_snapshot = getattr(_a, "_CURRENT_SNAPSHOT", None)
+        self.plan_mode = bool(getattr(_a, "_PLAN_MODE", False))
+        self.plan_draft = str(getattr(_a, "_PLAN_DRAFT", "") or "")
+        self.plan_history = list(getattr(_a, "_PLAN_HISTORY", []) or [])
         self._ast_cache_ref = getattr(_t, "_AST_CACHE", None)
         return self
 
@@ -63,6 +70,9 @@ class Session:
         _a._PROJECT_TYPE = self.project_type
         _a._PROJECT_TEST_CMD = self.project_test_cmd
         _a._CURRENT_SNAPSHOT = self.current_snapshot
+        _a._PLAN_MODE = self.plan_mode
+        _a._PLAN_DRAFT = self.plan_draft
+        _a._PLAN_HISTORY = list(self.plan_history)
 
     # ---------- 测试便利 ----------
 
@@ -73,6 +83,9 @@ class Session:
         self.project_type = None
         self.project_test_cmd = None
         self.current_snapshot = None
+        self.plan_mode = False
+        self.plan_draft = ""
+        self.plan_history = []
         if workspace_dir is not None:
             self.workspace_dir = workspace_dir
         self.push()

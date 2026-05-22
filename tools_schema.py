@@ -334,6 +334,34 @@ TOOLS = [
                 "required": ["success", "summary"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_plan_draft",
+            "description": "[Plan Mode 专用] 写入/更新当前 plan 草稿（markdown）。每次想沉淀方案就调一次——后续轮次会拿到最新草稿。建议结构：## 目标 / ## 步骤 / ## 关键文件 / ## 风险与权衡。多次调用会**整体替换**草稿（不是追加），所以每次给完整版本。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {"type": "string", "description": "完整 plan 草稿（markdown）"}
+                },
+                "required": ["content"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "exit_plan_mode_signal",
+            "description": "[Plan Mode 专用] 当前轮探索/写草稿告一段落、可请用户审阅时调用。**不会真正退出 Plan Mode**——用户可继续追问、补充需求或要求修改方案；批准必须由用户用 /approve 触发。一轮结束时调一次即可。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {"type": "string", "description": "可选：本轮做了什么、为什么觉得到位了"}
+                },
+                "required": []
+            }
+        }
     }
 ]
 
@@ -347,4 +375,5 @@ READONLY_TOOL_NAMES = {
     "git_diff", "git_log",
     "fetch_webpage", "search_docs",
     "task_complete",
+    "update_plan_draft", "exit_plan_mode_signal",
 }

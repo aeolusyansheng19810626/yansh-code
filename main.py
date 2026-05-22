@@ -28,6 +28,10 @@ _SLASH_COMMANDS = [
     ("/hil",      "切换 Human-in-Loop 模式"),
     ("/stats",    "Token 消耗统计"),
     ("/replay",   "加载失败案例回放"),
+    ("/plan_on",  "进入 Plan Mode（多轮探索 + 审批）"),
+    ("/plan_off", "退出 Plan Mode（不实施，丢弃草稿）"),
+    ("/plan",     "查看当前 plan 草稿"),
+    ("/approve",  "批准当前 plan 草稿并进入实施"),
 ]
 
 
@@ -319,6 +323,7 @@ def main():
         _sb = "off"
     console.print(f"模式: {current_mode} | 模型: {get_config()['model']} | 沙箱: {_sb}")
     console.print("输入任务需求，或输入 /history, /clear, /compress, /rollback, /stats, /log, /config, /rules, /mode 获取帮助。")
+    console.print("Plan Mode (P2 #7): /plan_on 进入多轮方案精炼，/plan 查看草稿，/approve 批准实施，/plan_off 取消。", highlight=False)
     console.print("图片: @image <路径/URL>（分析截图/设计稿）  @paste（粘贴剪贴板截图）  @image design.png → 按设计稿生成代码", highlight=False)
     if _PROJECT_TYPE:
         console.print(f"检测到项目：[bold]{_PROJECT_TYPE}[/bold]")
@@ -457,6 +462,52 @@ def main():
                     console.print("用法：/replay [list|load <id>]")
             else:
                 console.print("用法：/replay [list|load <id>]")
+            continue
+
+        # P2 #7 Plan Mode 命令族
+        if user_input == "/plan_on":
+            if agent.is_plan_mode():
+                console.print("已经在 Plan Mode 里了", highlight=False)
+            else:
+                agent.enter_plan_mode()
+            continue
+
+        if user_input == "/plan_off":
+            if not agent.is_plan_mode():
+                console.print("当前不在 Plan Mode", highlight=False)
+            else:
+                agent.cancel_plan_mode()
+            continue
+
+        if user_input == "/plan":
+            draft = agent.get_plan_draft()
+            if not draft:
+                console.print("当前没有 plan 草稿", highlight=False)
+            else:
+                console.print("\n[bold cyan]=== 当前 plan 草稿 ===[/bold cyan]", highlight=False)
+                console.print(draft, highlight=False)
+                console.print("[bold cyan]=== /草稿 ===[/bold cyan]\n", highlight=False)
+            continue
+
+        if user_input == "/approve":
+            if not agent.is_plan_mode():
+                console.print("当前不在 Plan Mode，无草稿可批准", highlight=False)
+                continue
+            if not agent.get_plan_draft():
+                console.print("草稿为空——先跟 LLM 对话产出方案再 /approve", highlight=False)
+                continue
+            enriched = agent.approve_plan()
+            console.print("[Plan Mode] 已批准草稿，进入实施流程...", highlight=False)
+            agent.run(enriched, mode=current_mode if current_mode != "plan" else "auto")
+            agent.show_stats()
+            continue
+
+        # Plan Mode 下的普通输入：走 plan_chat（多轮探索 + 草稿迭代）
+        if agent.is_plan_mode():
+            maybe_compress_history()
+            reply = agent.plan_chat(user_input)
+            console.print(f"\n[bold magenta]Planner:[/bold magenta]\n{reply}\n")
+            agent.show_stats()
             continue
 
         input_type = classify_input(user_input)
