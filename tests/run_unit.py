@@ -29,6 +29,8 @@ files = [
     "tests/unit/test_parser_concurrency.py",
     "tests/unit/test_procutil.py",
     "tests/unit/test_task_log_concurrency.py",
+    "tests/unit/test_frontmatter.py",
+    "tests/unit/test_session_isolation.py",
 ]
 
 if __name__ == "__main__":

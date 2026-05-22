@@ -848,6 +848,96 @@ def test_audit_mode_subagent_cannot_write_file_e2e(tmp_path):
     assert not pwned_target.exists(), "audit 链路被绕过——pwned.txt 被写出来了"
 
 
+# ---------- P4-4：general subagent summary 加修改文件清单 ----------
+
+def test_general_subagent_summary_lists_modified_files(tmp_path):
+    """general role 子 agent 写文件后，summary 末尾应追加 [系统提示] 文件清单。
+
+    Gemini 指出：父 agent 不知道子 agent 改了哪些文件 → 用旧 context 生成
+    代码会 Lost Update。本测试验证父 agent 拿到的 summary 含"修改文件" 提示。
+    """
+    with state.scoped_session(tmp_path):
+        (tmp_path / "existing.py").write_text("x=1\n", encoding="utf-8")
+
+        call_count = {"n": 0}
+
+        def fake_llm(msgs, **kw):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                # 第一轮：写两个文件
+                return _mk_resp(tool_calls=[
+                    ("w1", "write_file",
+                     {"filename": "new1.py", "content": "# new"}),
+                    ("w2", "write_file",
+                     {"filename": "new2.py", "content": "# new"}),
+                ])
+            # 第二轮 task_complete
+            return _mk_resp(tool_calls=[
+                ("tc", "task_complete",
+                 {"success": True, "summary": "改了两个文件"}),
+            ])
+
+        orig = agent.call_llm
+        try:
+            agent.call_llm = fake_llm
+            res = agent._run_subagent("写文件", role="general", max_steps=4)
+        finally:
+            agent.call_llm = orig
+
+    assert res["success"] is True
+    # 修改文件清单出现在 summary
+    assert "[系统提示]" in res["summary"]
+    assert "new1.py" in res["summary"]
+    assert "new2.py" in res["summary"]
+    # 提示父 agent 重新读
+    assert "重新" in res["summary"] or "read_file" in res["summary"]
+
+
+def test_explorer_subagent_summary_no_files_addendum(tmp_path):
+    """explorer role 子 agent（只读）即便看到 _WRITE_TOOLS 也写不了文件，
+    summary 不应含修改文件提示——避免误导父 agent"""
+    with state.scoped_session(tmp_path):
+        (tmp_path / "f.py").write_text("x=1\n", encoding="utf-8")
+
+        def fake_llm(msgs, **kw):
+            return _mk_resp(tool_calls=[
+                ("tc", "task_complete",
+                 {"success": True, "summary": "看完了"}),
+            ])
+
+        orig = agent.call_llm
+        try:
+            agent.call_llm = fake_llm
+            res = agent._run_subagent("查 X", role="explorer", max_steps=2)
+        finally:
+            agent.call_llm = orig
+
+    assert "[系统提示]" not in res["summary"]
+
+
+def test_general_subagent_no_files_modified_no_addendum(tmp_path):
+    """general role 但实际没写文件 → summary 也不该有修改清单"""
+    with state.scoped_session(tmp_path):
+        (tmp_path / "f.py").write_text("x=1\n", encoding="utf-8")
+
+        def fake_llm(msgs, **kw):
+            # 只读，不写
+            return _mk_resp(tool_calls=[
+                ("r", "read_file", {"filename": "f.py"}),
+                ("tc", "task_complete",
+                 {"success": True, "summary": "只看不改"}),
+            ])
+
+        orig = agent.call_llm
+        try:
+            agent.call_llm = fake_llm
+            res = agent._run_subagent("查", role="general", max_steps=2)
+        finally:
+            agent.call_llm = orig
+
+    assert "[系统提示]" not in res["summary"]
+
+
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, "-v"])
