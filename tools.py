@@ -780,38 +780,190 @@ def replace_symbol(symbol_name, new_code, file_path):
 _WORKSPACE_SYMBOLS_IGNORE = {".git", ".yansh", "__pycache__", "node_modules", "venv", ".venv", ".pytest_cache"}
 
 
-def workspace_symbols(extensions=None):
-    """扫描 workspace 下符合 extensions 的文件，返回每个文件的函数/类清单。
-    默认只扫 .py。命中 _AST_CACHE 几乎零成本，未命中则增量 parse 并入缓存。"""
-    exts = tuple(extensions) if extensions else (".py",)
-    root = Path(_get_workspace())
-    if not root.exists():
-        return {"files": {}, "total_files": 0, "total_symbols": 0}
-
-    files_out: dict = {}
+def _dir_symbol_count(dirpath: Path, exts: tuple) -> tuple:
+    """递归统计某目录下匹配 exts 的文件数 + 符号总数。
+    用于 workspace_symbols top 模式给子目录做摘要——只算计数不存符号清单。
+    命中 _AST_CACHE 几乎零成本。"""
+    py_files = 0
     total_symbols = 0
-
-    for f in root.rglob("*"):
+    for f in dirpath.rglob("*"):
         if not f.is_file():
             continue
         if any(part in _WORKSPACE_SYMBOLS_IGNORE for part in f.parts):
             continue
         if not f.name.endswith(exts):
             continue
+        py_files += 1
         symbols, err = _parse_symbols_cached(f)
         if err:
-            # tree-sitter 未装会反复返回同一错误，提前返回
-            if "tree-sitter 未安装" in err.get("error", ""):
-                return err
             continue
-        rel = str(f.relative_to(root)).replace("\\", "/")
-        files_out[rel] = symbols
         total_symbols += len(symbols)
+    return py_files, total_symbols
+
+
+def workspace_symbols(extensions=None, path=None, recursive=False):
+    """扫描 workspace 内符号清单。
+    - 默认（path=None, recursive=False）：返回顶层文件符号 + 子目录摘要（py_files / total_symbols）
+    - path="sub/dir", recursive=False：返回该目录顶层文件符号 + 子目录摘要
+    - recursive=True：递归扫整个子树（旧全量行为；大项目慎用）
+
+    默认只扫 .py。命中 _AST_CACHE 几乎零成本。"""
+    exts = tuple(extensions) if extensions else (".py",)
+    ws_root = Path(_get_workspace())
+    if not ws_root.exists():
+        return {"mode": "top", "path": ".", "files": {}, "subdirs": {},
+                "total_files": 0, "total_symbols": 0}
+
+    # 解析 path 参数：相对 workspace；越界拦截
+    if path:
+        resolved, err = _validate_path(path)
+        if err:
+            return err
+        if not resolved.exists():
+            return _err("not_found", f"目录不存在：{path}")
+        if not resolved.is_dir():
+            return _err("invalid_args", f"path 不是目录：{path}")
+        scan_root = resolved
+        rel_base = path.rstrip("/").rstrip("\\")
+    else:
+        scan_root = ws_root
+        rel_base = "."
+
+    # recursive=True：旧 deep 行为
+    if recursive:
+        files_out: dict = {}
+        total_symbols = 0
+        for f in scan_root.rglob("*"):
+            if not f.is_file():
+                continue
+            if any(part in _WORKSPACE_SYMBOLS_IGNORE for part in f.parts):
+                continue
+            if not f.name.endswith(exts):
+                continue
+            symbols, err = _parse_symbols_cached(f)
+            if err:
+                if "tree-sitter 未安装" in err.get("error", ""):
+                    return err
+                continue
+            rel = str(f.relative_to(ws_root)).replace("\\", "/")
+            files_out[rel] = symbols
+            total_symbols += len(symbols)
+        return {
+            "mode": "deep",
+            "path": rel_base,
+            "files": files_out,
+            "total_files": len(files_out),
+            "total_symbols": total_symbols,
+        }
+
+    # 默认 top 模式：只列直接子项
+    files_out = {}
+    subdirs: dict = {}
+    total_symbols = 0
+    try:
+        entries = list(scan_root.iterdir())
+    except OSError as e:
+        return _err("internal", f"读取目录失败：{e}")
+
+    for entry in entries:
+        if entry.name in _WORKSPACE_SYMBOLS_IGNORE:
+            continue
+        if entry.is_file():
+            if not entry.name.endswith(exts):
+                continue
+            symbols, err = _parse_symbols_cached(entry)
+            if err:
+                if "tree-sitter 未安装" in err.get("error", ""):
+                    return err
+                continue
+            rel = str(entry.relative_to(ws_root)).replace("\\", "/")
+            files_out[rel] = symbols
+            total_symbols += len(symbols)
+        elif entry.is_dir():
+            py_files, sub_total = _dir_symbol_count(entry, exts)
+            # 跳过空子目录（无任何匹配文件）以减小 prompt 噪音
+            if py_files == 0:
+                continue
+            subdirs[entry.name] = {"py_files": py_files, "total_symbols": sub_total}
 
     return {
+        "mode": "top",
+        "path": rel_base,
         "files": files_out,
+        "subdirs": subdirs,
         "total_files": len(files_out),
         "total_symbols": total_symbols,
+    }
+
+
+_DIR_SUMMARY_KEY_FILES = (
+    "README.md", "README.rst", "README", "README.txt",
+    "pyproject.toml", "setup.py", "setup.cfg", "requirements.txt",
+    "Makefile", "Dockerfile", "docker-compose.yml",
+    "Cargo.toml", "go.mod", "package.json", "tsconfig.json",
+    "CLAUDE.md", "ROADMAP.md", ".agent_rules",
+)
+
+
+def directory_summary(path="."):
+    """返回某目录的整体感知摘要：文件数、扩展名分布、关键文件、直接子目录、文件名采样。
+    不递归——只看直接子项。用于 LLM 在大项目里快速了解某目录是干啥的。"""
+    ws_root = Path(_get_workspace())
+    if not ws_root.exists():
+        return _err("not_found", f"workspace 不存在：{ws_root}")
+
+    if path in (".", ""):
+        target = ws_root
+        rel_base = "."
+    else:
+        resolved, err = _validate_path(path)
+        if err:
+            return err
+        if not resolved.exists():
+            return _err("not_found", f"目录不存在：{path}")
+        if not resolved.is_dir():
+            return _err("invalid_args", f"path 不是目录：{path}")
+        target = resolved
+        rel_base = path.rstrip("/").rstrip("\\").replace("\\", "/")
+
+    by_ext: dict = {}
+    key_files = []
+    subdirs = []
+    files_sample = []
+    file_count = 0
+    subdir_count = 0
+
+    try:
+        entries = sorted(target.iterdir(), key=lambda e: e.name)
+    except OSError as e:
+        return _err("internal", f"读取目录失败：{e}")
+
+    for entry in entries:
+        if entry.name in _WORKSPACE_SYMBOLS_IGNORE:
+            continue
+        if entry.is_file():
+            file_count += 1
+            ext = entry.suffix.lower() or "<noext>"
+            by_ext[ext] = by_ext.get(ext, 0) + 1
+            if entry.name in _DIR_SUMMARY_KEY_FILES:
+                key_files.append(entry.name)
+            if len(files_sample) < 12:
+                files_sample.append(entry.name)
+        elif entry.is_dir():
+            subdir_count += 1
+            subdirs.append(entry.name + "/")
+
+    if file_count > len(files_sample):
+        files_sample.append(f"... 还有 {file_count - len(files_sample)} 个文件")
+
+    return {
+        "path": rel_base,
+        "file_count": file_count,
+        "subdir_count": subdir_count,
+        "by_extension": dict(sorted(by_ext.items(), key=lambda kv: -kv[1])),
+        "key_files": key_files,
+        "subdirs": subdirs,
+        "files_sample": files_sample,
     }
 
 

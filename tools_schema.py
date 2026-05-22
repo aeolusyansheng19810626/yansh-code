@@ -267,7 +267,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "workspace_symbols",
-            "description": "扫描 workspace 内所有源文件，返回每个文件的函数和类清单（name/type/line）。用于一次性了解项目整体结构，避免反复 list_symbols。默认只扫 .py。",
+            "description": "返回项目符号清单（函数/类 name/type/line），分层模式默认只看顶层避免撑爆 context。**默认（不传 path/recursive）只列顶层文件 + 子目录摘要**（py_files/total_symbols 计数）；传 path 下钻该目录顶层；只在小项目或确实需要全树时传 recursive=true。默认只扫 .py。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -275,6 +275,31 @@ TOOLS = [
                         "type": "array",
                         "items": {"type": "string"},
                         "description": "文件扩展名列表，例 [\".py\"]。不传则默认 [\".py\"]。"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "可选：相对 workspace 的子目录，下钻查看该目录顶层（不递归子树）。不传则查 workspace 根。"
+                    },
+                    "recursive": {
+                        "type": "boolean",
+                        "description": "可选：true=递归扫子树（旧全量行为，大项目慎用）；默认 false（只看一层）。"
+                    }
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "directory_summary",
+            "description": "返回某目录的整体感知摘要：文件数、扩展名分布、关键文件（README/pyproject 等）、直接子目录、文件名采样。不递归。用于在大项目里快速了解某目录是干啥的——比 list_files 更高信息密度。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "相对 workspace 的目录路径，默认 '.'（workspace 根）。"
                     }
                 },
                 "required": []
@@ -318,7 +343,7 @@ TOOLS = [
 READONLY_TOOL_NAMES = {
     "read_file", "list_files", "glob_files", "search_in_files",
     "list_symbols", "get_symbol_definition", "find_references",
-    "workspace_symbols",
+    "workspace_symbols", "directory_summary",
     "git_diff", "git_log",
     "fetch_webpage", "search_docs",
     "task_complete",

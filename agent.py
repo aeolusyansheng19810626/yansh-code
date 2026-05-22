@@ -18,7 +18,7 @@ from tools import (
     get_symbol_definition, search_in_files, move_file, apply_patch,
     list_symbols, replace_symbol, fetch_webpage, search_docs, append_to_file,
     find_references, glob_files, git_diff, git_log, workspace_symbols,
-    delete_file, task_complete,
+    directory_summary, delete_file, task_complete,
 )
 import interrupt
 import tools as _tools_mod
@@ -870,6 +870,7 @@ def _dispatch_tool_call(tool_call, *, mode="auto", allow_hil=True, allow_confirm
         "search_in_files": search_in_files,
         "list_symbols": list_symbols,
         "workspace_symbols": workspace_symbols,
+        "directory_summary": directory_summary,
         "fetch_webpage": fetch_webpage,
         "search_docs": search_docs,
         "find_references": find_references,
@@ -1031,7 +1032,8 @@ _AUDITOR_ROLE = """【角色：审计 Agent】
   - `task_complete(success=False, summary="workspace 为空 / 目标符号不存在 / 无法继续")`
 - **不要沉默退出**——loop 会再问你一次"是否完成"，浪费一轮。
 
-工作流：先看 system 中预注入的 workspace_symbols 摘要锁定关注文件；再用 read_file/get_symbol_definition/search_in_files/find_references 按需深挖；最后输出报告 + task_complete。
+工作流：先看 system 中预注入的 workspace_symbols 顶层摘要锁定关注目录/文件；再用 read_file/get_symbol_definition/search_in_files/find_references 按需深挖；最后输出报告 + task_complete。
+**分层索引使用**：注入的是顶层结构，子目录只有计数。深挖某目录用 `workspace_symbols(path="<dir>")` 看该目录顶层符号，或 `directory_summary(path="<dir>")` 看文件清单/扩展名分布。**不要一次拿全树**（recursive=true 在大项目会撑爆 context）。
 工具调用效率（重要）：
 - **先定位再精读**：用 search_in_files / list_symbols / get_symbol_definition 锁定具体行号或符号，不要整文件 read_file 后再筛选
 - **无依赖工具调用并行**：同一轮可同时发起多个 read/search/list_symbols
@@ -1346,24 +1348,27 @@ def audit(requirement):
     返回 {"success": bool, "report": str}。"""
     console.print("[Agent: Auditor]", highlight=False)
 
-    # 预先构建符号索引摘要，注入 system 减少 LLM 探索回合
-    ws_symbols_result = workspace_symbols()
+    # P0 #1：默认只注入顶层结构，子目录用 path 参数按需深挖（避免大项目撑爆 context）
+    ws_symbols_result = workspace_symbols()  # default top
     if "error" in ws_symbols_result:
         symbols_brief = f"（workspace_symbols 失败：{ws_symbols_result['error']}）"
     else:
         files_map = ws_symbols_result.get("files", {})
-        # 控制 prompt 体量：每文件最多列 30 个符号；总文件数超 80 时截断并标注
+        subdirs_map = ws_symbols_result.get("subdirs", {})
         lines = []
-        for i, (path, syms) in enumerate(sorted(files_map.items())):
-            if i >= 80:
-                lines.append(f"... 还有 {len(files_map) - 80} 个文件未列出 ...")
-                break
+        for path, syms in sorted(files_map.items()):
             head = ", ".join(f"{s['name']}({s['type'][0]}:L{s['line']})" for s in syms[:30])
             extra = f" +{len(syms)-30}" if len(syms) > 30 else ""
             lines.append(f"  {path}: {head}{extra}")
+        if subdirs_map:
+            lines.append("")
+            lines.append("子目录（用 workspace_symbols(path='<dir>') 或 directory_summary(path='<dir>') 深入）：")
+            for d, info in sorted(subdirs_map.items()):
+                lines.append(f"  {d}/  ({info['py_files']} 个 .py / {info['total_symbols']} 个符号)")
         symbols_brief = (
-            f"workspace 符号索引（{ws_symbols_result['total_files']} 文件 / "
-            f"{ws_symbols_result['total_symbols']} 符号）：\n" + "\n".join(lines)
+            f"workspace 顶层符号索引（{ws_symbols_result['total_files']} 顶层文件 / "
+            f"{ws_symbols_result['total_symbols']} 顶层符号；子目录按需深挖）：\n"
+            + "\n".join(lines)
         )
 
     sys_prompt = f"{_AUDITOR_ROLE}{_get_project_rules()}\n\n{symbols_brief}"

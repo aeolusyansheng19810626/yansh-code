@@ -18,11 +18,11 @@
 
 已建：18 个工具、4 类角色、tree-sitter 符号索引（带 mtime 缓存）、HIL diff 确认、git 快照与回滚、任务日志、流式输出、ESC 中断、命令安全沙箱、--cwd 多项目支持。
 
-### 进度速览（2026-05-22）
+### 进度速览（2026-05-22 晚）
 
 | # | 项目 | 状态 |
 |---|---|---|
-| P0 #1 | 分层符号索引 | 🟡 部分（单层在，分层未做） |
+| P0 #1 | 分层符号索引 | 🟢 完成（top/deep 双模式 + directory_summary + audit 顶层注入） |
 | P0 #2 | Prompt 调优 | 🟢 活跃迭代 |
 | P0 #3 | 错误恢复闭环 | 🟢 完成（基础设施 + prompt 加固 + 信号全流程贯通） |
 | P1 #4 | JSON 解析健壮性 | 🟡 部分（基础校验在，retry 未做） |
@@ -41,9 +41,16 @@
 
 ## 优先级 P0：从"玩具"到"真正能用"的分水岭
 
-### 1. 分层符号索引（大型项目支持） 🟡 部分
+### 1. 分层符号索引（大型项目支持） 🟢 完成
 
-**进度（2026-05-21）**：单层 `workspace_symbols` + AST mtime 缓存已实现（commit `9ba0c47`）。分层下钻、`directory_summary(path)`、audit 不再预注入全量摘要——**未做**。
+**进度（2026-05-22）**：三项一起做完（笔记 [_11](./notes/shadow/2026-05-22_11-hierarchical-symbol-index.md)）：
+- `workspace_symbols(path, recursive)` 改成 top/deep 双模式：默认 top 只列顶层文件符号 + 子目录摘要（py_files/total_symbols 计数）；`recursive=True` 复原旧全量行为
+- 新增 `directory_summary(path)` 工具：返回 file_count / by_extension / key_files / subdirs / files_sample，不递归
+- audit() 改顶层注入 + `_AUDITOR_ROLE` prompt 提示主动深挖（`workspace_symbols(path=...)` / `directory_summary(path=...)`）
+
+**集成验证（yansh-code 自身 40 文件）**：top 模式 3,314 chars vs deep 12,975 chars，**缩减 74.5%**。3000+ 文件的大项目按比例估算 deep 模式会直接撑爆 200K context。
+
+**单测**：tests/unit/test_audit.py 19 条全过（旧 4 + 新 15）。
 
 **Claude Code 怎么做**：用户感知不到全局符号索引这种东西。Claude Code 在大项目里靠 `Glob` + `Grep` + 智能的"先看顶层目录，再按需深挖"——本质是**懒加载 + 信息收益最大化**。
 
