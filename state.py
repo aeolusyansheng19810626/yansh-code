@@ -33,6 +33,12 @@ class Session:
     plan_mode: bool = False
     plan_draft: str = ""
     plan_history: list = field(default_factory=list)
+    # P4-3：把 agent.py 的 _ACTIVE_* / _SUBAGENT_STATS 一并镜像，
+    # 让单测 scoped_session 能彻底隔离（之前一个 test 加载的 memory 索引
+    # 会被下一个 test 看到）
+    active_skills_prompt: str = ""
+    active_memory_index: str = ""
+    subagent_stats: dict = field(default_factory=dict)
     # AST 缓存按引用持有 tools._AST_CACHE（不复制）；只在 reset 时清空
     _ast_cache_ref: Optional[dict] = field(default=None, repr=False)
 
@@ -52,6 +58,9 @@ class Session:
         self.plan_mode = bool(getattr(_a, "_PLAN_MODE", False))
         self.plan_draft = str(getattr(_a, "_PLAN_DRAFT", "") or "")
         self.plan_history = list(getattr(_a, "_PLAN_HISTORY", []) or [])
+        self.active_skills_prompt = str(getattr(_a, "_ACTIVE_SKILLS_PROMPT", "") or "")
+        self.active_memory_index = str(getattr(_a, "_ACTIVE_MEMORY_INDEX", "") or "")
+        self.subagent_stats = dict(getattr(_a, "_SUBAGENT_STATS", {}) or {})
         self._ast_cache_ref = getattr(_t, "_AST_CACHE", None)
         return self
 
@@ -73,6 +82,12 @@ class Session:
         _a._PLAN_MODE = self.plan_mode
         _a._PLAN_DRAFT = self.plan_draft
         _a._PLAN_HISTORY = list(self.plan_history)
+        _a._ACTIVE_SKILLS_PROMPT = self.active_skills_prompt
+        _a._ACTIVE_MEMORY_INDEX = self.active_memory_index
+        # _SUBAGENT_STATS 是个 dict——更新内容而非替换引用，免得别处持有的引用过时
+        if hasattr(_a, "_SUBAGENT_STATS"):
+            _a._SUBAGENT_STATS.clear()
+            _a._SUBAGENT_STATS.update(self.subagent_stats)
 
     # ---------- 测试便利 ----------
 
@@ -86,6 +101,13 @@ class Session:
         self.plan_mode = False
         self.plan_draft = ""
         self.plan_history = []
+        self.active_skills_prompt = ""
+        self.active_memory_index = ""
+        self.subagent_stats = {
+            "calls": 0, "total_steps": 0, "last_task": "",
+            "last_summary": "", "last_role": "", "last_steps": 0,
+            "last_success": False,
+        }
         if workspace_dir is not None:
             self.workspace_dir = workspace_dir
         self.push()
