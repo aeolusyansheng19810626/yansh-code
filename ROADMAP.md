@@ -32,7 +32,7 @@
 | P2 #8 | Skills 系统 | 🟢 完成（关键字匹配 + LLM 智能匹配双路径，fast path 零成本） |
 | P2 #9 | 子 Agent | 🟢 完成（dispatch_subagent + role 切工具集 + 禁递归 + 多个并发跑 + /subagent stats） |
 | P2 #10 | MCP 协议 | 🟢 完成（stdio 传输 + tools/list+call + mcp.json 兼容 + /mcp 命令） |
-| P2 #11 | Hooks | ⬜ 未着手 |
+| P2 #11 | Hooks | 🟢 完成（4 事件 + block/modify + shell stdin/stdout + 跨平台超时杀进程树） |
 | P2 #12 | 跨 Session 记忆 | ⬜ 未着手 |
 
 每项的具体进度细节见对应章节顶部的「**进度（YYYY-MM-DD）**」行。维护方式：做了改动就回这里更新该行 + 速览表里的状态。
@@ -329,7 +329,22 @@
 
 ---
 
-### 11. Hooks ⬜ 未着手
+### 11. Hooks 🟢 完成
+
+**进度（2026-05-22）**：笔记 [_21](./notes/shadow/2026-05-22_21-hooks.md)。
+- `hooks.py` 新模块：4 事件（PreToolUse / PostToolUse / UserPromptSubmit / Stop）+ shell stdin/stdout JSON 协议 + matcher 精确匹配 + block/modify/system_message 三种动作
+- 聚合规则：多 hook 串行跑，任意 block 即整体 block（短路），modify 链式累积
+- 配置：`<ws>/.yansh/hooks.json` → `~/.yansh/hooks.json`，对齐 Claude Code settings.json
+- 跨平台超时杀进程树：Windows `taskkill /F /T`、POSIX `killpg(SIGKILL)`——subprocess.run + shell=True 在 Windows 上 kill 不到孙进程的坑
+- agent.py 集成：`_dispatch_tool_call` 拆 wrapper+inner 跑 Pre/Post；`run()` 入口跑 UserPromptSubmit；`run()` 出口跑 Stop
+- 跳过场景：子 agent 内 + 模块禁用 + 单 hook 失败默认 allow（不卡死主流程）
+- main.py：`--json` 自动禁 hooks；`/hooks list` 命令
+
+**集成验证**：写 hook_pre_delete.py（拦 delete .txt）+ hook_post_read.py（read 输出加行数前缀）跑 3 场景全部命中：PreToolUse block / PreToolUse 放行 / PostToolUse modify。
+
+**Windows 转义教训**：hook 命令直接内联进 hooks.json（`python -c "..."`）会被 cmd.exe 转义破坏；最佳实践是写独立脚本文件再调用。
+
+**单测**：tests/unit/test_hooks.py 28 条全过；run_unit.py 15 文件全过。
 
 **Claude Code 怎么做**：用户能在 settings.json 配置事件钩子（PreToolUse / PostToolUse / Stop / UserPromptSubmit），命令行脚本响应事件。
 

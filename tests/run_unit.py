@@ -23,6 +23,7 @@ files = [
     "tests/unit/test_skills.py",
     "tests/unit/test_subagent.py",
     "tests/unit/test_mcp.py",
+    "tests/unit/test_hooks.py",
 ]
 
 if __name__ == "__main__":

@@ -24,6 +24,7 @@ from tools import (
 import interrupt
 import tools as _tools_mod
 import mcp_client as _mcp_mod
+import hooks as _hooks_mod
 import snapshot as _snapshot_mod
 from snapshot import (
     create_snapshot, restore_snapshot, cleanup_snapshot,
@@ -814,19 +815,98 @@ def _filter_tools(allowed_names):
 
 
 def _dispatch_tool_call(tool_call, *, mode="auto", allow_hil=True, allow_confirm=True, snap=None) -> dict:
+    """[P2 #11 wrapper] PreToolUse hook → 内部 dispatch → PostToolUse hook。
+
+    跳过 hook 的场景：
+    - 子 agent 内部（_is_in_subagent()）—— 父 agent 派工具时已触发，子 agent 不重复
+    - hooks 模块全局禁用（批处理 --json 由 main.py 设置）
+    """
+    return _dispatch_tool_call_with_hooks(
+        tool_call, mode=mode, allow_hil=allow_hil,
+        allow_confirm=allow_confirm, snap=snap,
+    )
+
+
+def _dispatch_tool_call_with_hooks(tool_call, *, mode="auto", allow_hil=True,
+                                   allow_confirm=True, snap=None) -> dict:
+    """实际的 hook 包装实现。和 _dispatch_tool_call 是同一个东西，命名给单测能直接调。"""
+    name = tool_call.function.name
+    raw_args = tool_call.function.arguments or "{}"
+    try:
+        args_initial = json.loads(raw_args)
+    except json.JSONDecodeError as e:
+        return {"name": name, "args": {}, "id": tool_call.id,
+                "result": {"error": f"Invalid JSON in arguments: {e}"}}
+
+    # PreToolUse hook（子 agent 内 / 全局禁用时跳过）
+    skip_hooks = _is_in_subagent() or _hooks_mod.is_disabled()
+    if not skip_hooks:
+        try:
+            ws = _get_workspace()
+            hr = _hooks_mod.run_hook_event(
+                "PreToolUse",
+                {"event": "PreToolUse", "tool_name": name,
+                 "tool_input": args_initial, "cwd": ws},
+                match_target=name,
+                workspace_dir=ws,
+            )
+            if hr.get("ran", 0) > 0:
+                if hr["decision"] == "block":
+                    console.print(f"[hook] PreToolUse 阻止 {name}：{hr.get('reason', '')}",
+                                  style="yellow", highlight=False)
+                    return {"name": name, "args": args_initial, "id": tool_call.id,
+                            "result": {"error": f"Hook 阻止 {name}：{hr.get('reason', '')}"}}
+                # modify tool_input
+                mod = hr.get("modify", {})
+                if isinstance(mod.get("tool_input"), dict):
+                    args_initial = mod["tool_input"]
+                    console.print(f"[hook] PreToolUse 修改 {name} 输入", highlight=False)
+                # hook 错误打印一次（不阻断）
+                for err in hr.get("errors", []):
+                    console.print(f"[hook] {err}", style="yellow", highlight=False)
+        except Exception as e:
+            console.print(f"[hook] PreToolUse 异常忽略：{e}", style="yellow", highlight=False)
+
+    # 调内部 dispatch
+    out = _dispatch_tool_call_inner(
+        tool_call, args_initial, mode=mode, allow_hil=allow_hil,
+        allow_confirm=allow_confirm, snap=snap,
+    )
+
+    # PostToolUse hook（同样跳过场景）
+    if not skip_hooks:
+        try:
+            ws = _get_workspace()
+            hr = _hooks_mod.run_hook_event(
+                "PostToolUse",
+                {"event": "PostToolUse", "tool_name": out["name"],
+                 "tool_input": out["args"], "tool_output": out["result"], "cwd": ws},
+                match_target=out["name"],
+                workspace_dir=ws,
+            )
+            if hr.get("ran", 0) > 0:
+                mod = hr.get("modify", {})
+                if isinstance(mod.get("tool_output"), dict):
+                    out["result"] = mod["tool_output"]
+                    console.print(f"[hook] PostToolUse 修改 {out['name']} 输出", highlight=False)
+                for err in hr.get("errors", []):
+                    console.print(f"[hook] {err}", style="yellow", highlight=False)
+        except Exception as e:
+            console.print(f"[hook] PostToolUse 异常忽略：{e}", style="yellow", highlight=False)
+
+    return out
+
+
+def _dispatch_tool_call_inner(tool_call, args, *, mode="auto", allow_hil=True,
+                              allow_confirm=True, snap=None) -> dict:
     """统一处理 LLM 返回的单个 tool_call，code()/fix() 共用。
     返回 {"name": str, "args": dict, "id": str, "result": dict}
     - mode: "auto" 时对覆盖/移动等弹用户确认；"code" 跳过确认
     - allow_hil: 是否启用 HIL 编辑确认（fix 阶段也可启用）
     - allow_confirm: 是否在 mode=auto 时弹覆盖/移动确认
-    - snap: 当前快照，用于增量备份"""
+    - snap: 当前快照，用于增量备份
+    - args: 已解析的参数（PreToolUse hook 可能改过；wrapper 传入）"""
     name = tool_call.function.name
-    raw_args = tool_call.function.arguments or "{}"
-    try:
-        args = json.loads(raw_args)
-    except json.JSONDecodeError as e:
-        return {"name": name, "args": {}, "id": tool_call.id,
-                "result": {"error": f"Invalid JSON in arguments: {e}"}}
 
     # 审计模式：兜底拦截写/执行工具，防止 LLM hallucinate 超出 schema 的工具
     if mode == "audit" and name not in READONLY_TOOL_NAMES:
@@ -2314,11 +2394,68 @@ def run(requirement, mode="auto"):
     if ctx_block:
         requirement = requirement + "\n\n" + ctx_block
 
+    # P2 #11 UserPromptSubmit hook（子 agent 内 / 全局禁用时跳过）
+    extra_system_messages: list = []
+    if not _is_in_subagent() and not _hooks_mod.is_disabled():
+        try:
+            ws = _get_workspace()
+            hr = _hooks_mod.run_hook_event(
+                "UserPromptSubmit",
+                {"event": "UserPromptSubmit", "user_input": requirement,
+                 "mode": mode, "cwd": ws},
+                match_target=None,   # UserPromptSubmit 不按工具名 match
+                workspace_dir=ws,
+            )
+            if hr.get("ran", 0) > 0:
+                if hr["decision"] == "block":
+                    console.print(f"[hook] UserPromptSubmit 阻止：{hr.get('reason', '')}",
+                                  style="yellow", highlight=False)
+                    return {"success": False,
+                            "report": f"Hook 阻止用户输入：{hr.get('reason', '')}",
+                            "test_result": {"stderr": "blocked by hook"}}
+                # modify user_input
+                mod = hr.get("modify", {})
+                if isinstance(mod.get("user_input"), str):
+                    requirement = mod["user_input"]
+                    console.print("[hook] UserPromptSubmit 修改了 user_input", highlight=False)
+                # 收集 system_message 注入下游 _run（通过 system_message 拼到 requirement 头）
+                extra_system_messages = list(hr.get("system_messages", []))
+                for err in hr.get("errors", []):
+                    console.print(f"[hook] {err}", style="yellow", highlight=False)
+        except Exception as e:
+            console.print(f"[hook] UserPromptSubmit 异常忽略：{e}", style="yellow", highlight=False)
+    if extra_system_messages:
+        # 把 hook 给的 system_message 拼到 requirement 头部——LLM 会作为额外约束看到
+        prefix = "\n".join(f"[hook 注入] {m}" for m in extra_system_messages)
+        requirement = prefix + "\n\n" + requirement
+
     try:
         res = _run(requirement, mode)
         # #61 任务失败自动保存回放
         if not res["success"]:
             create_replay_package(res["test_result"].get("stderr", "任务失败"))
+
+        # P2 #11 Stop hook（任务完成后，返回前）
+        if not _is_in_subagent() and not _hooks_mod.is_disabled():
+            try:
+                ws = _get_workspace()
+                hr = _hooks_mod.run_hook_event(
+                    "Stop",
+                    {"event": "Stop", "user_input": requirement,
+                     "success": bool(res.get("success")),
+                     "task_summary": str(res.get("report", ""))[:500],
+                     "cwd": ws},
+                    match_target=None,
+                    workspace_dir=ws,
+                )
+                if hr.get("ran", 0) > 0 and hr.get("system_messages"):
+                    # Stop 阶段任务已结束，system_message 直接打印给用户看
+                    for sm in hr["system_messages"]:
+                        console.print(f"[hook/Stop] {sm}", highlight=False)
+                for err in hr.get("errors", []):
+                    console.print(f"[hook] {err}", style="yellow", highlight=False)
+            except Exception as e:
+                console.print(f"[hook] Stop 异常忽略：{e}", style="yellow", highlight=False)
         return res
     except interrupt.Interrupted:
         return _interrupted_result()

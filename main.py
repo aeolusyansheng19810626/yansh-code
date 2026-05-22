@@ -35,6 +35,7 @@ _SLASH_COMMANDS = [
     ("/skill",    "Skills 系统：/skill list | /skill show <name>"),
     ("/subagent", "子 Agent 统计：/subagent stats"),
     ("/mcp",      "MCP servers：/mcp list | /mcp tools [name]"),
+    ("/hooks",    "Hooks 配置：/hooks list（查 hooks.json）"),
 ]
 
 
@@ -317,6 +318,10 @@ def main():
     # 批处理模式处理
     if args.requirement or args.json:
         agent.set_batch_mode(True, json_output=args.json, strict=args.strict)
+        # P2 #11：批处理 --json 默认关 hooks（hooks 可能交互/慢，不适合自动化）
+        if args.json:
+            import hooks as _hooks_mod
+            _hooks_mod.set_disabled(True)
         if args.requirement:
             res = agent.run(args.requirement, mode=current_mode)
             if args.json:
@@ -509,6 +514,28 @@ def main():
                     console.print(hit.body, highlight=False)
             else:
                 console.print("用法：/skill list | /skill show <name>", highlight=False)
+            continue
+
+        # P2 #11 Hooks 命令（仅查看；编辑直接改 hooks.json）
+        if user_input == "/hooks" or user_input.startswith("/hooks "):
+            import hooks as _hooks_mod
+            parts = user_input.split(maxsplit=1)
+            sub = parts[1] if len(parts) > 1 else "list"
+            if sub == "list":
+                cfg = _hooks_mod.list_configured(WORKSPACE_DIR)
+                if "_error" in cfg:
+                    console.print(f"[hooks] 配置错误：{cfg['_error']}", style="yellow", highlight=False)
+                elif not cfg:
+                    console.print(f"[hooks] 无配置。在 {WORKSPACE_DIR}/.yansh/hooks.json 或 ~/.yansh/hooks.json 写", highlight=False)
+                else:
+                    console.print(f"\n[bold cyan]=== Hooks 配置 ===[/bold cyan]", highlight=False)
+                    for ev, items in cfg.items():
+                        console.print(f"\n[{ev}] ({len(items)} 条)", highlight=False)
+                        for it in items:
+                            console.print(f"  matcher={it['matcher']!r} timeout={it['timeout']}s", highlight=False)
+                            console.print(f"    {it['command']}", highlight=False)
+            else:
+                console.print("用法：/hooks list", highlight=False)
             continue
 
         # P2 #10 MCP 命令
