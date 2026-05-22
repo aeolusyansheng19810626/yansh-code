@@ -1202,13 +1202,20 @@ def _parse_plan_response(content: str) -> dict:
     return {"files": files_out, "test_command": validated.test_command}
 
 def code(plan, mode="auto", requirement=""):
-    """根据计划逐个文件生成/修改代码。文件已存在优先用replace_in_file做精确修改；不存在则用write_file新建。"""
+    """根据计划逐个文件生成/修改代码。文件已存在优先用replace_in_file做精确修改；不存在则用write_file新建。
+
+    返回 None 或 dict {"early_exit": True, "success": bool, "summary": str}：
+      - None：正常完成所有文件，没有 task_complete 信号
+      - success=True：Coder 主动声明本文件/任务完成（信息性，run() 不会因此跳过测试）
+      - success=False：Coder 主动放弃整个任务——run() 应跳过 review/测试直接标失败
+    """
     import os as _os
     from tools import write_file, read_file, replace_in_file
 
     files = plan.get("files", [])
     console.print("[Agent: Coder]", highlight=False)
     console.print(f"计划处理 {len(files)} 个文件...")
+    coder_signal = None  # 多文件循环结束时上送给 run()
 
     for file_entry in files:
         if interrupt.is_interrupted():
@@ -1293,9 +1300,24 @@ def code(plan, mode="auto", requirement=""):
             msgs.append(response_message)
 
             if response_message.tool_calls:
+                _early_exit_inner = False  # 收到 task_complete sentinel 时用来跳出 inner while
                 for tool_call in response_message.tool_calls:
                     out = _dispatch_tool_call(tool_call, mode=mode, snap=_CURRENT_SNAPSHOT)
                     _record_dispatch(out, msgs)
+                    # P0 #3 sentinel：Coder 主动声明任务结束
+                    if out["result"].get("_task_complete"):
+                        _success = bool(out["result"].get("success"))
+                        _summary = out["result"].get("summary", "")
+                        if not _success:
+                            console.print(f"[Coder task_complete] 主动放弃：{_summary}",
+                                          style="yellow", highlight=False)
+                            return {"early_exit": True, "success": False, "summary": _summary}
+                        # success=True：本文件完成，跳出 inner loop（multi-file 循环继续）
+                        coder_signal = {"early_exit": True, "success": True, "summary": _summary}
+                        _early_exit_inner = True
+                        break
+                if _early_exit_inner:
+                    break
             else:
                 break
 
@@ -1316,6 +1338,8 @@ def code(plan, mode="auto", requirement=""):
             console.print("[自动] pip install -e . 完成", highlight=False)
         else:
             console.print(f"[警告] pip install -e . 失败: {r.stderr[:200]}", style="yellow", highlight=False)
+
+    return coder_signal
 
 def audit(requirement):
     """审计现有代码，只读多轮工具调用，最终输出 markdown 报告。
@@ -1513,6 +1537,10 @@ def _parse_review_response(content: str) -> dict:
 def fix(test_result, plan, reason="test_failure"):
     """根据测试错误或审查意见修复代码（多轮工具调用）
     reason: "test_failure" | "review_rejection"
+
+    返回 dict: {"early_exit": bool, "success": bool, "summary": str}
+      - early_exit=True：LLM 主动调了 task_complete，外层应立即按 success 决定终止/标记
+      - early_exit=False：沉默退出（兜底已追问过）或软上限耗尽——外层走原路径继续 retry
     """
     console.print("[Agent: Tester]", highlight=False)
     console.print("开始修复代码...")
@@ -1592,7 +1620,7 @@ def fix(test_result, plan, reason="test_failure"):
                     summary = out["result"].get("summary", "")
                     console.print(f"修复结束（task_complete: {'成功' if success else '放弃'}）：{summary}",
                                   style="yellow" if not success else None, highlight=False)
-                    return
+                    return {"early_exit": True, "success": success, "summary": summary}
         else:
             # 沉默退出兜底：第一次没调工具 → 追问一次让它显式 task_complete
             if not silent_prompted:
@@ -1608,8 +1636,9 @@ def fix(test_result, plan, reason="test_failure"):
                 })
                 continue
             console.print("修复完成（沉默退出，已追问过一次）")
-            return
+            return {"early_exit": False, "success": False, "summary": ""}
     console.print(f"[警告] fix 已达 {_FIX_SOFT_LIMIT} 轮上限，强制退出", style="yellow", highlight=False)
+    return {"early_exit": False, "success": False, "summary": ""}
 
 def test(test_command):
     """执行测试命令"""
@@ -1624,12 +1653,15 @@ def judge(test_result):
     """判断测试是否通过"""
     return test_result.get("returncode") == 0
 
-def report(success, test_result):
-    """输出最终结果"""
-    return {
+def report(success, test_result, task_complete_signal=None):
+    """输出最终结果。task_complete_signal: LLM 主动声明信号 {early_exit, success, summary}，可选。"""
+    out = {
         "success": success,
-        "test_result": test_result
+        "test_result": test_result,
     }
+    if task_complete_signal:
+        out["task_complete_signal"] = task_complete_signal
+    return out
 
 def _interrupted_result():
     console.print("已中断")
@@ -1741,7 +1773,19 @@ def _run(requirement, mode):
 
     # code / auto（确认后）：生成代码 + 测试
     console.print("\n阶段2：生成代码")
-    code(plan_result, mode=mode, requirement=original_requirement)
+    coder_signal = code(plan_result, mode=mode, requirement=original_requirement)
+
+    # P0 #3 第二波：Coder 主动放弃 → 跳过 review/test/fix 直接标失败
+    if coder_signal and coder_signal.get("early_exit") and not coder_signal.get("success"):
+        _summary = coder_signal.get("summary", "")
+        console.print(f"[task_complete] Coder 主动放弃任务：{_summary}",
+                      style="yellow", highlight=False)
+        add_to_history(original_requirement, f"任务被 LLM 主动放弃：{_summary}")
+        # test_result 用 dummy dict（returncode=-1）避免外层 .get() 崩溃，
+        # 同时把 LLM 的放弃理由放进 stderr 便于回放
+        _dummy_tr = {"returncode": -1, "stdout": "", "stderr": f"Coder 主动放弃：{_summary}"}
+        finish_task_log(False, 0, _dummy_tr)
+        return report(False, _dummy_tr, task_complete_signal=coder_signal)
 
     # 砍掉独立的 reviewer agent 循环：对标 Claude Code 单 agent 设计——
     # coder 自己负责"做+验证"，由后面的"测试与修复"循环承担质量把关。
@@ -1771,7 +1815,16 @@ def _run(requirement, mode):
     linter_result = run_linter()
     if linter_result:
         console.print(f"Linter 发现错误，开始修复 (尝试 {attempts + 1}/{max_attempts})", highlight=False)
-        fix(linter_result, plan_result)
+        fix_signal = fix(linter_result, plan_result)
+        # P0 #3 第二波：linter 阶段 LLM 主动放弃也直接终止
+        if fix_signal.get("early_exit") and not fix_signal.get("success"):
+            _summary = fix_signal.get("summary", "")
+            console.print(f"[task_complete] LLM 在 linter 修复阶段主动放弃：{_summary}",
+                          style="yellow", highlight=False)
+            add_to_history(original_requirement, f"任务被 LLM 主动放弃：{_summary}")
+            _dummy_tr = {"returncode": -1, "stdout": "", "stderr": f"linter 阶段放弃：{_summary}"}
+            finish_task_log(False, attempts, _dummy_tr)
+            return report(False, _dummy_tr, task_complete_signal=fix_signal)
         attempts += 1
 
     while attempts < max_attempts:
@@ -1785,11 +1838,29 @@ def _run(requirement, mode):
             summary = f"执行了任务：{original_requirement}。创建/修改了文件：{', '.join(file_names)}"
             add_to_history(original_requirement, summary)
             finish_task_log(True, attempts, test_result)
-            return report(True, test_result)
+            return report(True, test_result, task_complete_signal=coder_signal)
         else:
             console.print(f"测试失败 (尝试 {attempts + 1}/{max_attempts})")
             if attempts < max_attempts - 1:
-                fix(test_result, plan_result)
+                fix_signal = fix(test_result, plan_result)
+                # P0 #3 第二波：识别 fix() 的主动声明，避免无谓 retry
+                if fix_signal.get("early_exit"):
+                    _summary = fix_signal.get("summary", "")
+                    if fix_signal.get("success"):
+                        # LLM 说"任务完成（剩下是 pre-existing 等不归我管）"
+                        console.print(f"[task_complete] LLM 主动声明任务完成：{_summary}",
+                                      highlight=False)
+                        add_to_history(original_requirement,
+                                       f"执行了任务（LLM 主动收尾）：{_summary}")
+                        finish_task_log(True, attempts, test_result)
+                        return report(True, test_result, task_complete_signal=fix_signal)
+                    else:
+                        # LLM 说"放弃"
+                        console.print(f"[task_complete] LLM 主动放弃任务：{_summary}",
+                                      style="yellow", highlight=False)
+                        add_to_history(original_requirement, f"任务被 LLM 主动放弃：{_summary}")
+                        finish_task_log(False, attempts, test_result)
+                        return report(False, test_result, task_complete_signal=fix_signal)
             attempts += 1
 
     console.print("达到最大尝试次数，任务失败")
@@ -1804,7 +1875,7 @@ def _run(requirement, mode):
 
     add_to_history(original_requirement, f"任务失败：{original_requirement}")
     finish_task_log(False, attempts, test_result)
-    return report(False, test_result)
+    return report(False, test_result, task_complete_signal=coder_signal)
 
 
 def _auto_generate_tests(plan_result, modified_files):
