@@ -34,6 +34,7 @@ _SLASH_COMMANDS = [
     ("/approve",  "批准当前 plan 草稿并进入实施"),
     ("/skill",    "Skills 系统：/skill list | /skill show <name>"),
     ("/subagent", "子 Agent 统计：/subagent stats"),
+    ("/mcp",      "MCP servers：/mcp list | /mcp tools [name]"),
 ]
 
 
@@ -298,6 +299,17 @@ def main():
     _agent_mod._PROJECT_TYPE = ptype
     _agent_mod._PROJECT_TEST_CMD = tcmd
 
+    # P2 #10 MCP：启动 mcp.json 里配置的 server，把工具注入 TOOLS。
+    # 失败不影响 yansh 本身——init_mcp 内部已捕获每个 server 的异常。
+    # atexit 注册在交互模式开始前；批处理模式下 yansh 退出会自然 GC。
+    import atexit
+    atexit.register(_agent_mod.shutdown_mcp)
+    try:
+        _agent_mod.init_mcp(verbose=True)
+    except Exception as _e:
+        console.print(f"[mcp] 初始化失败（继续不带 mcp 跑）：{_e}",
+                      style="yellow", highlight=False)
+
     current_mode = get_config()["mode"]
     if args.mode:
         current_mode = args.mode
@@ -497,6 +509,37 @@ def main():
                     console.print(hit.body, highlight=False)
             else:
                 console.print("用法：/skill list | /skill show <name>", highlight=False)
+            continue
+
+        # P2 #10 MCP 命令
+        if user_input == "/mcp" or user_input.startswith("/mcp "):
+            import mcp_client as _mcp_mod
+            parts = user_input.split(maxsplit=2)
+            sub = parts[1] if len(parts) > 1 else "list"
+            servers = _mcp_mod.get_servers()
+            if sub == "list":
+                if not servers:
+                    console.print("[mcp] 未启动任何 server。配置 ~/.yansh/mcp.json 或 <ws>/.yansh/mcp.json", highlight=False)
+                else:
+                    console.print(f"\n[bold cyan]=== MCP Servers ({len(servers)}) ===[/bold cyan]", highlight=False)
+                    for name, srv in servers.items():
+                        alive = "✓" if srv.is_alive() else "✗"
+                        console.print(f"  [{alive}] {name} — {len(srv.tools)} 工具 — cmd={srv.command} {' '.join(srv.args[:3])}", highlight=False)
+                        if srv.stderr_buffer and not srv.is_alive():
+                            console.print(f"      stderr 末尾: {srv.stderr_buffer[-2:]}", style="yellow", highlight=False)
+            elif sub == "tools":
+                target = parts[2] if len(parts) >= 3 else None
+                if not servers:
+                    console.print("[mcp] 未启动任何 server", highlight=False)
+                else:
+                    for name, srv in servers.items():
+                        if target and name != target:
+                            continue
+                        console.print(f"\n[bold cyan]=== {name} ({len(srv.tools)} 工具) ===[/bold cyan]", highlight=False)
+                        for t in srv.tools:
+                            console.print(f"  mcp__{name}__{t['name']} — {t.get('description', '')[:80]}", highlight=False)
+            else:
+                console.print("用法：/mcp list | /mcp tools [name]", highlight=False)
             continue
 
         # P2 #9 子 Agent 命令

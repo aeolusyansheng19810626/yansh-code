@@ -23,6 +23,7 @@ from tools import (
 )
 import interrupt
 import tools as _tools_mod
+import mcp_client as _mcp_mod
 import snapshot as _snapshot_mod
 from snapshot import (
     create_snapshot, restore_snapshot, cleanup_snapshot,
@@ -980,6 +981,14 @@ def _dispatch_tool_call(tool_call, *, mode="auto", allow_hil=True, allow_confirm
             result = readonly_handlers[name](**args)
         except Exception as e:
             result = _tools_mod._err("internal", f"工具调用异常: {e}")
+        return {"name": name, "args": args, "id": tool_call.id, "result": result}
+
+    # P2 #10 MCP 路由：mcp__<server>__<tool> 转发到对应 server
+    if name.startswith("mcp__"):
+        try:
+            result = _mcp_mod.call_tool(name, args)
+        except Exception as e:
+            result = _tools_mod._err("internal", f"MCP 工具调用异常: {e}")
         return {"name": name, "args": args, "id": tool_call.id, "result": result}
 
     return {"name": name, "args": args, "id": tool_call.id,
@@ -2021,6 +2030,44 @@ def _subagent_handler(task=None, role="explorer", max_steps=8) -> dict:
 def get_subagent_stats() -> dict:
     """返回累计 stats 的浅拷贝，给 main.py /subagent stats 用。"""
     return dict(_SUBAGENT_STATS)
+
+
+# ============================================================
+# P2 #10 MCP 协议：启动 server + 把工具注入 TOOLS + atexit 关闭
+# ============================================================
+
+def init_mcp(verbose: bool = True) -> dict:
+    """启动 mcp.json 里配置的所有 server，把发现的工具注入 TOOLS 列表。
+    main.py 启动时调一次。返回 {"started": {name: tool_count}, "errors": [...]}。
+
+    实现细节：直接 extend TOOLS 列表（动态扩展），子 agent / audit 各路径都读到同一份。
+    """
+    started, errors = _mcp_mod.start_all_servers(_get_workspace(), verbose=verbose)
+    if started:
+        new_schemas = _mcp_mod.discover_tools_as_schemas()
+        # 防重复：去掉之前可能注入过的同名 mcp__ 工具，再注入新的
+        existing_mcp = {t["function"]["name"] for t in TOOLS
+                        if t["function"]["name"].startswith("mcp__")}
+        # 用 list 原地修改（保持引用稳定，agent/_subagent_tools_for_role 各路径读的是同一引用）
+        if existing_mcp:
+            TOOLS[:] = [t for t in TOOLS
+                        if not t["function"]["name"].startswith("mcp__")]
+        TOOLS.extend(new_schemas)
+        if verbose:
+            for n, cnt in started.items():
+                console.print(f"[mcp] {n} 启动（{cnt} 工具）", highlight=False)
+    if errors and verbose:
+        for n, err in errors:
+            console.print(f"[mcp] {n} 启动失败：{err}", style="yellow", highlight=False)
+    return {"started": started, "errors": errors}
+
+
+def shutdown_mcp() -> None:
+    """atexit 钩子用：关掉所有 mcp server 子进程"""
+    try:
+        _mcp_mod.shutdown_all()
+    except Exception:
+        pass
 
 
 def review(requirement, modified_files):

@@ -31,7 +31,7 @@
 | P2 #7 | Plan Mode | 🟢 完成（方案 C：session 级 flag + 多轮探索 + /approve） |
 | P2 #8 | Skills 系统 | 🟢 完成（关键字匹配 + LLM 智能匹配双路径，fast path 零成本） |
 | P2 #9 | 子 Agent | 🟢 完成（dispatch_subagent + role 切工具集 + 禁递归 + 多个并发跑 + /subagent stats） |
-| P2 #10 | MCP 协议 | ⬜ 未着手 |
+| P2 #10 | MCP 协议 | 🟢 完成（stdio 传输 + tools/list+call + mcp.json 兼容 + /mcp 命令） |
 | P2 #11 | Hooks | ⬜ 未着手 |
 | P2 #12 | 跨 Session 记忆 | ⬜ 未着手 |
 
@@ -301,7 +301,20 @@
 
 ---
 
-### 10. MCP 协议支持 ⬜ 未着手
+### 10. MCP 协议支持 🟢 完成
+
+**进度（2026-05-22）**：笔记 [_20](./notes/shadow/2026-05-22_20-mcp.md)。
+- `mcp_client.py` 新模块：MCPServer 类（subprocess + JSON-RPC over stdio）+ 模块级 registry
+- 协议序列：initialize → notifications/initialized → tools/list → tools/call
+- 配置：mcp.json 兼容 Claude Code 格式，路径优先级 `<ws>/.yansh/mcp.json` → `~/.yansh/mcp.json`
+- 工具命名：`mcp__<server>__<tool>` 加前缀，避免与内置工具撞名
+- agent.py：`_dispatch_tool_call` 加 `mcp__` 路由 + `init_mcp` / `shutdown_mcp` 入口
+- main.py：启动时 init_mcp + atexit；`/mcp list` `/mcp tools [name]` 命令
+- 安全：audit 模式自动拦截 mcp 工具（不在 READONLY 白名单——第三方可能改外部状态）
+
+**集成验证**：接 `@modelcontextprotocol/server-everything` 官方参考实现，13 工具自动发现；LLM 端到端调 `mcp__everything__get-sum(1234, 5678) = 6912` 全程贯通。
+
+**单测**：tests/unit/test_mcp.py 24 条全过；run_unit.py 14 文件全过。
 
 **Claude Code 怎么做**：原生支持 MCP（Model Context Protocol），用户能接入第三方工具服务器（Linear、Sentry、GitHub MCP 等）。
 
