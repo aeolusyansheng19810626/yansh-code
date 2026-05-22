@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys as _sys
 import threading
 from pathlib import Path
 from typing import Optional
@@ -73,19 +74,25 @@ class MCPServer:
         if self.proc is not None:
             raise RuntimeError(f"server {self.name} 已启动")
         full_env = {**os.environ, **self.env}
+        # P1 安全：开新进程组，shutdown 时能 kill 整棵进程树。
+        # 否则 npx → node → mcp-server.js 这条链上的孙进程会变孤儿。
+        popen_kwargs = dict(
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=full_env,
+            cwd=self.cwd,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,   # line-buffered
+        )
+        if _sys.platform == "win32":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["start_new_session"] = True
         try:
-            self.proc = subprocess.Popen(
-                [self.command, *self.args],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=full_env,
-                cwd=self.cwd,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,   # line-buffered
-            )
+            self.proc = subprocess.Popen([self.command, *self.args], **popen_kwargs)
         except FileNotFoundError as e:
             raise RuntimeError(f"找不到命令 {self.command!r}：{e}")
         # reader 线程读 stdout（JSON-RPC 响应）
@@ -109,24 +116,76 @@ class MCPServer:
             raise
 
     def shutdown(self) -> None:
-        """关掉子进程。失败也尽量清理（不抛异常）"""
+        """关掉子进程 + 整棵进程树（孙进程也杀）。失败也尽量清理（不抛异常）。
+
+        P1 安全：仅 self.proc.kill() 只杀直接子进程，对 shell 包装 / npx 启动的
+        node 子进程会泄漏成孤儿。这里按平台杀整棵进程组。
+        """
         if self.proc is None:
             return
+        proc = self.proc
         try:
-            if self.proc.stdin and not self.proc.stdin.closed:
+            # 关 stdin → 给 server 退出信号
+            if proc.stdin and not proc.stdin.closed:
                 try:
-                    self.proc.stdin.close()
+                    proc.stdin.close()
                 except Exception:
                     pass
-            if self.proc.poll() is None:
-                self.proc.terminate()
-                try:
-                    self.proc.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    self.proc.kill()
+            # 直接 kill 整棵进程树——必须趁父进程还活着、还能被 psutil 枚举到
+            # 时一次性枚举出所有后代再 kill。先 graceful 让父退会丢失孙的访问路径。
+            if proc.poll() is None:
+                self._kill_tree(proc)
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                pass
         except Exception:
             pass
         self.proc = None
+
+    @staticmethod
+    def _kill_tree(proc: subprocess.Popen) -> None:
+        """跨平台杀进程树：Windows 优先 psutil（最可靠），fallback taskkill；POSIX killpg。
+
+        Windows 单 Popen + CREATE_NEW_PROCESS_GROUP 不构成 Job Object——taskkill /T
+        只能找到通过 cmd.exe 派生的孙进程，对 Popen → Popen 链失效。psutil 走
+        children(recursive=True) 是真"看见全树"的方案。
+        """
+        pid = proc.pid
+        # 路径 1: psutil（跨平台最可靠）
+        try:
+            import psutil as _psutil
+            try:
+                root = _psutil.Process(pid)
+                victims = root.children(recursive=True) + [root]
+                for p in victims:
+                    try:
+                        p.kill()
+                    except _psutil.NoSuchProcess:
+                        pass
+                _psutil.wait_procs(victims, timeout=2)
+                return
+            except _psutil.NoSuchProcess:
+                # 父已死——孤儿孙没法通过父枚举找到了，只能尽力
+                return
+        except ImportError:
+            pass
+
+        # 路径 2: 平台原生（无 psutil 时兜底）
+        try:
+            if _sys.platform == "win32":
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    capture_output=True, timeout=3,
+                )
+            else:
+                import signal as _signal
+                os.killpg(os.getpgid(pid), _signal.SIGKILL)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
 
     def is_alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
@@ -188,28 +247,51 @@ class MCPServer:
         self._send_line(msg)
 
     def _reader_loop(self) -> None:
-        """后台读 stdout，解析 JSON 后按 id 分发到 _pending"""
+        """后台读 stdout，解析 JSON 后按 id 分发到 _pending。
+
+        P1 重要：server 崩溃时 stdout 关闭 → for 循环退出 → 所有 _pending 死等。
+        finally 里把 pending 全部 set 一个错误响应，避免 _request 死等到 60s timeout。
+        """
         proc = self.proc
-        if proc is None or proc.stdout is None:
-            return
-        for line in proc.stdout:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                msg = json.loads(line)
-            except json.JSONDecodeError:
-                continue   # 不是合法 JSON 就忽略（server 可能输出诊断信息）
-            mid = msg.get("id")
-            if mid is None:
-                # 服务端发起的通知/请求——本最小版暂不处理
-                continue
+        try:
+            if proc is None or proc.stdout is None:
+                return
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    continue   # 不是合法 JSON 就忽略（server 可能输出诊断信息）
+                mid = msg.get("id")
+                if mid is None:
+                    # 服务端发起的通知/请求——本最小版暂不处理
+                    continue
+                with self._pending_lock:
+                    slot = self._pending.get(mid)
+                if slot is not None:
+                    ev, holder = slot
+                    holder["msg"] = msg
+                    ev.set()
+        finally:
+            # server 死了——把所有 pending 全部唤醒，写一个错误响应。
+            # 否则 _request 会死等到 _CALL_TIMEOUT_SEC（60s）才返回。
+            stderr_tail = list(self.stderr_buffer[-3:]) if self.stderr_buffer else []
             with self._pending_lock:
-                slot = self._pending.get(mid)
-            if slot is not None:
-                ev, holder = slot
-                holder["msg"] = msg
-                ev.set()
+                for mid, (ev, holder) in self._pending.items():
+                    if "msg" not in holder:
+                        holder["msg"] = {
+                            "id": mid,
+                            "error": {
+                                "code": -32000,
+                                "message": (
+                                    f"server {self.name} stdout 已关闭"
+                                    + (f"（stderr 末尾：{stderr_tail}）" if stderr_tail else "")
+                                ),
+                            },
+                        }
+                    ev.set()
 
     def _stderr_loop(self) -> None:
         """收集 server 的 stderr（用于失败诊断）"""

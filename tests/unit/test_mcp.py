@@ -491,6 +491,200 @@ def test_mcpserver_init_validates_required():
         pass
 
 
+# ---------- P1-1：reader_loop EOF 唤醒 pending ----------
+
+def _make_silent_server():
+    """构造一个 MCPServer + silent mock proc：永不响应。
+    用来测 EOF 唤醒——请求发出后一直 pending。"""
+    def silent_logic(req):
+        # 只响应 initialize 让握手过，其他全静默
+        method = req.get("method")
+        if method == "initialize":
+            return {"jsonrpc": "2.0", "id": req.get("id"),
+                    "result": {"protocolVersion": "2024-11-05", "capabilities": {}}}
+        if method == "notifications/initialized":
+            return None
+        return None  # 静默——请求永远 pending
+    srv = mcp_client.MCPServer(name="silent", command="dummy")
+    srv.proc = _MockProc(silent_logic)
+    srv._reader_thread = threading.Thread(target=srv._reader_loop, daemon=True)
+    srv._reader_thread.start()
+    srv._stderr_thread = threading.Thread(target=srv._stderr_loop, daemon=True)
+    srv._stderr_thread.start()
+    return srv
+
+
+def test_reader_loop_eof_wakes_pending_request():
+    """server 突然崩溃（stdout 关闭）→ 等待中的 _request 应在 1s 内
+    拿到错误响应，而不是死等到 _CALL_TIMEOUT_SEC（60s）。
+
+    P1 安全：之前 reader 的 for 循环退出后 pending 永不被 set →
+    _request 死等 60s timeout，LLM 看到的是"超时"而非"server 挂了"。
+    """
+    import time
+
+    srv = _make_silent_server()
+    try:
+        srv._do_initialize(timeout=2)
+        # 不调 _fetch_tools——silent server 不会响应 tools/list
+        srv._initialized = True
+
+        result_box = {}
+        def call_in_bg():
+            try:
+                srv._request("tools/list", timeout=10)
+                result_box["ok"] = True
+            except Exception as e:
+                result_box["err"] = e
+
+        t = threading.Thread(target=call_in_bg, daemon=True)
+        t.start()
+        time.sleep(0.1)   # 让 _request 进入 pending 状态
+
+        # 模拟 server 崩溃 —— 关 stdout 写端 → reader 的 for 循环退出
+        try:
+            srv.proc._stdout_write.close()
+        except Exception:
+            pass
+
+        t0 = time.time()
+        t.join(timeout=3)
+        elapsed = time.time() - t0
+
+        assert not t.is_alive(), "_request 没被唤醒——还在死等"
+        assert elapsed < 2.0, f"唤醒太慢：{elapsed:.2f}s（应 < 2s，否则等同 60s 死等）"
+        assert "err" in result_box, "应拿到错误响应"
+        err_msg = str(result_box["err"])
+        assert "stdout" in err_msg or "已关闭" in err_msg, \
+            f"错误信息应提示 stdout 关闭，实际：{err_msg}"
+    finally:
+        srv.shutdown()
+
+
+def test_reader_loop_eof_wakes_multiple_pending():
+    """多个 pending 同时存在时 EOF → 全部都被唤醒（不是只唤醒一个）"""
+    import time
+
+    srv = _make_silent_server()
+    try:
+        srv._do_initialize(timeout=2)
+        srv._initialized = True
+
+        results = []
+        results_lock = threading.Lock()
+
+        def call_one():
+            try:
+                srv._request("tools/list", timeout=10)
+                with results_lock:
+                    results.append("ok")
+            except Exception as e:
+                with results_lock:
+                    results.append(f"err:{type(e).__name__}")
+
+        N = 5
+        threads = [threading.Thread(target=call_one, daemon=True) for _ in range(N)]
+        for t in threads:
+            t.start()
+        time.sleep(0.1)  # 让所有 _request 进入 pending
+
+        # server 崩溃
+        try:
+            srv.proc._stdout_write.close()
+        except Exception:
+            pass
+
+        t0 = time.time()
+        for t in threads:
+            t.join(timeout=3)
+        elapsed = time.time() - t0
+
+        assert all(not t.is_alive() for t in threads), \
+            f"还有 pending 没被唤醒（{N} 个里 {sum(t.is_alive() for t in threads)} 个仍 alive）"
+        assert elapsed < 2.0, f"唤醒太慢：{elapsed:.2f}s"
+        assert len(results) == N
+        assert all(r.startswith("err:") for r in results), \
+            f"应全部拿到 error，实际 {results}"
+    finally:
+        srv.shutdown()
+
+
+# ---------- P1-1：shutdown 杀进程树 ----------
+
+def test_shutdown_kills_real_subprocess_tree(tmp_path):
+    """端到端：start 真实 Python 子进程（spawn 一个孙进程让其 sleep 60s），
+    shutdown 后用 psutil 验证孙进程也被杀（不是只杀直接子进程）。
+
+    跳过条件：psutil 没装时 skip——但 yansh 测试集已用，预期可用。
+    """
+    try:
+        import psutil
+    except ImportError:
+        import pytest
+        pytest.skip("需要 psutil 来验证进程树死亡")
+
+    import time
+
+    # 父子结构：python -c "spawn child sleep 60; sleep 60"
+    import sys as _sys
+    import subprocess
+    py = _sys.executable
+    # 父进程：fork 一个 sleep 子进程，自己也 sleep（不接 stdio 协议，纯进程树测试）
+    parent_code = (
+        "import subprocess, sys, time;"
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']);"
+        "print(p.pid, flush=True);"
+        "time.sleep(60)"
+    )
+
+    srv = mcp_client.MCPServer(name="proctree-test", command=py, args=["-c", parent_code])
+    # 不走 init 流程（这个进程不说 JSON-RPC）；只测进程树管理
+    full_env = {**os.environ}
+    popen_kwargs = dict(
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        env=full_env, text=True, encoding="utf-8", errors="replace", bufsize=1,
+    )
+    import sys as _sys2
+    if _sys2.platform == "win32":
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_kwargs["start_new_session"] = True
+    srv.proc = subprocess.Popen([py, "-c", parent_code], **popen_kwargs)
+
+    # 读父进程 stdout 拿到孙进程 pid
+    grandchild_pid_line = srv.proc.stdout.readline().strip()
+    grandchild_pid = int(grandchild_pid_line)
+    parent_pid = srv.proc.pid
+
+    # 给点时间让孙进程稳定
+    time.sleep(0.3)
+    assert psutil.pid_exists(parent_pid), "父进程没启动？"
+    assert psutil.pid_exists(grandchild_pid), "孙进程没起来？"
+
+    # shutdown
+    srv.shutdown()
+
+    # 给系统点时间清理
+    time.sleep(0.5)
+    parent_alive = psutil.pid_exists(parent_pid)
+    grand_alive = psutil.pid_exists(grandchild_pid)
+
+    # 兜底再杀一次（避免测试失败时孙进程残留 60s）
+    if grand_alive:
+        try:
+            psutil.Process(grandchild_pid).kill()
+        except Exception:
+            pass
+    if parent_alive:
+        try:
+            psutil.Process(parent_pid).kill()
+        except Exception:
+            pass
+
+    assert not parent_alive, f"父进程 {parent_pid} 没被杀"
+    assert not grand_alive, f"孙进程 {grandchild_pid} 没被杀（进程树 kill 失败）"
+
+
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, "-v"])
