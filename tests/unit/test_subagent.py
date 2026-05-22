@@ -160,7 +160,13 @@ def test_run_subagent_returns_summary_on_task_complete(tmp_path):
 
 
 def test_run_subagent_max_steps_clamped_to_hard_cap(tmp_path):
-    """max_steps=999 应被 clamp 到 _SUBAGENT_HARD_CAP（16）"""
+    """P3-2：max_steps=999 应被 clamp 到 _SUBAGENT_HARD_CAP（16）。
+
+    Codex 找出之前的实现假阳性：fake LLM 第一轮就返 content 无 tool_call →
+    沉默退出路径 2 步就退，根本没撞到 cap，断言 ≤ 16 必然成立但没测出 cap。
+
+    修复：让 fake LLM 每轮返一个 read_file tool_call，强制 loop 真撞 cap。
+    """
     with state.scoped_session(tmp_path):
         (tmp_path / "f.py").write_text("x=1\n", encoding="utf-8")
 
@@ -168,7 +174,10 @@ def test_run_subagent_max_steps_clamped_to_hard_cap(tmp_path):
 
         def fake_llm(msgs, **kw):
             call_count["n"] += 1
-            return _mk_resp(content=f"step {call_count['n']}")  # 永不调工具，沉默退出
+            # 永远调工具——绝不沉默退出，强迫 loop 用 max_steps 兜底
+            return _mk_resp(tool_calls=[
+                ("c" + str(call_count["n"]), "read_file", {"filename": "f.py"})
+            ])
 
         orig = agent.call_llm
         try:
@@ -177,9 +186,11 @@ def test_run_subagent_max_steps_clamped_to_hard_cap(tmp_path):
         finally:
             agent.call_llm = orig
 
-        # 沉默退出会有兜底追问 1 次再 break，所以 ≤ 2 次调用就退；不会跑到 16
-        assert res["steps"] <= 16
-        assert call_count["n"] <= 16
+        # cap 真生效：steps 精确等于 _SUBAGENT_HARD_CAP（16）
+        assert res["steps"] == agent._SUBAGENT_HARD_CAP, \
+            f"未真撞 cap：steps={res['steps']}, cap={agent._SUBAGENT_HARD_CAP}"
+        assert call_count["n"] == agent._SUBAGENT_HARD_CAP, \
+            f"LLM 调用次数应等于 cap，实际 {call_count['n']}"
 
 
 def test_run_subagent_silent_exit_uses_content_as_summary(tmp_path):
