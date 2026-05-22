@@ -42,5 +42,8 @@ jobs:
         env:
           PYTHONIOENCODING: utf-8
           PYTHONUTF8: "1"
+          # 测试 mock 了 call_llm，不会真打 API；但 OpenAI client 初始化校验
+          # 必须有非空 key，给个 dummy 让 import 能过
+          OPENROUTER_API_KEY: sk-dummy-for-ci
         run: |
           python tests/run_unit.py
