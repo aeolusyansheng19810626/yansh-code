@@ -31,7 +31,7 @@ def test_load_config_missing_returns_empty(tmp_path, monkeypatch):
 
 
 def test_load_config_workspace_priority(tmp_path, monkeypatch):
-    """项目级 mcp.json 应覆盖全局"""
+    """项目级 mcp.json 应覆盖全局（已 trust 的前提下）"""
     home = tmp_path / "home"
     (home / ".yansh").mkdir(parents=True)
     (home / ".yansh" / "mcp.json").write_text(
@@ -45,6 +45,7 @@ def test_load_config_workspace_priority(tmp_path, monkeypatch):
         encoding="utf-8",
     )
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.setenv("YANSH_TRUST_PROJECT_CONFIG", "always")
     cfg = mcp_client.load_config(workspace_dir=str(ws))
     assert "project_only" in cfg["mcpServers"]
     assert "global_only" not in cfg["mcpServers"]

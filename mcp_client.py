@@ -258,7 +258,7 @@ _servers_lock = threading.Lock()
 
 
 def _config_paths(workspace_dir: Optional[str] = None) -> list:
-    """配置文件查找路径（项目级优先）"""
+    """配置文件查找路径（项目级优先；调用方需自行过滤未 trust 的项目级路径）"""
     paths = []
     if workspace_dir:
         paths.append(Path(workspace_dir) / ".yansh" / "mcp.json")
@@ -267,14 +267,25 @@ def _config_paths(workspace_dir: Optional[str] = None) -> list:
 
 
 def load_config(workspace_dir: Optional[str] = None) -> dict:
-    """加载 mcp.json（项目级优先；找不到返回空 dict）"""
-    for p in _config_paths(workspace_dir):
-        if p.exists():
+    """加载 mcp.json（项目级 trust 通过才用项目级；否则 fallback 到 ~/.yansh）。
+
+    P0 安全：默认拒绝项目级配置（防恶意 repo 通过 .yansh/mcp.json 启动任意进程）；
+    用户在交互模式下首次见时 trust 后才允许，详见 workspace_trust 模块。
+    """
+    import workspace_trust as _wt
+    home_path = Path.home() / ".yansh" / "mcp.json"
+    if workspace_dir:
+        proj_path = Path(workspace_dir) / ".yansh" / "mcp.json"
+        if proj_path.exists() and _wt.check_or_prompt(workspace_dir, "mcp.json"):
             try:
-                return json.loads(p.read_text(encoding="utf-8"))
+                return json.loads(proj_path.read_text(encoding="utf-8"))
             except Exception as e:
-                # 配置坏不应崩 yansh
-                return {"_error": f"解析失败 {p}: {e}"}
+                return {"_error": f"解析失败 {proj_path}: {e}"}
+    if home_path.exists():
+        try:
+            return json.loads(home_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            return {"_error": f"解析失败 {home_path}: {e}"}
     return {}
 
 

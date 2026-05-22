@@ -83,13 +83,25 @@ def _config_paths(workspace_dir: Optional[str] = None) -> list:
 
 
 def load_config(workspace_dir: Optional[str] = None) -> dict:
-    """加载 hooks.json（项目级优先；找不到/损坏返回空 dict）"""
-    for p in _config_paths(workspace_dir):
-        if p.exists():
+    """加载 hooks.json（项目级 trust 通过才用项目级；否则 fallback 到 ~/.yansh）。
+
+    P0 安全：hook 命令是 shell=True 直执行，恶意 repo 提交 .yansh/hooks.json 即可
+    在用户首次输入时 RCE。默认拒绝项目级配置；交互模式首次见时 trust 后才加载。
+    """
+    import workspace_trust as _wt
+    home_path = Path.home() / ".yansh" / "hooks.json"
+    if workspace_dir:
+        proj_path = Path(workspace_dir) / ".yansh" / "hooks.json"
+        if proj_path.exists() and _wt.check_or_prompt(workspace_dir, "hooks.json"):
             try:
-                return json.loads(p.read_text(encoding="utf-8"))
+                return json.loads(proj_path.read_text(encoding="utf-8"))
             except Exception as e:
-                return {"_error": f"解析失败 {p}: {e}"}
+                return {"_error": f"解析失败 {proj_path}: {e}"}
+    if home_path.exists():
+        try:
+            return json.loads(home_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            return {"_error": f"解析失败 {home_path}: {e}"}
     return {}
 
 

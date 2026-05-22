@@ -41,6 +41,7 @@ def test_load_config_workspace_priority(tmp_path, monkeypatch):
         encoding="utf-8",
     )
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.setenv("YANSH_TRUST_PROJECT_CONFIG", "always")
     cfg = hooks.load_config(workspace_dir=str(ws))
     assert cfg["hooks"]["PreToolUse"][0]["matcher"] == "project"
 

@@ -25,6 +25,7 @@ files = [
     "tests/unit/test_mcp.py",
     "tests/unit/test_hooks.py",
     "tests/unit/test_memory.py",
+    "tests/unit/test_workspace_trust.py",
 ]
 
 if __name__ == "__main__":
