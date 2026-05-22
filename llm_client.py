@@ -30,8 +30,34 @@ _ica_client = None
 _session_tokens_by_model: dict = {}
 _last_request_tokens = {"prompt": 0, "completion": 0, "model": ""}
 
+# response_format 支持探测：探测过且失败的 model 加进来，后续请求自动跳过传参
+_RF_UNSUPPORTED: set = set()
+
 LLM_TIMEOUT_SEC = 120
 LLM_MAX_RETRIES_PER_MODEL = 3  # 每个模型对 429/5xx 的退避重试次数
+
+
+def _looks_like_rf_rejection(exc) -> bool:
+    """探测后端是否因 response_format 不支持而 400。
+    匹配常见错误描述：response_format、json_object、Unknown parameter 等。"""
+    msg = (str(exc) or "").lower()
+    keys = ("response_format", "json_object", "unknown parameter",
+            "not supported", "unsupported")
+    return any(k in msg for k in keys)
+
+
+def _should_skip_rf(model: str) -> bool:
+    """是否跳过传 response_format。
+    硬规则（已知差表现）+ 动态探测（运行时报 400 的）。
+
+    硬规则：Claude 走 ICA 时虽然接受 response_format 不报错，但 json_object 模式下
+    模型常常退化为输出 `{}`——比 400 还隐蔽。实测见笔记 _14。
+    """
+    if model in _RF_UNSUPPORTED:
+        return True
+    if _is_claude(model):
+        return True
+    return False
 
 
 def set_quality_cascade(cascade):
@@ -103,13 +129,27 @@ def _client_for(model: str):
 
 def _call_single_model(cl, model, messages, response_format=None, stream=False):
     kwargs = {"model": model, "messages": messages, "timeout": LLM_TIMEOUT_SEC}
-    if response_format and not _is_claude(model):
+    if response_format and not _should_skip_rf(model):
         kwargs["response_format"] = response_format
     if stream and not _is_gemini(model):
         kwargs["stream"] = True
         kwargs["stream_options"] = {"include_usage": True}
-        return _handle_stream(cl.chat.completions.create(**kwargs), model)
-    return cl.chat.completions.create(**kwargs)
+        try:
+            return _handle_stream(cl.chat.completions.create(**kwargs), model)
+        except Exception as e:
+            if response_format and "response_format" in kwargs and _looks_like_rf_rejection(e):
+                _RF_UNSUPPORTED.add(model)
+                kwargs.pop("response_format", None)
+                return _handle_stream(cl.chat.completions.create(**kwargs), model)
+            raise
+    try:
+        return cl.chat.completions.create(**kwargs)
+    except Exception as e:
+        if response_format and "response_format" in kwargs and _looks_like_rf_rejection(e):
+            _RF_UNSUPPORTED.add(model)
+            kwargs.pop("response_format", None)
+            return cl.chat.completions.create(**kwargs)
+        raise
 
 
 def _is_transient_error(exc) -> bool:
@@ -147,17 +187,33 @@ def call_llm(messages, tools=None, tool_choice=None, response_format=None, strea
                         kwargs["tools"] = tools
                     if tool_choice is not None:
                         kwargs["tool_choice"] = tool_choice
-                    if response_format is not None and not _is_claude(model):
+                    if response_format is not None and not _should_skip_rf(model):
                         kwargs["response_format"] = response_format
                     cl = _client_for(model)
-                    if use_stream and not _is_gemini(model):
-                        kwargs["stream"] = True
-                        kwargs["stream_options"] = {"include_usage": True}
-                        result_holder[0] = _handle_stream(
-                            cl.chat.completions.create(**kwargs), model
-                        )
-                    else:
-                        result_holder[0] = cl.chat.completions.create(**kwargs)
+                    try:
+                        if use_stream and not _is_gemini(model):
+                            kwargs["stream"] = True
+                            kwargs["stream_options"] = {"include_usage": True}
+                            result_holder[0] = _handle_stream(
+                                cl.chat.completions.create(**kwargs), model
+                            )
+                        else:
+                            result_holder[0] = cl.chat.completions.create(**kwargs)
+                    except Exception as inner:
+                        # 后端拒 response_format 时记忆并自动重试一次（无该参数）
+                        if (response_format is not None
+                                and "response_format" in kwargs
+                                and _looks_like_rf_rejection(inner)):
+                            _RF_UNSUPPORTED.add(model)
+                            kwargs.pop("response_format", None)
+                            if use_stream and not _is_gemini(model):
+                                result_holder[0] = _handle_stream(
+                                    cl.chat.completions.create(**kwargs), model
+                                )
+                            else:
+                                result_holder[0] = cl.chat.completions.create(**kwargs)
+                        else:
+                            raise
                     return
                 except Exception as e:
                     exc_holder[0] = e

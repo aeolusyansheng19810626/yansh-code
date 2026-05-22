@@ -417,6 +417,55 @@ def _log_json_failure(stage: str, raw_content: str, error: str) -> None:
     )
 
 
+def _call_with_json_retry(stage, messages, parser_fn,
+                          response_format=None, stream=None,
+                          extra_call_kwargs=None):
+    """LLM 调用 + JSON 解析失败自动 retry 1 次。
+
+    parser_fn(content) 必须返回 (ok: bool, data, error_msg: str|None)。
+      - ok=True: 解析成功，data 是最终返回值
+      - ok=False: 解析失败，error_msg 描述原因；返回 None data 时表示降级处理由 caller 决定
+
+    第一次失败时把"原始内容 + 错误描述"作为 user 消息追加再调一次；仍失败则 log + 返回 parser_fn 的降级数据。
+    """
+    extra = dict(extra_call_kwargs or {})
+    kwargs = {"messages": messages}
+    if response_format is not None:
+        kwargs["response_format"] = response_format
+    if stream is not None:
+        kwargs["stream"] = stream
+    kwargs.update(extra)
+
+    response = call_llm(**kwargs)
+    content = response.choices[0].message.content or ""
+    ok, data, err = parser_fn(content)
+    if ok:
+        return data
+
+    # 失败 → retry 1 次
+    console.print(f"[{stage}] JSON 解析失败，自动 retry 1 次：{err}",
+                  style="yellow", highlight=False)
+    fix_prompt = (
+        f"上一轮你的输出无法被解析为合法 JSON。请仅输出合法 JSON（无多余说明、无 markdown 围栏）。\n"
+        f"错误：{err}\n"
+        f"前次输出（截断）：\n{_truncate(content)}"
+    )
+    retry_messages = list(messages) + [
+        {"role": "assistant", "content": content},
+        {"role": "user", "content": fix_prompt},
+    ]
+    retry_kwargs = dict(kwargs)
+    retry_kwargs["messages"] = retry_messages
+    response2 = call_llm(**retry_kwargs)
+    content2 = response2.choices[0].message.content or ""
+    ok2, data2, err2 = parser_fn(content2)
+    if ok2:
+        return data2
+    # 两次都失败：log raw + 返回降级值
+    _log_json_failure(stage, content2, f"retry 后仍失败：{err2}")
+    return data2
+
+
 def _extract_json(text: str) -> str:
     """从 LLM 响应中提取 JSON 字符串（兼容 markdown 代码块、顶层数组、顶层对象）"""
     import re
@@ -1159,49 +1208,50 @@ test_command 禁止使用 python -c 内联执行（会被安全策略拦截）�
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_content}
     ]
-    response = call_llm(messages, response_format={"type": "json_object"})
-    content = response.choices[0].message.content or ""
-    return _parse_plan_response(content)
+    return _call_with_json_retry(
+        "plan", messages, _parse_plan_with_status,
+        response_format={"type": "json_object"},
+    )
 
 
-def _parse_plan_response(content: str) -> dict:
-    """解析 plan() 的 LLM 响应。失败时 log raw 内容（不静默 pass），返回空 plan。"""
+def _parse_plan_with_status(content: str):
+    """返回 (ok, plan_dict, err_msg)。retry 包装用此版本；旧 _parse_plan_response 委托到这里。"""
     if not content.strip():
-        _log_json_failure("plan", content, "LLM 返回空内容")
-        return {"files": [], "test_command": ""}
+        return False, {"files": [], "test_command": ""}, "LLM 返回空内容"
     extracted = _extract_json(content)
     try:
         raw = json.loads(extracted)
     except json.JSONDecodeError as e:
-        _log_json_failure("plan", content, f"json.loads 失败：{e}")
-        return {"files": [], "test_command": ""}
-
+        return False, {"files": [], "test_command": ""}, f"json.loads 失败：{e}"
     # 兼容 LLM 直接返回数组的旧形态
     if isinstance(raw, list):
         raw = {"files": raw, "test_command": ""}
     if not isinstance(raw, dict):
-        _log_json_failure("plan", content, f"顶层不是 dict/list，而是 {type(raw).__name__}")
-        return {"files": [], "test_command": ""}
-
+        return False, {"files": [], "test_command": ""}, f"顶层不是 dict/list，而是 {type(raw).__name__}"
     try:
         validated = PlanResult(**raw)
     except ValidationError as e:
-        _log_json_failure("plan", content, f"schema 校验失败：{e.errors()}")
-        # 校验失败仍返回原 dict，让下游尽力处理（向后兼容）
-        return raw
-
+        # 校验失败仍返回原 dict，让下游尽力处理
+        return False, raw, f"schema 校验失败：{e.errors()}"
     # 序列化回 plain dict（与历史行为保持兼容：files 元素可能是 str 或 dict）
     files_out = []
     for f in validated.files:
         if isinstance(f, PlanFile):
             d = f.model_dump()
-            # 兼容：旧代码读 description；保留 intent 别名
             if d.get("description") and not d.get("intent"):
                 d["intent"] = d["description"]
             files_out.append(d)
         else:
             files_out.append(f)
-    return {"files": files_out, "test_command": validated.test_command}
+    return True, {"files": files_out, "test_command": validated.test_command}, None
+
+
+def _parse_plan_response(content: str) -> dict:
+    """旧入口：失败时 log raw（保留向后兼容，单测仍直接调它）"""
+    ok, data, err = _parse_plan_with_status(content)
+    if not ok:
+        _log_json_failure("plan", content, err)
+    return data
 
 def code(plan, mode="auto", requirement=""):
     """根据计划逐个文件生成/修改代码。文件已存在优先用replace_in_file做精确修改；不存在则用write_file新建。
@@ -1497,12 +1547,14 @@ def review(requirement, modified_files):
     ]
     
     try:
+        # P1 #4：走 retry 包装；REVIEW_MODEL 走单模型路径，仍保留旧行为（不 retry，避免变更面）
         if REVIEW_MODEL:
             response = _call_single_model(_client_for(REVIEW_MODEL), REVIEW_MODEL, messages, stream=True)
-        else:
-            response = call_llm(messages, stream=True)
-        content = response.choices[0].message.content or ""
-        return _parse_review_response(content)
+            content = response.choices[0].message.content or ""
+            return _parse_review_response(content)
+        return _call_with_json_retry(
+            "review", messages, _parse_review_with_status, stream=True,
+        )
     except Exception as e:
         return {
             "approved": False,
@@ -1511,39 +1563,42 @@ def review(requirement, modified_files):
         }
 
 
-def _parse_review_response(content: str) -> dict:
-    """解析 review() 的 LLM 响应。失败时 log raw 并把错误带回 issues。"""
+def _parse_review_with_status(content: str):
+    """返回 (ok, review_dict, err_msg)。retry 包装用此版本。"""
     if not content.strip():
-        _log_json_failure("review", content, "LLM 返回空内容")
-        return {"approved": False,
-                "issues": ["review_error: LLM 返回空内容"],
-                "suggestions": []}
+        return False, {"approved": False,
+                       "issues": ["review_error: LLM 返回空内容"],
+                       "suggestions": []}, "LLM 返回空内容"
     extracted = _extract_json(content)
     try:
         raw = json.loads(extracted)
     except json.JSONDecodeError as e:
-        _log_json_failure("review", content, f"json.loads 失败：{e}")
-        return {"approved": False,
-                "issues": [f"review_error: LLM 返回非 JSON（{e}）"],
-                "suggestions": []}
-
+        return False, {"approved": False,
+                       "issues": [f"review_error: LLM 返回非 JSON（{e}）"],
+                       "suggestions": []}, f"json.loads 失败：{e}"
     if not isinstance(raw, dict):
-        _log_json_failure("review", content, f"顶层不是 dict，而是 {type(raw).__name__}")
-        return {"approved": False,
-                "issues": [f"review_error: 顶层非 dict"],
-                "suggestions": []}
-
+        return False, {"approved": False,
+                       "issues": ["review_error: 顶层非 dict"],
+                       "suggestions": []}, f"顶层不是 dict，而是 {type(raw).__name__}"
     try:
         validated = ReviewResult(**raw)
-        return validated.model_dump()
+        return True, validated.model_dump(), None
     except ValidationError as e:
-        _log_json_failure("review", content, f"schema 校验失败：{e.errors()}")
         # 兜底：尽力按字段类型抢救
-        return {
+        salvage = {
             "approved": bool(raw.get("approved", False)),
-            "issues": list(raw.get("issues", [])) or [f"review_error: schema 校验失败"],
+            "issues": list(raw.get("issues", [])) or ["review_error: schema 校验失败"],
             "suggestions": list(raw.get("suggestions", [])),
         }
+        return False, salvage, f"schema 校验失败：{e.errors()}"
+
+
+def _parse_review_response(content: str) -> dict:
+    """旧入口：失败时 log raw（向后兼容）"""
+    ok, data, err = _parse_review_with_status(content)
+    if not ok:
+        _log_json_failure("review", content, err)
+    return data
 
 def fix(test_result, plan, reason="test_failure"):
     """根据测试错误或审查意见修复代码（多轮工具调用）

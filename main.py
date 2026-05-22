@@ -255,6 +255,8 @@ def main():
     parser.add_argument("--json", action="store_true", help="以 JSON 格式输出最后结果 (batch 模式)")
     parser.add_argument("--strict", action="store_true", help="批处理模式下拒绝需确认命令（pip/npm install、git checkout/reset）")
     parser.add_argument("--cwd", metavar="DIR", help="指定工作目录（workspace），默认为 ./workspace")
+    parser.add_argument("--sandbox", metavar="BACKEND",
+                        help="execute_command 沙箱：none(默认) | docker | docker:<image>")
     args = parser.parse_args()
 
     # --cwd：在一切初始化之前设置 workspace 路径
@@ -265,6 +267,15 @@ def main():
         _config_mod.set_workspace_dir(args.cwd)
         _tools_mod2._reinit_paths()
         _agent_mod2._reinit_paths()
+
+    # --sandbox：opt-in 沙箱（P1 #6）；默认禁用、行为不变
+    if args.sandbox:
+        import sandbox as _sandbox_mod
+        try:
+            _sandbox_mod.set_config(_sandbox_mod.parse_cli_arg(args.sandbox))
+        except ValueError as _e:
+            console.print(f"[红]--sandbox 参数错：{_e}[/红]", highlight=False)
+            sys.exit(2)
 
     # 加载配置
     load_project_config()
@@ -301,7 +312,12 @@ def main():
 
     # 交互模式
     console.print("[bold cyan]yansh-code 已启动[/bold cyan]")
-    console.print(f"模式: {current_mode} | 模型: {get_config()['model']}")
+    try:
+        import sandbox as _sandbox_mod
+        _sb = _sandbox_mod.describe()
+    except Exception:
+        _sb = "off"
+    console.print(f"模式: {current_mode} | 模型: {get_config()['model']} | 沙箱: {_sb}")
     console.print("输入任务需求，或输入 /history, /clear, /compress, /rollback, /stats, /log, /config, /rules, /mode 获取帮助。")
     console.print("图片: @image <路径/URL>（分析截图/设计稿）  @paste（粘贴剪贴板截图）  @image design.png → 按设计稿生成代码", highlight=False)
     if _PROJECT_TYPE:

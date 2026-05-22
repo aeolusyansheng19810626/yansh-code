@@ -227,11 +227,17 @@ def execute_command(command):
                 return _err("security", "用户取消执行", returncode=-1, stdout="", stderr="")
 
     import threading
+    # P1 #6：opt-in 沙箱——若启用，把命令包成 docker run 形态；默认禁用，行为不变
+    try:
+        import sandbox as _sandbox
+        run_command = _sandbox.wrap_command(command, _get_workspace())
+    except Exception:
+        run_command = command
 
     try:
         env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
         process = subprocess.Popen(
-            command,
+            run_command,
             shell=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

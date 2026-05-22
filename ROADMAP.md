@@ -18,16 +18,16 @@
 
 已建：18 个工具、4 类角色、tree-sitter 符号索引（带 mtime 缓存）、HIL diff 确认、git 快照与回滚、任务日志、流式输出、ESC 中断、命令安全沙箱、--cwd 多项目支持。
 
-### 进度速览（2026-05-22 晚）
+### 进度速览（2026-05-22 夜）
 
 | # | 项目 | 状态 |
 |---|---|---|
 | P0 #1 | 分层符号索引 | 🟢 完成（top/deep 双模式 + directory_summary + audit 顶层注入） |
 | P0 #2 | Prompt 调优 | 🟢 活跃迭代 |
 | P0 #3 | 错误恢复闭环 | 🟢 完成（基础设施 + prompt 加固 + 信号全流程贯通 + 持久化进日志） |
-| P1 #4 | JSON 解析健壮性 | 🟡 部分（基础校验在，retry 未做） |
-| P1 #5 | 全局状态重构 | ⬜ 未着手 |
-| P1 #6 | 沙箱模式 opt-in | ⬜ 未着手 |
+| P1 #4 | JSON 解析健壮性 | 🟢 完成（retry 包装 + ICA response_format 探测/硬规则） |
+| P1 #5 | 全局状态重构 | 🟢 完成（state.Session + scoped_session 渐进式） |
+| P1 #6 | 沙箱模式 opt-in | 🟢 完成（--sandbox docker[:image]，仅包 execute_command） |
 | P2 #7 | Plan Mode | ⬜ 未着手 |
 | P2 #8 | Skills 系统 | ⬜ 未着手 |
 | P2 #9 | 子 Agent | ⬜ 未着手 |
@@ -123,9 +123,14 @@
 
 ## 优先级 P1：长期工程健康
 
-### 4. JSON 解析健壮性 🟡 部分
+### 4. JSON 解析健壮性 🟢 完成
 
-**进度（2026-05-21）**：Pydantic 校验 + 失败 log 已加（commit `fa9f991`）。**待做**：调研 ICA 网关 `response_format`、解析失败自动 retry 1 次。
+**进度（2026-05-22 夜）**：上一轮的"待做"两项一起做完（commit 见 git log，笔记 [_14](./notes/shadow/2026-05-22_14-p1-batch-4-5-6.md)）：
+
+- **retry 1 次**：`agent._call_with_json_retry(stage, messages, parser_fn, ...)` 包装。第一次 parse 失败时把"原始内容 + 错误"作为 user 消息追加再调一次；仍失败则 log raw 并返回降级值。`_parse_plan_response` / `_parse_review_response` 拆出 `*_with_status` 三元组接口供包装用。`plan()` / `review()`（仅 REVIEW_MODEL 未设时）已改用。
+- **ICA response_format 探测**：`llm_client._RF_UNSUPPORTED` 进程级黑名单 + `_looks_like_rf_rejection` 关键字探测；`_should_skip_rf(model)` 合并硬规则（Claude 实测降质 → 硬跳过）+ 动态黑名单（运行时 400 加入）。
+
+**关键发现**：ICA 接受 `response_format={"type":"json_object"}` 不报 400，但 Sonnet 4.6 会退化输出 `{}`——比 400 拒绝更隐蔽。原本 `_is_claude` 硬跳过是必须的，不是过度防御。
 
 **Claude Code 怎么做**：tool calling 用的是 OpenAI 兼容的 function calling，schema 由后端校验。模型偶尔生成不合法 JSON 会被 SDK 层 retry。结构化输出走 strict json schema mode（OpenAI/Anthropic 都支持）。
 
@@ -144,7 +149,17 @@
 
 ---
 
-### 5. 全局状态重构 ⬜ 未着手
+### 5. 全局状态重构 🟢 完成
+
+**进度（2026-05-22 夜）**：渐进式落地（笔记 [_14](./notes/shadow/2026-05-22_14-p1-batch-4-5-6.md)）。新建 `state.py`：
+
+- `Session` dataclass 镜像 `_BATCH_MODE` / `_PROJECT_TYPE` / `_PROJECT_TEST_CMD` / `_CURRENT_SNAPSHOT` / `_AST_CACHE`
+- `Session.pull()` 拍快照、`Session.push()` 写回、`Session.reset(workspace_dir)` 一行清零
+- `scoped_session(workspace_dir)` context manager：进入拍快照 + reset；退出 push 恢复
+
+模块级变量保留作为运行期事实存储（不破坏现有读写路径）。测试现可 `with scoped_session(tmp_path):` 隔离，告别 `reload(tools)` hack。
+
+**取舍**：完整 Session class 替代模块全局会改 ~15 处读写 + 全部 fixture，先上"测试可隔离"这个最痛的点，未来再迁。
 
 **Claude Code 怎么做**：每个 session 独立进程，session 内状态局部封装。多个 Claude Code 实例可以并行跑而互不干扰。
 
@@ -163,9 +178,16 @@
 
 ---
 
-### 6. 沙箱模式（opt-in） ⬜ 未着手
+### 6. 沙箱模式（opt-in） 🟢 完成
 
-**进度（2026-05-21）**：已有命令安全沙箱（黑名单 + 未识别确认）。**待做**：`--sandbox docker` opt-in。
+**进度（2026-05-22 夜）**：opt-in 进程隔离落地（笔记 [_14](./notes/shadow/2026-05-22_14-p1-batch-4-5-6.md)）。
+
+- 新建 `sandbox.py`：`SandboxConfig`、`parse_cli_arg("docker"|"docker:image"|"none")`、`wrap_command(cmd, ws)` 输出 `docker run --rm -i -v <ws>:/ws -w /ws <image> sh -c '<cmd>'`，`shlex.quote` 防注入
+- `tools.execute_command` 在 Popen 前调一次 `wrap_command`——禁用时零开销原样返回
+- `main.py` 加 `--sandbox` CLI；启动 banner 显示 `沙箱: off | docker:python:3.11-slim`
+
+**只包 execute_command**：read_file / write_file 是受控 IO，无需隔离。
+**rw 挂载（非 ro）**：测试常需要写中间文件；隔离的核心收益是命名空间隔离，不是只读。
 
 **Claude Code 怎么做**：默认运行在用户机器上，但 IDE 集成时有 read-only file mode、explicit auth 提示。本身不强制 docker 沙箱。
 
