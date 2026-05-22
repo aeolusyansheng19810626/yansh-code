@@ -6,3 +6,6 @@ workspace/
 .claude/
 .yansh/
 .yansh_history.json
+*.egg-info/
+build/
+dist/
