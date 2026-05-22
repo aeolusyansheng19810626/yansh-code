@@ -3,6 +3,7 @@ import re
 import sys
 import subprocess
 import shutil
+import threading
 from pathlib import Path
 from config import WORKSPACE_DIR
 
@@ -578,7 +579,7 @@ def get_symbol_definition(symbol_name, file_path=None):
     def _search_file(abs_path):
         try:
             src_bytes = abs_path.read_bytes()
-            tree = parser.parse(src_bytes)
+            tree = _ts_parse_locked(parser, src_bytes)
             hits = _collect(tree.root_node, src_bytes)
             rel = str(abs_path.relative_to(_WORKSPACE_ROOT)).replace("\\", "/")
             return [{"file": rel, "line": h["line"], "code": h["code"]} for h in hits]
@@ -692,25 +693,39 @@ _TS_PARSER = None
 # 文件级 AST 符号缓存：abs_path_str -> (mtime, [{name, type, line}])
 # 仅 list_symbols 路径使用；replace_symbol 写入后调 _invalidate_ast_cache
 _AST_CACHE: dict = {}
+# P1 安全：tree-sitter Parser 不是 thread-safe；并发 subagent 启动时
+# workspace_symbols 会撞 parser.parse。用一把锁串行 parse 调用。
+# 单次 parse < 10ms，对 yansh 并发场景可接受。
+_TS_PARSER_LOCK = threading.Lock()
 
 
 def _load_ts_parser():
-    """返回 (parser, error_dict)。parser 跨调用复用。"""
+    """返回 (parser, error_dict)。parser 跨调用复用，init 加锁防多线程同时 init。"""
     global _TS_PARSER
     if _TS_PARSER is not None:
         return _TS_PARSER, None
-    try:
-        import tree_sitter_python as tspython
-        from tree_sitter import Language, Parser
-        py_lang = Language(tspython.language())
-        _TS_PARSER = Parser(py_lang)
-        return _TS_PARSER, None
-    except ImportError:
-        return None, _err("internal", "tree-sitter 未安装，请运行: pip install tree-sitter tree-sitter-python")
+    with _TS_PARSER_LOCK:
+        # double-check：拿到锁后再确认
+        if _TS_PARSER is not None:
+            return _TS_PARSER, None
+        try:
+            import tree_sitter_python as tspython
+            from tree_sitter import Language, Parser
+            py_lang = Language(tspython.language())
+            _TS_PARSER = Parser(py_lang)
+            return _TS_PARSER, None
+        except ImportError:
+            return None, _err("internal", "tree-sitter 未安装，请运行: pip install tree-sitter tree-sitter-python")
+
+
+def _ts_parse_locked(parser, src_bytes):
+    """parser.parse 必须串行——tree-sitter Parser 单实例并发不安全。"""
+    with _TS_PARSER_LOCK:
+        return parser.parse(src_bytes)
 
 
 def _invalidate_ast_cache(abs_path):
-    """文件被写入后调用，清掉对应的缓存项"""
+    """文件被写入后调用，清掉对应的缓存项（dict.pop CPython 原子）"""
     _AST_CACHE.pop(str(abs_path), None)
 
 
@@ -740,7 +755,7 @@ def _parse_symbols_cached(abs_path):
     except Exception as e:
         return None, _err("internal", str(e))
 
-    tree = parser.parse(src_bytes)
+    tree = _ts_parse_locked(parser, src_bytes)
     symbols = []
 
     def _collect(node):
@@ -789,7 +804,7 @@ def replace_symbol(symbol_name, new_code, file_path):
     except Exception as e:
         return _err("internal", str(e))
 
-    tree = parser.parse(src_bytes)
+    tree = _ts_parse_locked(parser, src_bytes)
 
     def _find(node, parent_type=None):
         if node.type == "decorated_definition":
