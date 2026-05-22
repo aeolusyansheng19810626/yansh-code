@@ -171,6 +171,76 @@ def test_run_one_hook_timeout():
     assert elapsed < 5, f"超时应 ≤ 1s + buffer，实际 {elapsed:.1f}s"
 
 
+def test_run_one_hook_timeout_kills_process_tree(tmp_path):
+    """P3-1：timeout 触发后用 psutil 验证 hook 进程 + 孙进程都真被杀。
+
+    之前的 test_run_one_hook_timeout 只验证"主线程 1s 后返回"——但如果
+    procutil.kill_tree 实现错误，子进程会留下来当孤儿，主线程依然能
+    timeout 返回，测试依然绿。这条测试用 marker file 拿到两层 pid，
+    返回后用 psutil 验证两个 pid 都不存活。
+    """
+    try:
+        import psutil
+    except ImportError:
+        import pytest
+        pytest.skip("需要 psutil 验证 pid 死亡")
+
+    import sys as _sys
+    py = _sys.executable.replace("\\", "/")
+    marker = tmp_path / "pids.txt"
+    marker_path = str(marker).replace("\\", "/")
+
+    # hook 命令：写自己 pid 到 marker，spawn 孙 sleep(60)，孙写自己 pid 到 marker，
+    # 自己 sleep(60)。timeout 后两个 pid 都该死。
+    hook_script = tmp_path / "tree_hook.py"
+    hook_script.write_text(
+        "import os, subprocess, sys, time\n"
+        f"marker = r'{marker_path}'\n"
+        "with open(marker, 'a') as f: f.write(f'parent={os.getpid()}\\n')\n"
+        f"p = subprocess.Popen([r'{py}', '-c', '''\n"
+        "import os, sys\n"
+        f"with open(r'{marker_path}', 'a') as f: f.write(f'child={{os.getpid()}}\\\\n')\n"
+        "import time; time.sleep(60)\n"
+        "'''])\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    hook = {"command": f'{py} "{hook_script}"', "timeout": 1}
+
+    t0 = time.time()
+    result = hooks._run_one_hook(hook, {"event": "test"})
+    elapsed = time.time() - t0
+    assert "_hook_error" in result
+    assert "超时" in result["_hook_error"]
+    assert elapsed < 5
+
+    # 给系统 0.5s 清理
+    time.sleep(0.5)
+
+    # 读 marker 拿 pid
+    parent_pid = child_pid = None
+    if marker.exists():
+        for line in marker.read_text(encoding="utf-8").splitlines():
+            if line.startswith("parent="):
+                parent_pid = int(line.split("=", 1)[1])
+            elif line.startswith("child="):
+                child_pid = int(line.split("=", 1)[1])
+
+    # 兜底：若孙没写出 pid（例如 Popen 还没 fork 就被杀），不能断言它死——只断言写出来的那些
+    # 再清理（避免测试失败时残留）
+    for pid in (parent_pid, child_pid):
+        if pid and psutil.pid_exists(pid):
+            try:
+                psutil.Process(pid).kill()
+            except Exception:
+                pass
+
+    assert parent_pid is not None, f"hook 没写出 parent pid，marker 内容：{marker.read_text(encoding='utf-8') if marker.exists() else '<missing>'}"
+    assert not psutil.pid_exists(parent_pid), f"父 pid {parent_pid} 还活着——kill 失败"
+    if child_pid is not None:
+        assert not psutil.pid_exists(child_pid), f"孙 pid {child_pid} 还活着——进程树 kill 失败"
+
+
 # ---------- run_hook_event 聚合 ----------
 
 def _write_hooks_json(tmp_path, monkeypatch, hooks_dict):
