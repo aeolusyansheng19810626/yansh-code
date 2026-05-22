@@ -1429,7 +1429,13 @@ def audit(requirement):
                     console.print(f"审计完成（task_complete: {'成功' if success else '放弃'}）：{summary}")
                     console.print()
                     console.print(last_text or summary or "（无报告内容）", highlight=False)
-                    return {"success": success, "report": last_text or summary}
+                    return {
+                        "success": success,
+                        "report": last_text or summary,
+                        "task_complete_signal": {
+                            "early_exit": True, "success": success, "summary": summary,
+                        },
+                    }
         else:
             # 沉默退出兜底：第一次没调工具 → 追问一次让它显式 task_complete
             if not silent_prompted:
@@ -1712,7 +1718,8 @@ def _run(requirement, mode):
     # audit 模式：完全独立路径，不进 plan/code/review/fix
     if mode == "audit":
         res = audit(original_requirement)
-        finish_task_log(res["success"], 0)
+        finish_task_log(res["success"], 0,
+                        task_complete_signal=res.get("task_complete_signal"))
         return {"success": res["success"],
                 "test_result": {"returncode": 0 if res["success"] else 1,
                                 "stdout": res.get("report", ""), "stderr": ""}}
@@ -1789,7 +1796,7 @@ def _run(requirement, mode):
         # test_result 用 dummy dict（returncode=-1）避免外层 .get() 崩溃，
         # 同时把 LLM 的放弃理由放进 stderr 便于回放
         _dummy_tr = {"returncode": -1, "stdout": "", "stderr": f"Coder 主动放弃：{_summary}"}
-        finish_task_log(False, 0, _dummy_tr)
+        finish_task_log(False, 0, _dummy_tr, task_complete_signal=coder_signal)
         return report(False, _dummy_tr, task_complete_signal=coder_signal)
 
     # 砍掉独立的 reviewer agent 循环：对标 Claude Code 单 agent 设计——
@@ -1828,7 +1835,7 @@ def _run(requirement, mode):
                           style="yellow", highlight=False)
             add_to_history(original_requirement, f"任务被 LLM 主动放弃：{_summary}")
             _dummy_tr = {"returncode": -1, "stdout": "", "stderr": f"linter 阶段放弃：{_summary}"}
-            finish_task_log(False, attempts, _dummy_tr)
+            finish_task_log(False, attempts, _dummy_tr, task_complete_signal=fix_signal)
             return report(False, _dummy_tr, task_complete_signal=fix_signal)
         attempts += 1
 
@@ -1842,7 +1849,7 @@ def _run(requirement, mode):
             file_names = [name for name in file_names if name]
             summary = f"执行了任务：{original_requirement}。创建/修改了文件：{', '.join(file_names)}"
             add_to_history(original_requirement, summary)
-            finish_task_log(True, attempts, test_result)
+            finish_task_log(True, attempts, test_result, task_complete_signal=coder_signal)
             return report(True, test_result, task_complete_signal=coder_signal)
         else:
             console.print(f"测试失败 (尝试 {attempts + 1}/{max_attempts})")
@@ -1857,14 +1864,14 @@ def _run(requirement, mode):
                                       highlight=False)
                         add_to_history(original_requirement,
                                        f"执行了任务（LLM 主动收尾）：{_summary}")
-                        finish_task_log(True, attempts, test_result)
+                        finish_task_log(True, attempts, test_result, task_complete_signal=fix_signal)
                         return report(True, test_result, task_complete_signal=fix_signal)
                     else:
                         # LLM 说"放弃"
                         console.print(f"[task_complete] LLM 主动放弃任务：{_summary}",
                                       style="yellow", highlight=False)
                         add_to_history(original_requirement, f"任务被 LLM 主动放弃：{_summary}")
-                        finish_task_log(False, attempts, test_result)
+                        finish_task_log(False, attempts, test_result, task_complete_signal=fix_signal)
                         return report(False, test_result, task_complete_signal=fix_signal)
             attempts += 1
 
@@ -1879,7 +1886,7 @@ def _run(requirement, mode):
         # 不主动 cleanup：失败时也保留快照供后续 /revert，由 _gc_old_snapshots 控制总量
 
     add_to_history(original_requirement, f"任务失败：{original_requirement}")
-    finish_task_log(False, attempts, test_result)
+    finish_task_log(False, attempts, test_result, task_complete_signal=coder_signal)
     return report(False, test_result, task_complete_signal=coder_signal)
 
 

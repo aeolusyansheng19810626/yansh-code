@@ -221,6 +221,95 @@ def test_report_omits_task_complete_signal_when_none():
     assert out["success"] is False
 
 
+# ============= task_log 持久化 task_complete_signal =============
+
+def test_task_log_persists_task_complete_signal(tmp_path):
+    """finish_task_log 收到 signal 时应持久化到日志文件"""
+    import config, task_log
+    config.set_workspace_dir(str(tmp_path))
+    task_log._reinit_paths()
+
+    task_log.init_task_log("test req", "code")
+    sig = {"early_exit": True, "success": True, "summary": "完成 multiply"}
+    task_log.finish_task_log(True, 0, {"returncode": 0, "stdout": "", "stderr": ""},
+                             task_complete_signal=sig)
+
+    # 读最新日志文件
+    logs = sorted(task_log._LOG_DIR.glob("*.jsonl"))
+    assert logs, "应至少写入一个日志文件"
+    import json as _json
+    entry = _json.loads(logs[-1].read_text(encoding="utf-8"))
+    assert entry.get("task_complete_signal") == {
+        "early_exit": True, "success": True, "summary": "完成 multiply",
+    }
+
+
+def test_task_log_omits_signal_when_none(tmp_path):
+    """没 signal 时日志不应有 task_complete_signal 字段"""
+    import config, task_log
+    config.set_workspace_dir(str(tmp_path))
+    task_log._reinit_paths()
+
+    task_log.init_task_log("test req", "code")
+    task_log.finish_task_log(True, 0, {"returncode": 0, "stdout": "", "stderr": ""})
+
+    logs = sorted(task_log._LOG_DIR.glob("*.jsonl"))
+    assert logs
+    import json as _json
+    entry = _json.loads(logs[-1].read_text(encoding="utf-8"))
+    assert "task_complete_signal" not in entry
+
+
+def test_task_log_truncates_long_summary(tmp_path):
+    """summary 超 500 字符应截断，避免日志膨胀"""
+    import config, task_log
+    config.set_workspace_dir(str(tmp_path))
+    task_log._reinit_paths()
+
+    task_log.init_task_log("test req", "code")
+    long_summary = "x" * 1000
+    sig = {"early_exit": True, "success": False, "summary": long_summary}
+    task_log.finish_task_log(False, 1, {"returncode": 1, "stdout": "", "stderr": "boom"},
+                             task_complete_signal=sig)
+
+    logs = sorted(task_log._LOG_DIR.glob("*.jsonl"))
+    import json as _json
+    entry = _json.loads(logs[-1].read_text(encoding="utf-8"))
+    assert len(entry["task_complete_signal"]["summary"]) == 500
+
+
+def test_audit_returns_signal_on_task_complete(tmp_path):
+    """audit() 收到 task_complete sentinel 时返回值应包含 task_complete_signal"""
+    import config, tools
+    config.set_workspace_dir(str(tmp_path))
+    tools._reinit_paths()
+
+    orig = agent.call_llm
+    try:
+        call_count = {"n": 0}
+        def mock_llm(msgs, **kw):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return _make_response(
+                    content="审计报告内容",
+                    tool_calls=[("a1", "task_complete",
+                                 {"success": True, "summary": "审计完成：3 处问题"})],
+                )
+            return _make_response(content="", tool_calls=None)
+
+        agent.call_llm = mock_llm
+        result = agent.audit("审计 calc.py")
+    finally:
+        agent.call_llm = orig
+
+    assert result["success"] is True
+    sig = result.get("task_complete_signal")
+    assert sig is not None
+    assert sig["early_exit"] is True
+    assert sig["success"] is True
+    assert "3 处" in sig["summary"]
+
+
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, "-v"])

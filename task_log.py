@@ -50,7 +50,11 @@ def init_task_log(requirement, mode):
     })
 
 
-def finish_task_log(success, attempts, test_result=None):
+def finish_task_log(success, attempts, test_result=None, task_complete_signal=None):
+    """落盘任务日志。
+    task_complete_signal: LLM 主动声明的 {early_exit, success, summary}。
+      传 None 表示这次没收到主动信号（沉默退出 / 老路径），日志里不写该字段。
+    """
     if not _current_task_log:
         return
     _current_task_log["test_result"] = "pass" if success else "fail"
@@ -61,6 +65,13 @@ def finish_task_log(success, attempts, test_result=None):
     if test_result and not success:
         err = test_result.get("stderr", "") or test_result.get("stdout", "")
         _current_task_log["error"] = err[:300]
+    if task_complete_signal:
+        # 持久化 LLM 主动声明的事实——回放/统计能追溯
+        _current_task_log["task_complete_signal"] = {
+            "early_exit": bool(task_complete_signal.get("early_exit", False)),
+            "success": bool(task_complete_signal.get("success", False)),
+            "summary": str(task_complete_signal.get("summary", ""))[:500],
+        }
     _LOG_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     (_LOG_DIR / f"{ts}.jsonl").write_text(
@@ -88,7 +99,12 @@ def show_recent_logs():
             res = "✓" if e.get("test_result") == "pass" else "✗"
             dur = e.get("duration_seconds", 0)
             att = e.get("attempts", 0)
-            console.print(f"{ts} | {res} | {dur}s | {att}次 | {req}", highlight=False)
+            # task_complete_signal：标注 LLM 是否主动声明，让历史能看出"自然收尾 vs 兜底退出"
+            sig = e.get("task_complete_signal")
+            sig_tag = ""
+            if sig:
+                sig_tag = " | TC:" + ("ok" if sig.get("success") else "give-up")
+            console.print(f"{ts} | {res} | {dur}s | {att}次{sig_tag} | {req}", highlight=False)
         except Exception:
             continue
 
