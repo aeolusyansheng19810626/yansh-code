@@ -25,6 +25,8 @@ _task_tool_calls: list = []
 _task_files_modified: list = []
 _last_task_log: dict = {}
 _log_lock = threading.Lock()
+# AB 测试 / 成本统计：init 时记 baseline，finish 时算 delta 即本任务的 token 用量
+_token_baseline: dict = {"input": 0, "output": 0, "by_model": {}}
 
 
 def _reinit_paths():
@@ -36,6 +38,13 @@ def _reinit_paths():
 def init_task_log(requirement, mode):
     """重置当前任务日志（in-place 清空+更新，外部持有的 dict 引用仍有效）"""
     from config import get_config
+    # 记 token baseline——finish 时算 delta 得到本任务的 token 实耗
+    try:
+        import llm_client as _lc
+        global _token_baseline
+        _token_baseline = _lc.get_session_token_breakdown()
+    except Exception:
+        _token_baseline = {"input": 0, "output": 0, "by_model": {}}
     with _log_lock:
         _task_tool_calls.clear()
         _task_files_modified.clear()
@@ -79,6 +88,23 @@ def finish_task_log(success, attempts, test_result=None, task_complete_signal=No
                 "success": bool(task_complete_signal.get("success", False)),
                 "summary": str(task_complete_signal.get("summary", ""))[:500],
             }
+        # token 实耗 = 当前累计 - baseline（多任务场景隔离）
+        try:
+            import llm_client as _lc
+            cur = _lc.get_session_token_breakdown()
+            _current_task_log["tokens"] = {
+                "input": cur["input"] - _token_baseline.get("input", 0),
+                "output": cur["output"] - _token_baseline.get("output", 0),
+                "by_model": {
+                    m: {
+                        "input": b["input"] - _token_baseline.get("by_model", {}).get(m, {}).get("input", 0),
+                        "output": b["output"] - _token_baseline.get("by_model", {}).get(m, {}).get("output", 0),
+                    }
+                    for m, b in cur["by_model"].items()
+                },
+            }
+        except Exception:
+            pass
         # 在锁内构建好 payload，但实际写盘 IO 释放锁后做
         snapshot = dict(_current_task_log)
         _last_task_log.clear()

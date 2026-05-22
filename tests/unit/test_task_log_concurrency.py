@@ -124,6 +124,56 @@ def test_finish_task_log_under_concurrent_writes_consistent(tmp_path, monkeypatc
     assert len(last["files_modified"]) == 200
 
 
+# ---------- AB 测试用：token 字段 ----------
+
+def test_finish_task_log_includes_token_delta(tmp_path, monkeypatch):
+    """finish_task_log 应当从 llm_client 拉本任务的 token 实耗（基于 baseline）。"""
+    import config as _config_mod
+    import llm_client as _lc
+    monkeypatch.setattr(_config_mod, "WORKSPACE_DIR", str(tmp_path))
+    monkeypatch.setattr(task_log, "_LOG_DIR", tmp_path / "logs")
+
+    # 模拟"本任务前已有累计"——baseline
+    _lc._session_tokens_by_model.clear()
+    _lc._session_tokens_by_model["m1"] = {"prompt": 100, "completion": 50}
+
+    task_log.init_task_log("test", "auto")
+    # 模拟本任务期间 LLM 调用累加
+    _lc._session_tokens_by_model["m1"]["prompt"] += 200
+    _lc._session_tokens_by_model["m1"]["completion"] += 80
+    _lc._session_tokens_by_model["m2"] = {"prompt": 30, "completion": 10}
+
+    task_log.finish_task_log(success=True, attempts=1)
+    last = task_log.get_last_task_log()
+
+    assert "tokens" in last
+    # 本任务实耗 = 当前 - baseline
+    # m1: 200/80 增量 ; m2: 30/10 全是新增
+    assert last["tokens"]["input"] == 200 + 30
+    assert last["tokens"]["output"] == 80 + 10
+    assert last["tokens"]["by_model"]["m1"]["input"] == 200
+    assert last["tokens"]["by_model"]["m1"]["output"] == 80
+    assert last["tokens"]["by_model"]["m2"]["input"] == 30
+    # cleanup
+    _lc._session_tokens_by_model.clear()
+
+
+def test_finish_task_log_no_llm_calls_zero_tokens(tmp_path, monkeypatch):
+    """如果任务没真调 LLM，token 应该是 0（不抛、不漏字段）"""
+    import config as _config_mod
+    import llm_client as _lc
+    monkeypatch.setattr(_config_mod, "WORKSPACE_DIR", str(tmp_path))
+    monkeypatch.setattr(task_log, "_LOG_DIR", tmp_path / "logs")
+    _lc._session_tokens_by_model.clear()
+
+    task_log.init_task_log("test", "auto")
+    task_log.finish_task_log(success=True, attempts=1)
+    last = task_log.get_last_task_log()
+
+    assert last["tokens"]["input"] == 0
+    assert last["tokens"]["output"] == 0
+
+
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, "-v"])

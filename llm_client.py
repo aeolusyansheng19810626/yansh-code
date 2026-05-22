@@ -72,6 +72,24 @@ def get_session_total_tokens() -> int:
     return sum(b["prompt"] + b["completion"] for b in _session_tokens_by_model.values())
 
 
+def get_session_token_breakdown() -> dict:
+    """返回 {"input": int, "output": int, "by_model": {model: {input, output}}}.
+
+    给 task_log / AB 测试用。yansh batch 模式每次 main.py 调用 _session_tokens
+    从空开始累计，finish_task_log 直接读就是单任务总数；多任务场景需配 baseline
+    diff（task_log 内部已处理）。
+    """
+    by_model = {
+        m: {"input": b["prompt"], "output": b["completion"]}
+        for m, b in _session_tokens_by_model.items()
+    }
+    return {
+        "input": sum(v["input"] for v in by_model.values()),
+        "output": sum(v["output"] for v in by_model.values()),
+        "by_model": by_model,
+    }
+
+
 def _get_gemini_client():
     """每次调用刷新 OAuth token，供 Vertex AI 端点使用"""
     from config import GEMINI_BASE_URL
