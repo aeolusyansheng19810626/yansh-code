@@ -1,0 +1,63 @@
+[Agent: Auditor]
+审计轮 1: 1 次工具调用
+审计轮 2: 1 次工具调用
+审计完成（task_complete: 成功）：定位完成：_dispatch_tool_calls 在 
+agent.py:L1139 当 dispatch_subagent 数量≥2 时用 ThreadPoolExecutor 
+并发；其余情况（单个subagent、所有非subagent工具）一律在 L1165 的 for 
+循环串行执行。
+
+结果已经足够清晰，无需进一步读文件。
+
+---
+
+## 定位结果
+
+**文件**：`agent.py`，函数起始于 **L1115**。
+
+---
+
+### 并发跑 — `agent.py:L1139–L1162`
+
+**触发条件**：本次 LLM 返回的 `tool_calls` 列表中，**`dispatch_subagent` 
+调用数量 ≥ 2**。
+
+```
+sub_indices = 
+
+if len(sub_indices) >= 2:          # ← 触发并发的判断点（L1137–L1139）
+    ThreadPoolExecutor(max_workers=min(len(sub_indices), 
+_SUBAGENT_CONCURRENCY_CAP))
+    # 仅把这些 sub_indices 对应的 tool_call 提交到线程池并发执行
+```
+
+- 并发范围：**仅限 `dispatch_subagent` 调用**，其余工具不进线程池。
+- 并发上限由常量 `_SUBAGENT_CONCURRENCY_CAP` 控制（线程数 = `min(子agent数, 
+CAP)`）。
+- 结果按**原 tool_calls 顺序**写回 `outs` 列表，顺序不乱。
+
+---
+
+### 串行跑 — `agent.py:L1165–L1167`
+
+**触发条件**（以下任一即走串行）：
+
+| 情形 | 说明 |
+|---|---|
+| `dispatch_subagent` 调用数 **= 0** | 全部走串行循环 |
+| `dispatch_subagent` 调用数 **= 1** | 单个子 agent 不值得开线程池，走串行 |
+| **非 `dispatch_subagent`** 的普通工具 | 无论有多少个，一律串行（HIL/confirm 
+顺序依赖、console 输出可读性） |
+
+```python
+for i, tc in enumerate(tool_calls):
+    if outs is None:            # ← 并发已处理的槽已非 None，跳过；其余全串行
+        outs = _dispatch_tool_call(tc, ...)
+```
+
+---
+
+### 设计意图摘要（来自函数 docstring L1118–L1124）
+
+> - 本地工具（read/grep/list_files）几毫秒，并发开销得不偿失 → **始终串行**  
+> - 写工具必须串行（HIL/confirm 顺序依赖、console 输出可读）→ **始终串行**  
+> - 子 agent 是唯一长耗时操作（多轮 LLM call）→ **≥2 个时并发，收益最大**
