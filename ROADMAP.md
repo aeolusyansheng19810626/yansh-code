@@ -29,7 +29,7 @@
 | P1 #5 | 全局状态重构 | 🟢 完成（state.Session + scoped_session 渐进式） |
 | P1 #6 | 沙箱模式 opt-in | 🟢 完成（--sandbox docker[:image]，仅包 execute_command） |
 | P2 #7 | Plan Mode | 🟢 完成（方案 C：session 级 flag + 多轮探索 + /approve） |
-| P2 #8 | Skills 系统 | 🟢 完成（skills/*.md frontmatter triggers + 关键字匹配 + prompt 注入） |
+| P2 #8 | Skills 系统 | 🟢 完成（关键字匹配 + LLM 智能匹配双路径，fast path 零成本） |
 | P2 #9 | 子 Agent | ⬜ 未着手 |
 | P2 #10 | MCP 协议 | ⬜ 未着手 |
 | P2 #11 | Hooks | ⬜ 未着手 |
@@ -253,7 +253,9 @@
 
 **集成验证**（Sonnet 4.6）：写 `code-review.md`（触发词"审查/review"，强制 markdown 表格 + 严重/中/低三档），跑 `audit "审查 calc.py"` → LLM 输出**严格按 skill 规定格式**——表格列名、分级标签、行号要求一字不差。
 
-**单测**：tests/unit/test_skills.py 20 条全过；全套 12 文件全过。
+**进度续（2026-05-22 夜）**：加 LLM 智能匹配（笔记 [_17](./notes/shadow/2026-05-22_17-skills-llm-matching.md)）。`match_skills` 改为分层决策——关键字命中走 fast path（零成本），不命中调 `_llm_select_skills`（基于 description 语义判断），LLM 失败降级返回空。`match_skills_keyword` 保留公开 API。验证 LLM 能跨字面词做语义匹配（"效率→性能"、"HTTP→API 设计"），且无关输入时正确返回空。新增 10 条单测，30/30 通过。
+
+**单测**：tests/unit/test_skills.py 30 条全过；全套 12 文件全过。
 
 **Claude Code 怎么做**：Skills 是用户自定义的 prompt 包，按用户输入或上下文自动触发。本质是**可复用的角色 + 工作流模板**。
 

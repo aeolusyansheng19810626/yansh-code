@@ -298,6 +298,241 @@ def test_agent_run_no_skill_match_clears_prompt(tmp_path):
         assert agent._ACTIVE_SKILLS_PROMPT == ""
 
 
+# ============= LLM 智能匹配（P2 #8 续）=============
+
+def _mk_resp(content):
+    msg = MagicMock()
+    msg.content = content
+    msg.tool_calls = None
+    resp = MagicMock()
+    resp.choices = [MagicMock(message=msg)]
+    return resp
+
+
+def test_match_skills_keyword_function_still_works(tmp_path):
+    """旧版关键字匹配函数应保留可用（公开 API）"""
+    sk_dir = tmp_path / "skills"
+    sk_dir.mkdir()
+    (sk_dir / "a.md").write_text(
+        '---\nname: a\ntriggers: ["重构"]\n---\nbody', encoding="utf-8"
+    )
+    all_sk = skills.discover_skills(str(tmp_path))
+    out = skills.match_skills_keyword("帮我重构 X", all_sk)
+    assert [s.name for s in out] == ["a"]
+
+
+def test_match_skills_keyword_hit_skips_llm(tmp_path):
+    """关键字命中走 fast path，不调 LLM"""
+    sk_dir = tmp_path / "skills"
+    sk_dir.mkdir()
+    (sk_dir / "a.md").write_text(
+        '---\nname: a\ntriggers: ["重构"]\n---\nbody', encoding="utf-8"
+    )
+    all_sk = skills.discover_skills(str(tmp_path))
+
+    import llm_client
+    orig = llm_client.call_llm
+    call_count = {"n": 0}
+    def spy(*a, **kw):
+        call_count["n"] += 1
+        return _mk_resp('{"skills": []}')
+
+    try:
+        llm_client.call_llm = spy
+        out = skills.match_skills("帮我重构 calc.py", all_sk, use_llm=True)
+    finally:
+        llm_client.call_llm = orig
+
+    assert [s.name for s in out] == ["a"]
+    assert call_count["n"] == 0   # 关键字命中 → 没调 LLM
+
+
+def test_match_skills_no_keyword_calls_llm(tmp_path):
+    """关键字不命中 → 调 LLM；LLM 选了一个 → 返回该 skill"""
+    sk_dir = tmp_path / "skills"
+    sk_dir.mkdir()
+    (sk_dir / "refactor.md").write_text(
+        '---\nname: refactor\ndescription: 重构指引\ntriggers: ["重构"]\n---\nbody-r',
+        encoding="utf-8",
+    )
+    (sk_dir / "review.md").write_text(
+        '---\nname: review\ndescription: 代码审查\ntriggers: ["审查"]\n---\nbody-v',
+        encoding="utf-8",
+    )
+    all_sk = skills.discover_skills(str(tmp_path))
+
+    import llm_client
+    orig = llm_client.call_llm
+    seen = {"sys": "", "user": ""}
+    def fake(messages, **kw):
+        seen["sys"] = messages[0]["content"]
+        seen["user"] = messages[1]["content"]
+        return _mk_resp('{"skills": ["review"]}')
+    try:
+        llm_client.call_llm = fake
+        # 输入用 "code review"——不在 triggers ["审查"] 也不在 ["重构"] 里
+        out = skills.match_skills("can you do a code review of this", all_sk, use_llm=True)
+    finally:
+        llm_client.call_llm = orig
+
+    assert [s.name for s in out] == ["review"]
+    # LLM 看到了候选清单
+    assert "refactor" in seen["user"]
+    assert "review" in seen["user"]
+    assert "代码审查" in seen["user"]
+
+
+def test_match_skills_llm_returns_empty(tmp_path):
+    """LLM 判断都不适用 → 返回空"""
+    sk_dir = tmp_path / "skills"
+    sk_dir.mkdir()
+    (sk_dir / "a.md").write_text(
+        '---\nname: a\ndescription: 不相关\ntriggers: ["X"]\n---\nbody', encoding="utf-8"
+    )
+    all_sk = skills.discover_skills(str(tmp_path))
+
+    import llm_client
+    orig = llm_client.call_llm
+    try:
+        llm_client.call_llm = lambda *a, **kw: _mk_resp('{"skills": []}')
+        out = skills.match_skills("无关需求", all_sk, use_llm=True)
+    finally:
+        llm_client.call_llm = orig
+    assert out == []
+
+
+def test_match_skills_llm_failure_falls_back_to_empty(tmp_path):
+    """LLM 抛错 → _llm_select_skills 返回 None → match_skills 保守返回空"""
+    sk_dir = tmp_path / "skills"
+    sk_dir.mkdir()
+    (sk_dir / "a.md").write_text(
+        '---\nname: a\ndescription: x\ntriggers: ["X"]\n---\nbody', encoding="utf-8"
+    )
+    all_sk = skills.discover_skills(str(tmp_path))
+
+    import llm_client
+    orig = llm_client.call_llm
+    try:
+        def boom(*a, **kw):
+            raise RuntimeError("api 不通")
+        llm_client.call_llm = boom
+        out = skills.match_skills("做点什么", all_sk, use_llm=True)
+    finally:
+        llm_client.call_llm = orig
+    assert out == []
+
+
+def test_match_skills_llm_invalid_json(tmp_path):
+    """LLM 输出非法 JSON → 返回空（不崩）"""
+    sk_dir = tmp_path / "skills"
+    sk_dir.mkdir()
+    (sk_dir / "a.md").write_text(
+        '---\nname: a\ndescription: x\ntriggers: ["X"]\n---\nbody', encoding="utf-8"
+    )
+    all_sk = skills.discover_skills(str(tmp_path))
+
+    import llm_client
+    orig = llm_client.call_llm
+    try:
+        llm_client.call_llm = lambda *a, **kw: _mk_resp("LLM 解释了一通，没给 JSON")
+        out = skills.match_skills("做点什么", all_sk, use_llm=True)
+    finally:
+        llm_client.call_llm = orig
+    assert out == []
+
+
+def test_match_skills_use_llm_false_keyword_only(tmp_path):
+    """use_llm=False 时不调 LLM；关键字不命中即空"""
+    sk_dir = tmp_path / "skills"
+    sk_dir.mkdir()
+    (sk_dir / "a.md").write_text(
+        '---\nname: a\ndescription: x\ntriggers: ["紫罗兰"]\n---\nbody', encoding="utf-8"
+    )
+    all_sk = skills.discover_skills(str(tmp_path))
+
+    import llm_client
+    orig = llm_client.call_llm
+    call_count = {"n": 0}
+    def spy(*a, **kw):
+        call_count["n"] += 1
+        return _mk_resp('{"skills": ["a"]}')
+    try:
+        llm_client.call_llm = spy
+        out = skills.match_skills("做点别的事", all_sk, use_llm=False)
+    finally:
+        llm_client.call_llm = orig
+    assert out == []
+    assert call_count["n"] == 0   # use_llm=False → 不调 LLM
+
+
+def test_match_skills_no_candidates_skips_llm(tmp_path):
+    """mode 过滤后无候选 → 立即返回空，不调 LLM"""
+    sk_dir = tmp_path / "skills"
+    sk_dir.mkdir()
+    (sk_dir / "a.md").write_text(
+        '---\nname: a\nmodes: ["audit"]\ntriggers: ["X"]\n---\nbody',
+        encoding="utf-8",
+    )
+    all_sk = skills.discover_skills(str(tmp_path))
+
+    import llm_client
+    orig = llm_client.call_llm
+    call_count = {"n": 0}
+    def spy(*a, **kw):
+        call_count["n"] += 1
+        return _mk_resp('{"skills": ["a"]}')
+    try:
+        llm_client.call_llm = spy
+        out = skills.match_skills("做点 X", all_sk, mode="code", use_llm=True)
+    finally:
+        llm_client.call_llm = orig
+    assert out == []
+    assert call_count["n"] == 0
+
+
+def test_match_skills_llm_filters_unknown_names(tmp_path):
+    """LLM 给的 name 不在候选里 → 静默丢弃，不报错"""
+    sk_dir = tmp_path / "skills"
+    sk_dir.mkdir()
+    (sk_dir / "a.md").write_text(
+        '---\nname: a\ndescription: x\ntriggers: ["X"]\n---\nbody', encoding="utf-8"
+    )
+    all_sk = skills.discover_skills(str(tmp_path))
+
+    import llm_client
+    orig = llm_client.call_llm
+    try:
+        # LLM 返回不存在的 skill name
+        llm_client.call_llm = lambda *a, **kw: _mk_resp(
+            '{"skills": ["nonexistent", "a"]}'
+        )
+        out = skills.match_skills("无 X", all_sk, use_llm=True)
+    finally:
+        llm_client.call_llm = orig
+    assert [s.name for s in out] == ["a"]
+
+
+def test_match_skills_llm_with_markdown_codeblock(tmp_path):
+    """LLM 输出包在 ```json ... ``` 里也能解析"""
+    sk_dir = tmp_path / "skills"
+    sk_dir.mkdir()
+    (sk_dir / "a.md").write_text(
+        '---\nname: a\ndescription: x\ntriggers: ["X"]\n---\nbody', encoding="utf-8"
+    )
+    all_sk = skills.discover_skills(str(tmp_path))
+
+    import llm_client
+    orig = llm_client.call_llm
+    try:
+        llm_client.call_llm = lambda *a, **kw: _mk_resp(
+            '```json\n{"skills": ["a"]}\n```'
+        )
+        out = skills.match_skills("无 X", all_sk, use_llm=True)
+    finally:
+        llm_client.call_llm = orig
+    assert [s.name for s in out] == ["a"]
+
+
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, "-v"])

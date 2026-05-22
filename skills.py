@@ -160,9 +160,9 @@ def discover_skills(workspace_dir: Optional[str] = None) -> List[Skill]:
     return list(skills.values())
 
 
-def match_skills(user_input: str, skills: List[Skill],
-                 mode: Optional[str] = None) -> List[Skill]:
-    """关键字匹配：user_input 含任一 trigger（不区分大小写）即命中"""
+def match_skills_keyword(user_input: str, skills: List[Skill],
+                         mode: Optional[str] = None) -> List[Skill]:
+    """关键字匹配（旧版逻辑保留为公开 API；快速、零成本、零延迟，作为 LLM 失败降级）"""
     if not user_input:
         return []
     text = user_input.lower()
@@ -173,6 +173,110 @@ def match_skills(user_input: str, skills: List[Skill],
         if any(t and t in text for t in sk.triggers):
             matched.append(sk)
     return matched
+
+
+def _llm_select_skills(user_input: str, candidates: List[Skill],
+                       mode: Optional[str] = None) -> Optional[List[str]]:
+    """让 LLM 判断哪些 skill 适用。返回选中的 skill name 列表；失败返回 None（caller 降级）。
+
+    设计：候选 metadata 给 LLM（name/description/triggers），用户输入也给。要求 JSON 输出。
+    走当前 cascade 的最便宜模型（不强行切 Haiku，避免改 client 状态）。
+    """
+    if not candidates:
+        return []
+    try:
+        import llm_client as _llm
+        import json as _json
+
+        listing = []
+        for i, sk in enumerate(candidates, 1):
+            triggers_hint = ", ".join(sk.triggers[:5]) if sk.triggers else "（无关键词）"
+            listing.append(
+                f"{i}. {sk.name} — {sk.description or '(无描述)'}\n"
+                f"   关键词提示：{triggers_hint}"
+            )
+        listing_text = "\n".join(listing)
+        mode_hint = f"（当前任务 mode={mode}）" if mode else ""
+
+        sys_prompt = (
+            "你是 yansh 的 skill 选择器。基于用户输入和可用 skill 清单，决定哪些 skill 适用。"
+            "选择标准：skill 描述与用户意图实质相关（不必字面命中关键词）；宁缺勿滥——"
+            "拿不准就不选。输出严格 JSON：{\"skills\": [\"name1\", ...]}；都不适用就 {\"skills\": []}。"
+            "不要解释，只输出 JSON。"
+        )
+        user_msg = (
+            f"用户输入：{user_input}\n{mode_hint}\n\n"
+            f"可用 skill：\n{listing_text}\n\n"
+            f"哪些 skill 适用？输出 JSON。"
+        )
+        messages = [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": user_msg},
+        ]
+        resp = _llm.call_llm(messages, response_format={"type": "json_object"}, stream=False)
+        content = (resp.choices[0].message.content or "").strip()
+        if not content:
+            return None
+        # 复用 agent._extract_json 的逻辑，避免循环 import：手写一段最简
+        text = content
+        if "```" in text:
+            import re as _re
+            m = _re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
+            if m:
+                text = m.group(1).strip()
+        else:
+            obj_start = text.find("{")
+            obj_end = text.rfind("}")
+            if obj_start != -1 and obj_end > obj_start:
+                text = text[obj_start:obj_end + 1]
+        try:
+            data = _json.loads(text)
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+        names = data.get("skills")
+        if not isinstance(names, list):
+            return None
+        return [str(n) for n in names if isinstance(n, str)]
+    except Exception:
+        return None
+
+
+def match_skills(user_input: str, skills: List[Skill],
+                 mode: Optional[str] = None,
+                 use_llm: bool = True) -> List[Skill]:
+    """智能匹配 skill。
+
+    决策顺序：
+      1) mode 过滤（modes 字段不允许的直接淘汰）
+      2) 候选 0 个：返回空（无需 LLM）
+      3) 候选 1 个：仍跑关键字匹配——若命中直接返回；否则按 use_llm 决定
+      4) 候选多个 + use_llm：调 LLM 判断；失败降级关键字
+      5) use_llm=False：用关键字匹配（向后兼容）
+
+    use_llm=False 时本函数完全等价旧版关键字匹配。
+    """
+    if not user_input or not skills:
+        return []
+    candidates = [sk for sk in skills if sk.applies_to_mode(mode)]
+    if not candidates:
+        return []
+
+    # 关键字命中优先（零成本短路）
+    keyword_hits = match_skills_keyword(user_input, candidates, mode=mode)
+    if keyword_hits:
+        return keyword_hits
+
+    if not use_llm:
+        return []   # 无关键字命中 + 不让 LLM 判断
+
+    # 候选很多 / 关键字未命中 → 让 LLM 判断
+    selected = _llm_select_skills(user_input, candidates, mode=mode)
+    if selected is None:
+        return []   # LLM 调用失败：与"关键字未命中"一致，返回空（保守）
+    name_set = {n for n in selected}
+    return [sk for sk in candidates if sk.name in name_set]
 
 
 def format_skills_prompt(matched: List[Skill]) -> str:
@@ -191,8 +295,13 @@ def format_skills_prompt(matched: List[Skill]) -> str:
 
 
 def load_and_format(user_input: str, workspace_dir: Optional[str] = None,
-                    mode: Optional[str] = None) -> tuple[str, List[Skill]]:
-    """便捷入口：扫描 + 匹配 + 格式化，一次返回 prompt 片段和命中列表。"""
+                    mode: Optional[str] = None,
+                    use_llm: bool = True) -> tuple[str, List[Skill]]:
+    """便捷入口：扫描 + 匹配 + 格式化，一次返回 prompt 片段和命中列表。
+
+    use_llm=True（默认）：关键字命中走 fast path，不命中时调 LLM 判断。
+    use_llm=False：仅关键字匹配（向后兼容/测试场景）。
+    """
     all_skills = discover_skills(workspace_dir)
-    matched = match_skills(user_input, all_skills, mode=mode)
+    matched = match_skills(user_input, all_skills, mode=mode, use_llm=use_llm)
     return format_skills_prompt(matched), matched
