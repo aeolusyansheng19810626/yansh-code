@@ -24,7 +24,7 @@
 |---|---|---|
 | P0 #1 | 分层符号索引 | 🟢 完成（top/deep 双模式 + directory_summary + audit 顶层注入） |
 | P0 #2 | Prompt 调优 | 🟢 活跃迭代 |
-| P0 #3 | 错误恢复闭环 | 🟢 完成（基础设施 + prompt 加固 + 信号全流程贯通） |
+| P0 #3 | 错误恢复闭环 | 🟢 完成（基础设施 + prompt 加固 + 信号全流程贯通 + 持久化进日志） |
 | P1 #4 | JSON 解析健壮性 | 🟡 部分（基础校验在，retry 未做） |
 | P1 #5 | 全局状态重构 | ⬜ 未着手 |
 | P1 #6 | 沙箱模式 opt-in | ⬜ 未着手 |
@@ -94,13 +94,14 @@
 
 ### 3. 错误恢复闭环 🟢 完成
 
-**进度（2026-05-22）**：三波迭代完整落地——
+**进度（2026-05-22）**：四波迭代完整落地——
 
 - **第一波**（commit `7d1b399`，笔记 [_07](./notes/shadow/2026-05-21_07-p0-3-recovery-loop.md)）：基础设施层。`task_complete(success, summary)` 工具、fix/audit 软上限（6→12/8→16）、token 预算警告（60K/120K）、`error_kind` 全量铺到 21 个工具、fix() 加 interrupt 检查。
 - **第二波**（commit `5d22465`，笔记 [_08](./notes/shadow/2026-05-21_08-prompt-and-loop-hardening.md)）：prompt 加固。`_TESTER_ROLE` / `_AUDITOR_ROLE` 把【收尾要求】移到顶部 + few-shot 示例 + 删反向暗示；fix/audit 加沉默退出兜底（追问一次）；`_CODER_ROLE` 模板 4 加 linter 归属规则（ruff/flake8 报错若不在 plan 文件按 pre-existing 处理）。实操 [_09](./notes/shadow/2026-05-21_09-p0-3-live-validation.md) 跑三场景验证，发现下一波漏洞。
 - **第三波**（commit `8be9e4f`，笔记 [_10](./notes/shadow/2026-05-21_10-task-complete-signal-propagation.md)）：信号全流程贯通。`fix()` 返回 `{early_exit, success, summary}`；`code()` 返回 Optional[dict]，inner loop 识别 sentinel；`run()` 三处接信号（Coder 阶段后 / linter fix 后 / attempts 循环 fix 后）；`report()` 加 `task_complete_signal` 字段。集成验证场景 A：attempts 3→0，fail→success；场景 B：pass(错)→fail(对)，31s→2s。
+- **第四波**（commit `5d1569f`，笔记 [_13](./notes/shadow/2026-05-22_13-task-complete-signal-persistence.md)）：signal 持久化进 task_log。`finish_task_log` 加可选参数；audit() 返回值补 signal；run() 8 个调用点全部传入；`show_recent_logs` 显示 `TC:ok` / `TC:give-up` 标记。历史日志能区分"自然收尾 / 主动放弃 / 沉默退出"三类结局。
 
-**关键收益**：LLM 调 `task_complete(success=true)` 时外层立即标 success 退出（不再无谓 retry）；调 `task_complete(success=false)` 时外层立即跳过测试标 fail。Sonnet 4.6 在三场景里都正确触发协议——prompt 加固已把"必须显式收尾"内化。
+**关键收益**：LLM 调 `task_complete(success=true)` 时外层立即标 success 退出（不再无谓 retry）；调 `task_complete(success=false)` 时外层立即跳过测试标 fail；主动声明的事实进日志便于回放/统计。Sonnet 4.6 在三场景里都正确触发协议——prompt 加固已把"必须显式收尾"内化。
 
 **Claude Code 怎么做**：工具失败 → LLM 看到错误 → 自然换路（换工具、换参数、问用户、放弃并报告原因）。整个 agent loop 没有硬性的"6 轮上限"——它通过其他机制（context 占用、用户中断、明确的"我做不了"声明）来收敛。
 
