@@ -20,11 +20,9 @@ from __future__ import annotations
 import threading
 from typing import Optional
 
-from rich.console import Console
+from console_shared import console
 
 from tools_schema import TOOLS, READONLY_TOOL_NAMES
-
-console = Console()
 
 
 # ============================================================

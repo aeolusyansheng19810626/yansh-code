@@ -36,4 +36,5 @@ py-modules = [
     "hooks", "procutil", "workspace_trust",
     "memory",
     "frontmatter", "subagent",
+    "console_shared",
 ]

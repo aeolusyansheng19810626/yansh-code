@@ -1,8 +1,6 @@
 import json
 from pathlib import Path
-from rich.console import Console
-
-console = Console()
+from console_shared import console
 
 def analyze_logs(log_dir):
     """分析日志并打印统计摘要"""

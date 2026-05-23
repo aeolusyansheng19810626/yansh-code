@@ -10,10 +10,8 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 
-from rich.console import Console
+from console_shared import console
 import config as _cfg_mod
-
-console = Console()
 
 # 快照/回滚时需要跳过的目录
 _SNAPSHOT_IGNORE_DIRS = {".git", ".yansh", "__pycache__", "venv", "node_modules", ".pytest_cache"}

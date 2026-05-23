@@ -4,7 +4,7 @@ import sys
 import shutil
 import threading
 from datetime import datetime
-from rich.console import Console
+from console_shared import console, set_json_mode as _set_json_mode
 from pathlib import Path
 from config import (
     OPENROUTER_API_KEY, OPENROUTER_BASE_URL, WORKSPACE_DIR, get_config,
@@ -46,7 +46,6 @@ from llm_client import (
     get_session_total_tokens,
 )
 
-console = Console()
 
 # Token 统计在 llm_client 模块（_session_tokens_by_model / _last_request_tokens）
 
@@ -393,11 +392,11 @@ def _process_at_files(user_input):
 def set_batch_mode(enabled: bool, json_output: bool = False, strict: bool | None = None):
     """设置批处理模式；json_output=True 时将 console 重定向到 stderr；
     strict=True 时批处理下仍拒绝 Level-3 需确认命令（pip install / git reset 等）"""
-    global _BATCH_MODE, console
+    global _BATCH_MODE
     _BATCH_MODE = enabled
     _tools_mod.set_batch_mode(enabled, strict=strict)
     if json_output:
-        console = Console(file=sys.stderr)
+        _set_json_mode(True)
 
 
 def _prompt(msg: str, default: str = "y") -> str:
@@ -490,15 +489,19 @@ def _call_with_json_retry(stage, messages, parser_fn,
     # 失败 → retry 1 次
     console.print(f"[{stage}] JSON 解析失败，自动 retry 1 次：{err}",
                   style="yellow", highlight=False)
-    fix_prompt = (
-        f"上一轮你的输出无法被解析为合法 JSON。请仅输出合法 JSON（无多余说明、无 markdown 围栏）。\n"
-        f"错误：{err}\n"
-        f"前次输出（截断）：\n{_truncate(content)}"
-    )
-    retry_messages = list(messages) + [
-        {"role": "assistant", "content": content},
-        {"role": "user", "content": fix_prompt},
-    ]
+    if not content.strip():
+        # 空内容：直接重发原 prompt（不带空 assistant 消息），省 tokens 也避免 ICA 拒绝空 assistant
+        retry_messages = list(messages)
+    else:
+        fix_prompt = (
+            f"上一轮你的输出无法被解析为合法 JSON。请仅输出合法 JSON（无多余说明、无 markdown 围栏）。\n"
+            f"错误：{err}\n"
+            f"前次输出（截断）：\n{_truncate(content)}"
+        )
+        retry_messages = list(messages) + [
+            {"role": "assistant", "content": content},
+            {"role": "user", "content": fix_prompt},
+        ]
     retry_kwargs = dict(kwargs)
     retry_kwargs["messages"] = retry_messages
     response2 = call_llm(**retry_kwargs)
@@ -1343,6 +1346,9 @@ Tool-call efficiency (critical):
 - **Parallelize independent tool calls**: in one turn, fire multiple read_file / search_in_files / list_symbols at once — don't serialize
 - **Combine shell queries**: when checking several env vars or running several independent commands, chain them with `;` in a single execute_command
 - **Don't re-read after editing**: write_file / replace_in_file / replace_symbol return an error directly on failure — no need to read_file to confirm
+- **Don't dispatch_subagent for small tasks**: a subagent costs 1k+ tokens of cascade overhead before doing anything. Use it only for genuinely large explorations (mapping a module's call sites across many files) or parallelizable independent branches (analyze A/B/C modules at once). For "read 3 functions in 1 file" or "read 1 file + 1 test", call read_file / get_symbol_definition / search_in_files directly — single tool call, no overhead.
+  - ❌ Anti-pattern: dispatch_subagent("read find_memory + save_memory + _slugify in memory.py, plus test_X in test_memory.py") — that's 4 read_file calls or 1 list_symbols + 2 read_file, NOT a subagent task.
+  - ✓ Correct usage: dispatch_subagent("map all callers of `tools.read_file` across the repo and classify by call pattern") — genuine cross-file exploration.
 Task pattern recognition (identify which category before acting, follow the matching rule):
 
 1. **Changing an existing function signature / return shape**

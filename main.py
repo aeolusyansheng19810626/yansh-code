@@ -1,7 +1,7 @@
 import sys
 import os
 import argparse
-from rich.console import Console
+from console_shared import console
 import agent
 from agent import (
     classify_input, chat, run, compress_history, show_context, clear_history, maybe_compress_history,
@@ -12,7 +12,6 @@ from config import load_project_config, get_config, override_config, set_workspa
 import interrupt
 from pathlib import Path
 import monitor
-console = Console()
 
 
 _SLASH_COMMANDS = [
@@ -259,7 +258,11 @@ def main():
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description="yansh-code: 极简代码智能体")
     parser.add_argument("requirement", nargs="?", help="任务需求说明")
-    parser.add_argument("--mode", choices=VALID_MODES, help="运行模式")
+    parser.add_argument(
+        "--mode",
+        choices=VALID_MODES,
+        help="运行模式：auto=plan+人工确认+code+test+fix；code=同 auto 但跳过人工确认（仍走 plan）；plan=只输出计划不执行；audit=只读分析",
+    )
     parser.add_argument("--model", help="指定 LLM 模型")
     parser.add_argument("--json", action="store_true", help="以 JSON 格式输出最后结果 (batch 模式)")
     parser.add_argument("--strict", action="store_true", help="批处理模式下拒绝需确认命令（pip/npm install、git checkout/reset）")

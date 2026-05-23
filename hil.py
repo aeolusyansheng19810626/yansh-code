@@ -9,9 +9,7 @@ import sys
 import difflib
 from pathlib import Path
 
-from rich.console import Console
-
-console = Console()
+from console_shared import console
 
 _HIL_AUTO_ACCEPT = False
 

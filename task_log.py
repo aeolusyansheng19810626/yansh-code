@@ -13,10 +13,8 @@ import time as _time
 from datetime import datetime
 from pathlib import Path
 
-from rich.console import Console
+from console_shared import console
 import config as _cfg_mod
-
-console = Console()
 
 _LOG_DIR = Path(_cfg_mod.WORKSPACE_DIR) / ".yansh" / "logs"
 

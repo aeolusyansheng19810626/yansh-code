@@ -11,15 +11,13 @@ import time as _time
 from types import SimpleNamespace
 
 from openai import OpenAI
-from rich.console import Console
+from console_shared import console
 
 from config import (
     OPENROUTER_API_KEY, OPENROUTER_BASE_URL, QUALITY_CASCADE,
     get_model_price,
 )
 import interrupt
-
-console = Console()
 
 # 默认 client（OPENROUTER_BASE_URL 已在 config.py 中指向 ICA 或 OpenRouter）
 client = OpenAI(api_key=OPENROUTER_API_KEY, base_url=OPENROUTER_BASE_URL)
