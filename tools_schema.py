@@ -27,7 +27,7 @@ TOOLS = [
                     "filename": {"type": "string", "description": "文件名（相对于workspace）"},
                     "offset":    {"type": "integer", "description": "起始行号（1-based，可选）"},
                     "limit":     {"type": "integer", "description": "读取行数上限（可选）"},
-                    "max_bytes": {"type": "integer", "description": "可选的最大读取字节数，不填则读取完整文件"}
+                    "max_bytes": {"type": "integer", "description": "读取字节数上限（可选）；超过此限制时返回截断内容，并附带 truncated: true 标记"}
                 },
                 "required": ["filename"]
             }

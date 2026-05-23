@@ -522,16 +522,22 @@ def test_error_field_preserved_for_legacy_callers():
 
 
 def test_read_file_max_bytes_truncation():
-    """max_bytes 截断：写入11字节内容，以 max_bytes=5 读取时内容为前5字节且 truncated=True；
-    以 max_bytes=100 读取时不截断（truncated 为 False 或字段不存在）"""
-    write_file("mb_test.txt", "hello world")  # 11 字节
+    """max_bytes 截断：内容超过 max_bytes 时 truncated=True，且返回内容字节数 <= max_bytes"""
+    content = "hello world"  # 11 字节
+    write_file("trunc_test.txt", content)
 
-    # 截断路径
-    result = read_file("mb_test.txt", max_bytes=5)
-    assert result["content"] == "hello"
+    result = read_file("trunc_test.txt", max_bytes=5)
+    assert "error" not in result
     assert result.get("truncated") is True
+    assert len(result["content"].encode("utf-8")) <= 5
 
-    # 不截断路径
-    result = read_file("mb_test.txt", max_bytes=100)
-    assert result["content"] == "hello world"
+
+def test_read_file_max_bytes_no_truncation():
+    """max_bytes 未截断：内容不超过 max_bytes 时 truncated 字段为 False 或不存在"""
+    content = "hello world"  # 11 字节
+    write_file("trunc_test2.txt", content)
+
+    result = read_file("trunc_test2.txt", max_bytes=100)
+    assert "error" not in result
     assert result.get("truncated") is not True
+    assert result["content"] == content

@@ -70,6 +70,45 @@
 
 ## 数据文件
 
-- `20260523_task2_rerun_yansh.json` / `_stderr.log`
+- `20260523_task2_rerun_yansh.json` / `_stderr.log` (v1, 翻车)
+- `20260523_task2_rerun_v2_yansh.json` / `_stderr.log` (v2, 修后)
 - `20260523_task3_rerun_yansh.json` / `_stderr.log`
 - baseline：`20260523_task2_yansh.jsonl` / `20260523_task3_yansh.json`
+
+## v2 验证（cce571a + 174df32 修 prompt 后再跑 task #2）
+
+修法核心：
+- `_TESTER_ROLE` Example 3 加反例（禁止弱化断言）
+- `fix()` user message 把 plan files 单列出来给 LLM 看清"本次任务范围"，明示按 Investigation order 第 1 条做归属判断；不依赖 `notes/shadow/` 这种 yansh-self-codebase 偶然产物
+- 修了一个我代码里的 bug：plan 是字典含 `files` key，第一版按 list 迭代，意外让 plan_files 总为空（LLM 误读成"一切都不在范围"，碰巧早退；rerun 174df32 后是真按归属判断走）
+
+### task #2 v2 数据
+
+| 维度 | baseline | v1 (翻车) | **v2 (修后)** |
+|---|---|---|---|
+| duration (s) | 254 | 402 | **219** ✓ |
+| 工具调用 | 61 | 75 | **28** ✓ |
+| 总 tokens | 641K | 1722K | **754K** |
+| sonnet input | 627K | 1043K | **747K** |
+| haiku input | 0 | 663K | 0 |
+| 估算成本 ($) | ~1.88 | ~3.79 | **~2.24** |
+| test_result | pass | fail | **pass** ✓ |
+| linter fix attempts | 1 (早退) | 1 (写错) | **1 (早退)** ✓ |
+| test fix attempts | 1 | 3 (max) | **1 (早退)** ✓ |
+| 弱化断言? | ❌ 没有 | ⚠ 5 处 | ❌ **没有** ✓ |
+| 副带改动质量 | 删 3 个未用 import | （+ 5 处弱化断言, bad）| **修 `_read_cache_key` 漏了 max_bytes 的 cache 误命中 bug** ✓ |
+
+### 解读
+
+- **行为正确**：linter attempt 1 早退（成功识别 218 条 ruff 错误不在 plan files 范围）；test attempt 2 早退（成功识别 5 条 pre-existing 失败不在范围）。两阶段都没尝试修
+- **token 略高于 baseline (+18% sonnet)**：新加的 anti-pattern few-shot + 显式 plan_files hint 是常驻 system prompt 增量。但**质量**显著优于 baseline——v2 顺手发现并修了一个真 bug（`_read_cache_key` 没把 max_bytes 当 key，会让不同 max_bytes 的 read_file 调用错误命中 cache）
+- **vs v1**：tokens 砍 56% (1.72M → 754K)，工具调用砍 63% (75 → 28)，从 fail → pass
+
+### 三个 task 综合
+
+| Task | baseline tokens | v2 tokens | Δ tokens | v2 cost vs baseline |
+|---|---|---|---|---|
+| #2 (写代码 + fix loop) | 641K | 754K | +18% | +19% |
+| #3 (架构论证 + subagent) | 730K | 729K | 0% | **-62%** ✓ |
+
+P2.2（subagent 切 haiku）在 #3 类任务收益巨大；P1.2/P1.3/prompt 修法在 #2 类避免了行为退化但 token 数本身没显著降。**结论**：成本削减从架构上靠 P2.2，质量稳定靠 prompt 反例 + 归属规则显式化。

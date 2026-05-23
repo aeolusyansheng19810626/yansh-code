@@ -232,7 +232,7 @@ def write_file(filename, content):
 def read_file(filename, offset=None, limit=None, max_bytes=None):
     """读取workspace目录下的文件。
     可选 offset/limit 按行截取（offset 1-based 起始行；limit 行数上限）。
-    可选 max_bytes 限制读取字节数，超出时返回截断内容并附带 truncated: true。
+    可选 max_bytes 限制读取的字节数；超过时截断内容并在返回 dict 中加入 truncated=True。
     无截取参数时返回整个文件，行为与原版相同。"""
     resolved, err = _validate_path(filename)
     if err:
@@ -243,25 +243,31 @@ def read_file(filename, offset=None, limit=None, max_bytes=None):
         return _err("not_found", f"文件 {filename} 不存在")
     except Exception as e:
         return _err("internal", str(e))
+
+    # max_bytes 截断处理（在行切片之前）
+    truncated = False
+    if max_bytes is not None:
+        encoded = text.encode('utf-8')
+        if len(encoded) > max_bytes:
+            text = encoded[:max_bytes].decode('utf-8', errors='replace')
+            truncated = True
+
     if offset is None and limit is None:
-        if max_bytes is not None and len(text.encode('utf-8')) > max_bytes:
-            truncated_text = text.encode('utf-8')[:max_bytes].decode('utf-8', errors='ignore')
-            return {"content": truncated_text, "truncated": True}
-        return {"content": text}
+        result = {"content": text}
+        if truncated:
+            result["truncated"] = True
+        return result
     lines = text.splitlines(keepends=True)
     total = len(lines)
     start = max(0, (offset or 1) - 1)
     end = total if limit is None else min(total, start + max(0, int(limit)))
-    content = "".join(lines[start:end])
     result = {
-        "content": content,
+        "content": "".join(lines[start:end]),
         "total_lines": total,
         "offset": start + 1,
         "lines_returned": end - start,
     }
-    if max_bytes is not None and len(content.encode('utf-8')) > max_bytes:
-        truncated_content = content.encode('utf-8')[:max_bytes].decode('utf-8', errors='ignore')
-        result["content"] = truncated_content
+    if truncated:
         result["truncated"] = True
     return result
 

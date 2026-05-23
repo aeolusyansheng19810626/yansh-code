@@ -848,11 +848,12 @@ def _read_cache_clear():
 
 
 def _read_cache_key(args: dict) -> tuple:
-    """从 read_file args 提取 cache key。offset/limit 缺省补 None 保证 dedupe 一致。"""
+    """从 read_file args 提取 cache key。offset/limit/max_bytes 缺省补 None 保证 dedupe 一致。"""
     return (
         str(args.get("filename") or ""),
         args.get("offset"),
         args.get("limit"),
+        args.get("max_bytes"),
     )
 
 
@@ -1195,7 +1196,7 @@ def _dispatch_tool_call_inner(tool_call, args, *, mode="auto", allow_hil=True,
         if name == "read_file" and _read_cache_hit_or_record(args):
             console.print(
                 f"[read_cache] 命中 {args.get('filename')}"
-                f"@offset={args.get('offset')}/limit={args.get('limit')}，跳过实读",
+                f"@offset={args.get('offset')}/limit={args.get('limit')}/max_bytes={args.get('max_bytes')}，跳过实读",
                 style="cyan", highlight=False,
             )
             return {
@@ -1205,7 +1206,7 @@ def _dispatch_tool_call_inner(tool_call, args, *, mode="auto", allow_hil=True,
                     "filename": args.get("filename"),
                     "offset": args.get("offset"),
                     "limit": args.get("limit"),
-                    "hint": ("This (filename, offset, limit) was already read earlier in the same task; "
+                    "hint": ("This (filename, offset, limit, max_bytes) was already read earlier in the same task; "
                              "the content is in your message history. Reuse it instead of reading again. "
                              "If you genuinely need a fresh read, call with a different range or note it in your reply."),
                 },
@@ -2286,7 +2287,9 @@ def fix(test_result, plan, reason="test_failure"):
         sys_role = f"{_TESTER_ROLE}\n{_get_project_rules()}You are a code-review-fix assistant. Fix strictly per the review comments — one replace_in_file precise edit per comment. Do not touch code unrelated to the review comments."
         sys_role = _append_active_prompts(sys_role)
     else:
-        plan_files = [p.get("filename", "") for p in (plan or []) if isinstance(p, dict)]
+        # plan 可能是 plan_result 字典（含 "files"）或直接 list of file dicts，两种都兼容
+        plan_items = plan.get("files", []) if isinstance(plan, dict) else (plan or [])
+        plan_files = [p.get("filename", "") for p in plan_items if isinstance(p, dict)]
         content = (
             f"Tests failed.\nError output:\n{error_info}\n\nPlan files (this task's scope): {plan_files}\n\n"
             "归属判断（必读 — 走 _TESTER_ROLE 的 Investigation order 第 1 条）：\n"

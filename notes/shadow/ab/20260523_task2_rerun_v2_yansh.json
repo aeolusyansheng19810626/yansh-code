@@ -1,0 +1,240 @@
+[快照] 20260523-205428 (baseline 4 文件)
+
+--- diff: tools.py ---
+--- a/tools.py
++++ b/tools.py
+@@ -1,6 +1,7 @@
+-def read_file(filename, offset=None, limit=None):
+
++def read_file(filename, offset=None, limit=None, max_bytes=None):
+
+     """读取workspace目录下的文件。
+
+     可选 offset/limit 按行截取（offset 1-based 起始行；limit 行数上限）。
+
++    可选 max_bytes 限制读取的字节数；超过时截断内容并在返回 dict 中加入 
+truncated=True。
+
+     无截取参数时返回整个文件，行为与原版相同。"""
+
+     resolved, err = _validate_path(filename)
+
+     if err:
+
+@@ -11,15 +12,30 @@
+         return _err("not_found", f"文件 {filename} 不存在")
+
+     except Exception as e:
+
+         return _err("internal", str(e))
+
++
+
++    # max_bytes 截断处理（在行切片之前）
+
++    truncated = False
+
++    if max_bytes is not None:
+
++        encoded = text.encode('utf-8')
+
++        if len(encoded) > max_bytes:
+
++            text = encoded[:max_bytes].decode('utf-8', errors='replace')
+
++            truncated = True
+
++
+
+     if offset is None and limit is None:
+
+-        return {"content": text}
+
++        result = {"content": text}
+
++        if truncated:
+
++            result["truncated"] = True
+
++        return result
+
+     lines = text.splitlines(keepends=True)
+
+     total = len(lines)
+
+     start = max(0, (offset or 1) - 1)
+
+     end = total if limit is None else min(total, start + max(0, int(limit)))
+
+-    return {
+
++    result = {
+
+         "content": "".join(lines),
+
+         "total_lines": total,
+
+         "offset": start + 1,
+
+         "lines_returned": end - start,
+
+-    }
++    }
+
++    if truncated:
+
++        result["truncated"] = True
+
++    return result
+
+--- diff: tools_schema.py ---
+--- a/tools_schema.py
++++ b/tools_schema.py
+@@ -1,4 +1,5 @@
+-                    "offset": {"type": "integer", "description": 
+"起始行号（1-based，可选）"},
+
+-                    "limit":  {"type": "integer", "description": 
+"读取行数上限（可选）"}
+
++                    "offset":    {"type": "integer", "description": 
+"起始行号（1-based，可选）"},
+
++                    "limit":     {"type": "integer", "description": 
+"读取行数上限（可选）"},
+
++                    "max_bytes": {"type": "integer", "description": 
+"读取字节数上限（可选）；超过此限制时返回截断内容，并附带 truncated: true 
+标记"}
+
+                 },
+
+                 "required": ["filename"]
+
+--- diff: agent.py ---
+--- a/agent.py
++++ b/agent.py
+@@ -1,7 +1,8 @@
+ def _read_cache_key(args: dict) -> tuple:
+
+-    """从 read_file args 提取 cache key。offset/limit 缺省补 None 保证 dedupe 
+一致。"""
+
++    """从 read_file args 提取 cache key。offset/limit/max_bytes 缺省补 None 
+保证 dedupe 一致。"""
+
+     return (
+
+         str(args.get("filename") or ""),
+
+         args.get("offset"),
+
+         args.get("limit"),
+
++        args.get("max_bytes"),
+
+     )
+
+--- diff: agent.py ---
+--- a/agent.py
++++ b/agent.py
+@@ -1,6 +1,6 @@
+             console.print(
+
+                 f" 命中 {args.get('filename')}"
+
+-                
+f"@offset={args.get('offset')}/limit={args.get('limit')}，跳过实读",
+
++                
+f"@offset={args.get('offset')}/limit={args.get('limit')}/max_bytes={args.get('m
+ax_bytes')}，跳过实读",
+
+                 style="cyan", highlight=False,
+
+             )
+
+             return {
+
+@@ -10,7 +10,7 @@
+                     "filename": args.get("filename"),
+
+                     "offset": args.get("offset"),
+
+                     "limit": args.get("limit"),
+
+-                    "hint": ("This (filename, offset, limit) was already read 
+earlier in the same task; "
+
++                    "hint": ("This (filename, offset, limit, max_bytes) was 
+already read earlier in the same task; "
+
+                              "the content is in your message history. Reuse it
+instead of reading again. "
+
+                              "If you genuinely need a fresh read, call with a 
+different range or note it in your reply."),
+
+                 },
+
+
+--- diff: tests/unit/test_tools.py ---
+--- a/tests/unit/test_tools.py
++++ b/tests/unit/test_tools.py
+@@ -1,16 +1,20 @@
+ def test_read_file_max_bytes_truncation():
+
+-    """max_bytes 截断：内容超限时 truncated=True，未超限时不含 truncated 
+字段（或为 False）"""
+
++    """max_bytes 截断：内容超过 max_bytes 时 truncated=True，且返回内容字节数 
+<= max_bytes"""
+
+     content = "hello world"  # 11 字节
+
+     write_file("trunc_test.txt", content)
+
+ 
+
+-    # 截断场景：max_bytes=5 < 11
+
+     result = read_file("trunc_test.txt", max_bytes=5)
+
+     assert "error" not in result
+
+     assert result.get("truncated") is True
+
+     assert len(result["content"].encode("utf-8")) <= 5
+
+ 
+
+-    # 未截断场景：max_bytes=100 > 11
+
+-    result2 = read_file("trunc_test.txt", max_bytes=100)
+
+-    assert "error" not in result2
+
+-    assert result2.get("truncated") is not True
+
+-    assert result2["content"] == content
++
+
++def test_read_file_max_bytes_no_truncation():
+
++    """max_bytes 未截断：内容不超过 max_bytes 时 truncated 字段为 False 
+或不存在"""
+
++    content = "hello world"  # 11 字节
+
++    write_file("trunc_test2.txt", content)
+
++
+
++    result = read_file("trunc_test2.txt", max_bytes=100)
+
++    assert "error" not in result
+
++    assert result.get("truncated") is not True
+
++    assert result["content"] == content
+{"timestamp": "2026-05-23T20:54:12.094473", "requirement": "给 yansh-code 项目里的 tools.read_file 加一个可选参数 max_bytes（默认 None=不限制），用来限制读取的字节数；超过 max_bytes 时返回截断内容加一个标记字段（比如 truncated: true）说明被截断。同时在 tests/unit/test_tools.py 加一条单测验证截断行为。", "mode": "auto", "model": "claude-sonnet-4-6", "plan": [{"filename": "tools.py", "intent": "在 read_file 函数签名中添加可选参数 max_bytes=None；读取文件后若 max_bytes 不为 None 且内容字节数超过限制，则截断内容并在返回 dict 中加入 truncated=True 字段；未超限时返回 dict 保持原结构（可含 truncated=False 或不含该字段，与现有调用方兼容）。", "description": "在 read_file 函数签名中添加可选参数 max_bytes=None；读取文件后若 max_bytes 不为 None 且内容字节数超过限制，则截断内容并在返回 dict 中加入 truncated=True 字段；未超限时返回 dict 保持原结构（可含 truncated=False 或不含该字段，与现有调用方兼容）。"}, {"filename": "tools_schema.py", "intent": "在 read_file 对应的 JSON Schema properties 中追加 max_bytes 字段（type: integer, description 说明字节上限，optional）；required 列表不变。", "description": "在 read_file 对应的 JSON Schema properties 中追加 max_bytes 字段（type: integer, description 说明字节上限，optional）；required 列表不变。"}, {"filename": "agent.py", "intent": "搜索 read_file 调用点：若 dispatch/tool-call 处透传参数给 tools.read_file，确认 max_bytes 作为 kwargs 自然透传，无需硬编码修改；若有参数白名单需补充 max_bytes。（视搜索结果决定是否实际修改）", "description": "搜索 read_file 调用点：若 dispatch/tool-call 处透传参数给 tools.read_file，确认 max_bytes 作为 kwargs 自然透传，无需硬编码修改；若有参数白名单需补充 max_bytes。（视搜索结果决定是否实际修改）"}, {"filename": "tests/unit/test_tools.py", "intent": "新增测试用例 test_read_file_max_bytes_truncation：写一个临时文件，内容超过指定 max_bytes，调用 read_file(path, max_bytes=N)，断言返回内容长度 <= N 且 truncated==True；同时新增 test_read_file_max_bytes_no_truncation 验证内容不超限时 truncated 为 False 或字段不存在。", "description": "新增测试用例 test_read_file_max_bytes_truncation：写一个临时文件，内容超过指定 max_bytes，调用 read_file(path, max_bytes=N)，断言返回内容长度 <= N 且 truncated==True；同时新增 test_read_file_max_bytes_no_truncation 验证内容不超限时 truncated 为 False 或字段不存在。"}], "files_modified": ["tools.py", "tests/unit/test_tools.py", "tools_schema.py", "agent.py"], "tool_calls": [{"name": "search_in_files", "args": {"pattern": "def test_read_file", "extensions": [".py"]}}, {"name": "search_in_files", "args": {"pattern": "test_tools.py"}}, {"name": "list_symbols", "args": {"file_path": "tests/unit/test_tools.py"}}, {"name": "search_in_files", "args": {"pattern": "def read_file", "extensions": [".py"]}}, {"name": "read_file", "args": {"filename": "tests/unit/test_tools.py", "offset": 516, "limit": 15}}, {"name": "read_file", "args": {"filename": "tools.py", "offset": 232, "limit": 22}}, {"name": "replace_in_file", "args": {"filename": "tools.py", "old_str": "def read_file(filename, offset=None, limit=None):\n    \"\"\"读取workspace目录下的文件。\n    可选 offset/limit 按行截取（offset 1-based 起始行；limit 行数上限）。\n    无截取参数时返回整个文件，行为与原版相同。\"\"\"\n    resolved, err = _validate_path(filename)\n    if err:\n        return err\n    try:\n        text = resolved.read_text(encoding='utf-8')\n    except FileNotFoundError:\n        return _err(\"not_found\", f\"文件 {filename} 不存在\")\n    except Exception as e:\n        return _err(\"internal\", str(e))\n    if offset is None and limit is None:\n        return {\"content\": text}\n    lines = text.splitlines(keepends=True)\n    total = len(lines)\n    start = max(0, (offset or 1) - 1)\n    end = total if limit is None else min(total, start + max(0, int(limit)))\n    return {\n        \"content\": \"\".join(lines[start:end]),\n        \"total_lines\": total,\n        \"offset\": start + 1,\n        \"lines_returned\": end - start,\n    }"}}, {"name": "append_to_file", "args": {"filename": "tests/unit/test_tools.py"}}, {"name": "replace_in_file", "args": {"filename": "tools_schema.py", "old_str": "                    \"offset\": {\"type\": \"integer\", \"description\": \"起始行号（1-based，可选）\"},\n                    \"limit\":  {\"type\": \"integer\", \"description\": \"读取行数上限（可选）\"}\n                },\n                \"required\": [\"filename\"]"}}, {"name": "get_symbol_definition", "args": {"symbol_name": "read_file"}}, {"name": "glob_files", "args": {"pattern": "tests/unit/test_tools.py"}}, {"name": "search_in_files", "args": {"pattern": "max_bytes", "extensions": [".py"]}}, {"name": "search_in_files", "args": {"pattern": "def test_read_file", "extensions": [".py"]}}, {"name": "execute_command", "args": {"command": "cd /d \"$(pwd)\" && python -m pytest tests/unit/test_tools.py::test_read_file_max_bytes_truncation -v 2>&1 | tail -20"}}, {"name": "execute_command", "args": {"command": "python -m pytest tests/unit/test_tools.py::test_read_file_max_bytes_truncation -v 2>&1"}}, {"name": "search_in_files", "args": {"pattern": "read_file", "extensions": [".py"]}}, {"name": "read_file", "args": {"filename": "agent.py", "offset": 848, "limit": 25}}, {"name": "read_file", "args": {"filename": "agent.py", "offset": 1160, "limit": 50}}, {"name": "read_file", "args": {"filename": "agent.py", "limit": 20, "offset": 1210}}, {"name": "replace_in_file", "args": {"filename": "agent.py", "old_str": "def _read_cache_key(args: dict) -> tuple:\n    \"\"\"从 read_file args 提取 cache key。offset/limit 缺省补 None 保证 dedupe 一致。\"\"\"\n    return (\n        str(args.get(\"filename\") or \"\"),\n        args.get(\"offset\"),\n        args.get(\"limit\"),\n    )"}}, {"name": "replace_in_file", "args": {"filename": "agent.py", "old_str": "            console.print(\n                f\"[read_cache] 命中 {args.get('filename')}\"\n                f\"@offset={args.get('offset')}/limit={args.get('limit')}，跳过实读\",\n                style=\"cyan\", highlight=False,\n            )\n            return {\n                \"name\": name, \"args\": args, \"id\": tool_call.id,\n                \"result\": {\n                    \"error\": \"duplicate_read\",\n                    \"filename\": args.get(\"filename\"),\n                    \"offset\": args.get(\"offset\"),\n                    \"limit\": args.get(\"limit\"),\n                    \"hint\": (\"This (filename, offset, limit) was already read earlier in the same task; \"\n                             \"the content is in your message history. Reuse it instead of reading again. \"\n                             \"If you genuinely need a fresh read, call with a different range or note it in your reply.\"),\n                },\n            }"}}, {"name": "get_symbol_definition", "args": {"symbol_name": "read_file", "file_path": "tools.py"}}, {"name": "search_in_files", "args": {"pattern": "test_read_file_max_bytes_truncation", "extensions": [".py"]}}, {"name": "read_file", "args": {"filename": "tests/unit/test_tools.py", "offset": 524}}, {"name": "replace_in_file", "args": {"filename": "tests/unit/test_tools.py", "old_str": "def test_read_file_max_bytes_truncation():\n    \"\"\"max_bytes 截断：内容超限时 truncated=True，未超限时不含 truncated 字段（或为 False）\"\"\"\n    content = \"hello world\"  # 11 字节\n    write_file(\"trunc_test.txt\", content)\n\n    # 截断场景：max_bytes=5 < 11\n    result = read_file(\"trunc_test.txt\", max_bytes=5)\n    assert \"error\" not in result\n    assert result.get(\"truncated\") is True\n    assert len(result[\"content\"].encode(\"utf-8\")) <= 5\n\n    # 未截断场景：max_bytes=100 > 11\n    result2 = read_file(\"trunc_test.txt\", max_bytes=100)\n    assert \"error\" not in result2\n    assert result2.get(\"truncated\") is not True\n    assert result2[\"content\"] == content"}}, {"name": "execute_command", "args": {"command": "cd /workspace && python -m pytest tests/unit/test_tools.py::test_read_file_max_bytes_truncation tests/unit/test_tools.py::test_read_file_max_bytes_no_truncation -v 2>&1"}}, {"name": "task_complete", "args": {"success": true, "summary": "Plan files 为空列表，所有 218 条 lint 错误（F401/E741/F841/E401 等）均不属于本次任务范围，属于 pre-existing 失败，已跳过，由用户判断是否单独立项修复。"}}, {"name": "task_complete", "args": {"success": true, "summary": "Plan files 为空，5 条失败均不属本次任务范围，已跳过：test_execute_command_timeout（超时错误文案不匹配）、test_path_traversal_protection（路径越界文案\"超出\"不匹配）、test_replace_in_file_path_traversal（路径越界英文文案\"exceeds workspace\"不匹配）、test_move_file_path_traversal（路径越界英文文案\"exceeds workspace\"不匹配）、test_build_diff_lines_exactly_50_no_truncation（diff截断阈值边界判断有误）——均为 pre-existing 失败，建议用户单独立项处理。"}}], "test_command": "pytest tests/unit/test_tools.py", "test_result": "pass", "attempts": 1, "error": null, "duration_seconds": 218.57, "warnings": ["[警告] tools.py 已用尽 5 轮工具调用上限", "[警告] tools_schema.py 已用尽 5 轮工具调用上限", "[警告] agent.py 已用尽 5 轮工具调用上限", "[警告] tests/unit/test_tools.py 已用尽 5 轮工具调用上限"], "task_complete_signal": {"early_exit": true, "success": true, "summary": "Plan files 为空，5 条失败均不属本次任务范围，已跳过：test_execute_command_timeout（超时错误文案不匹配）、test_path_traversal_protection（路径越界文案\"超出\"不匹配）、test_replace_in_file_path_traversal（路径越界英文文案\"exceeds workspace\"不匹配）、test_move_file_path_traversal（路径越界英文文案\"exceeds workspace\"不匹配）、test_build_diff_lines_exactly_50_no_truncation（diff截断阈值边界判断有误）——均为 pre-existing 失败，建议用户单独立项处理。"}, "tokens": {"input": 747404, "output": 6948, "by_model": {"claude-sonnet-4-6": {"input": 747404, "output": 6948}}}}
