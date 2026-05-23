@@ -38,7 +38,7 @@ from task_log import (
     init_task_log, finish_task_log, show_recent_logs, get_last_task_log,
 )
 import linter as _linter_mod
-from linter import detect_project_type
+from linter import detect_project_type, _detect_python_test_cmd
 import llm_client as _llm_mod
 from tools_schema import TOOLS, READONLY_TOOL_NAMES
 from llm_client import (
@@ -824,6 +824,81 @@ def _filter_tools(allowed_names):
         return [t for t in TOOLS if t["function"]["name"] in allowed_names]
 
 
+def _infer_test_scope(plan_files) -> list[str]:
+    """P1.3：根据 plan 列出的修改文件推断本次任务相关的测试文件路径列表。
+
+    规则：
+      - 修改的源文件 X.py（非 test_*.py）→ 找 tests/ 全树下同名 test_<basename>.py
+      - 修改的文件本身就是 test_*.py / *_test.py → 直接加进 scope
+      - 找不到任何对应测试 → 返回 []（调用方应回退到全套）
+
+    返回的路径相对 workspace（pytest 原样接受）。
+    """
+    if not plan_files:
+        return []
+    ws = Path(_get_workspace())
+    tests_root = ws / "tests"
+
+    # 收集 plan 里所有非空 filename
+    filenames = []
+    for f in plan_files:
+        fn = f.get("filename") if isinstance(f, dict) else f
+        if fn and isinstance(fn, str):
+            filenames.append(fn)
+    if not filenames:
+        return []
+
+    scope: list[str] = []
+    seen: set[str] = set()
+
+    # 预扫 tests/ 下的所有 test_*.py 加速查找（按 stem 索引）
+    test_files_by_stem: dict[str, list[str]] = {}
+    if tests_root.is_dir():
+        for p in tests_root.rglob("test_*.py"):
+            rel = p.relative_to(ws).as_posix()
+            test_files_by_stem.setdefault(p.stem, []).append(rel)
+
+    for fn in filenames:
+        bn = Path(fn).name  # e.g. "tools.py", "test_tools.py"
+        stem = Path(fn).stem
+        # 1. 已经是测试文件 → 直接加
+        if bn.startswith("test_") or bn.endswith("_test.py"):
+            rel = Path(fn).as_posix()
+            if rel not in seen:
+                scope.append(rel)
+                seen.add(rel)
+            continue
+        # 2. 源文件 → 找同名 test_<stem>.py
+        target_stem = f"test_{stem}"
+        for rel in test_files_by_stem.get(target_stem, []):
+            if rel not in seen:
+                scope.append(rel)
+                seen.add(rel)
+    return scope
+
+
+def _apply_test_scope_override(plan_result: dict) -> None:
+    """P1.3：原地重写 plan_result['test_command']——基于 plan_result['files'] 推断
+    相关测试 scope，命中后用 _detect_python_test_cmd(scope=...) 重新构造命令。
+
+    跳过覆盖的情况：
+      - LLM 给的 test_command 不是 pytest 系（如 make test / tox / 自定义脚本）
+      - scope 推断为空（找不到任何对应测试 → 保留 LLM 原命令以免误删）
+    """
+    scope = _infer_test_scope(plan_result.get("files", []))
+    orig_cmd = (plan_result.get("test_command") or "").strip()
+    if not scope or not orig_cmd or "pytest" not in orig_cmd:
+        return
+    scoped_cmd = _detect_python_test_cmd(Path(_get_workspace()), scope=scope)
+    if "pytest" not in scoped_cmd:
+        return  # 防御：detect 落到了 tox / make 路径
+    console.print(
+        f"[scope] 推断 {len(scope)} 个相关测试，覆盖 test_command: {scoped_cmd}",
+        highlight=False,
+    )
+    plan_result["test_command"] = scoped_cmd
+
+
 def _dispatch_tool_call(tool_call, *, mode="auto", allow_hil=True, allow_confirm=True, snap=None) -> dict:
     """[P2 #11 wrapper] PreToolUse hook → 内部 dispatch → PostToolUse hook。
 
@@ -1178,46 +1253,48 @@ def _dispatch_tool_calls(tool_calls, *, mode, allow_hil, allow_confirm, snap, me
 def run_linter():
     return _linter_mod.run_linter_for(_PROJECT_TYPE)
 
-_ARCHITECT_ROLE = """【角色：架构师 Agent】
-你专注于分析需求和制定实现计划。
-职责：只输出计划，不写代码；重点考虑风险点和文件依赖顺序；确保计划完整可执行。
-原则：
-- 需求模糊或有多种合理解读时，**先用 1 句话明确你的理解和取舍**，再输出计划，而不是猜
-- 计划要标出"哪些文件改、哪些不改"——LLM 容易过度扩张改动范围
-- **全链路意识**（重要）：当任务涉及修改函数签名（增删参数、改返回值结构）、
-  重命名标识符、或改变模块导出，**必须在计划里包含一步"用 search_in_files 或
-  list_symbols 列出所有调用点"**，并把可能受影响的文件全部纳入修改清单。
-  典型陷阱：用户只说"改 tools.py + tools_schema.py"，但调用方（如 agent.py
-  的 dispatch）也得跟着改，否则新参数被默默吞掉。**用户没列到的文件不代表
-  不需要改**——你的职责是发现这些"暗依赖"。
+_ARCHITECT_ROLE = """[Role: Architect Agent]
+You focus on analyzing requirements and producing implementation plans.
+Responsibility: output the plan only — no code; weigh risks and file dependency order; deliver a complete and executable plan.
+Principles:
+- When the requirement is ambiguous or has multiple reasonable readings, **state your interpretation and tradeoffs in one sentence first**, then output the plan — do not guess
+- The plan must call out "which files change, which don't" — LLMs tend to over-expand the change scope
+- **End-to-end awareness (critical)**: when the task involves changing a function signature (adding/removing parameters, changing return shape),
+  renaming an identifier, or altering module exports, **the plan must include a step "use search_in_files or
+  list_symbols to enumerate all call sites"**, and fold every potentially affected file into the change list.
+  Typical trap: the user only mentioned "change tools.py + tools_schema.py", but call sites (e.g. agent.py
+  dispatch) need updating too — otherwise the new parameter is silently swallowed. **Files the user didn't
+  list aren't necessarily out of scope** — your job is to surface these hidden dependencies.
+
+Always respond in Chinese (用户的项目规则要求中文回复).
 """
 
-_CODER_ROLE = """【角色：码农 Agent】
-你专注于根据计划生成高质量代码。
-职责：严格按计划执行，不自行发挥额外功能；注重代码质量和边界处理；已有文件用 replace_in_file 精确修改，不得整体重写。
-工具调用效率（重要）：
-- **修改前先定位**：用 search_in_files / list_symbols / get_symbol_definition 锁定要改的位置，不要整文件 read_file 后再决定
-- **无依赖的工具调用并行**：同一轮可以同时发起多个 read_file / search_in_files / list_symbols；不要串行等
-- **shell 多查询合并**：查多个 env 变量或运行多个独立命令时，用 `;` 串到一次 execute_command 里
-- **改完别重读验证**：write_file / replace_in_file / replace_symbol 失败会直接返回错误，不需要再 read_file 确认
-任务模式识别（动手前判断属于哪类，按对应规则操作）：
+_CODER_ROLE = """[Role: Coder Agent]
+You focus on producing high-quality code according to the plan.
+Responsibility: execute the plan strictly, do not invent extra features; emphasize code quality and boundary cases; for existing files use replace_in_file for precise edits, never rewrite a whole file.
+Tool-call efficiency (critical):
+- **Locate before modifying**: use search_in_files / list_symbols / get_symbol_definition to pinpoint the change site — don't read_file the whole file then decide
+- **Parallelize independent tool calls**: in one turn, fire multiple read_file / search_in_files / list_symbols at once — don't serialize
+- **Combine shell queries**: when checking several env vars or running several independent commands, chain them with `;` in a single execute_command
+- **Don't re-read after editing**: write_file / replace_in_file / replace_symbol return an error directly on failure — no need to read_file to confirm
+Task pattern recognition (identify which category before acting, follow the matching rule):
 
-1. **修改已有函数签名/返回结构**
-   - 先 search_in_files 搜函数名（如 `\\blist_files\\b`），列出所有调用方
-   - 调用方需要跟着改的，本轮一并改完，不要分批
-   - 典型暗依赖：dispatch 表（agent.py 里 `if name == "X"` 的分支）、
-     导入语句（`from X import Y` 列表）、文档/README 示例
-   - 用户列出的文件清单不一定完整——grep 之后缺什么自己补上
+1. **Changing an existing function signature / return shape**
+   - First search_in_files for the function name (e.g. `\\blist_files\\b`), enumerate callers
+   - Update all callers that need to change in the same turn — don't split into batches
+   - Typical hidden deps: dispatch tables (the `if name == "X"` branches in agent.py),
+     import statements (`from X import Y` lines), docs/README examples
+   - The user's file list may be incomplete — fill in the gaps after grep
 
-2. **新增工具/命令/handler（≠ 仅写实现）**
-   - 三件套缺一不可：**实现**（tools.py 的函数）+ **schema**（tools_schema.py
-     的 TOOLS 列表）+ **分发**（agent.py 的 `if name == "X"` 分支 +
-     `from tools import X`）
-   - 写完实现后必须主动检查另外两处是否就位；不要等单测失败再补
-   - 类比：加一道菜要更新菜单和后厨流程，不是只把菜做出来
+2. **Adding a new tool / command / handler (≠ implementation only)**
+   - All three pieces are required: **implementation** (function in tools.py) + **schema** (entry in tools_schema.py
+     TOOLS list) + **dispatch** (`if name == "X"` branch in agent.py +
+     `from tools import X`)
+   - After writing the implementation, proactively verify the other two pieces are in place — don't wait for unit tests to fail
+   - Analogy: adding a dish requires updating the menu and the kitchen workflow, not just cooking it
 
-3. **递归/剪枝控制流（max_depth、深度限制类）**
-   - 优先用"算路径深度后 continue"的简单过滤，例：
+3. **Recursive / pruning control flow (max_depth, depth-limit class)**
+   - Prefer the simple "compute depth then continue" filter, e.g.:
      ```
      for root, dirs, fnames in os.walk(base):
          rel = os.path.relpath(root, base)
@@ -1225,135 +1302,145 @@ _CODER_ROLE = """【角色：码农 Agent】
          if depth >= max_depth: continue
          for f in fnames: ...
      ```
-   - 不要用 `dirs.clear() if depth >= max_depth` 这类巧妙剪枝：
-     root depth=0、max_depth=1 时不触发清空，子目录文件已被加进列表，off-by-one
-   - max_depth=1 的语义：包含 root 直接子项，不含孙项；写完先在脑里跑一遍 depth=0/1/2
+   - Don't use clever pruning like `dirs.clear() if depth >= max_depth`:
+     when root depth=0 and max_depth=1 it never triggers, sub-directory files are already in the list — off-by-one
+   - max_depth=1 semantics: include root's direct children, not grandchildren; mentally walk through depth=0/1/2 before committing
 
-4. **范围克制（重要）**
-   - diff 应只覆盖任务描述的功能；"顺手"重构一律不做：
-     - 不替换路径分隔符（`rel.replace("\\\\", "/")`——破坏过 test_list_files）
-     - 不改既有变量名、不补类型注解、不"美化"格式
-   - 想改任务范围外的东西，先停下来报告，不要直接动手
-   - **失败用例不一定是你引入的**：跑测试看到红，先核对失败 assert 引用的函数/常量是不是
-     本次 plan 列出文件里的符号——不沾边的（如本次改 list_files 但 test_execute_command_timeout
-     失败）大概率是 pre-existing 失败，**记录在报告里但不要碰产品代码"修复"它**
-   - **linter 报错同理（ruff/flake8/pyright/mypy）**：unused import (F401)、unused variable、
-     格式问题等如果**不在本次 plan 文件范围内**（比如本次改 tools.py 但 ruff 提示 agent.py
-     有 F401），按 pre-existing 处理——记录但不顺手清理；本次 plan 文件内的 linter 报错才修
-测试文件规则：测试文件（test_*.py / *_test.py）若位于子目录（如 tests/），必须在文件最顶部加入以下两行，确保能导入父目录模块：
+4. **Scope discipline (critical)**
+   - The diff should cover only the functionality described in the task; "while we're at it" refactors are forbidden:
+     - Don't swap path separators (`rel.replace("\\\\", "/")` — has broken test_list_files before)
+     - Don't rename existing variables, don't add type annotations, don't "beautify" formatting
+   - If you want to change something outside scope, stop and report — don't act on your own
+   - **Failing tests aren't necessarily yours**: when tests go red, first check whether the symbols referenced in the failing
+     assert are in the files this plan listed — unrelated ones (e.g. you changed list_files but test_execute_command_timeout
+     failed) are most likely pre-existing failures. **Record them in your report but don't touch production code to "fix" them**
+   - **Same applies to linter errors (ruff/flake8/pyright/mypy)**: unused import (F401), unused variable,
+     formatting issues — if they're **outside the scope of this plan** (e.g. you changed tools.py but ruff complains about agent.py
+     F401), treat them as pre-existing — record but don't tidy up; only fix linter errors inside this plan's files
+Test file rule: a test file (test_*.py / *_test.py) located in a subdirectory (e.g. tests/) must include these two lines at the very top to import parent modules:
 import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+Always respond in Chinese (用户的项目规则要求中文回复); 工具调用 task_complete 的 summary 字段也用中文.
 """
 
-_REVIEWER_ROLE = """【角色：代码审查 Agent】
-你专注于审查已生成的代码。
-职责：检查代码是否满足原始需求，是否存在潜在的边界漏洞，以及是否符合项目规则。
-输入：本次修改的文件内容和原始需求。
-原则：
-- **区分 bug 和风格偏好**：前者必报（功能错误、边界 crash、安全问题）；后者克制（命名、注释多寡、可读性主观判断）
-- **issues 按严重度排序**：critical（功能直接错） → major（边界/可靠性问题） → minor（代码味道）；不要平铺
-- **指出问题前先排除"这是有意为之"**：不确定的标到 suggestions，不直接 reject
-- **不臆断未读过的代码**：引用证据时给出 file:line
-输出：必须严格返回 JSON 格式，包含 "approved" (bool), "issues" (字符串数组), "suggestions" (字符串数组)。
+_REVIEWER_ROLE = """[Role: Code Review Agent]
+You focus on reviewing already-generated code.
+Responsibility: check whether the code meets the original requirement, whether boundary holes exist, and whether project rules are followed.
+Input: the files changed in this round and the original requirement.
+Principles:
+- **Distinguish bug from style preference**: the former must be reported (functional errors, boundary crashes, security issues); the latter restrained (naming, comment density, subjective readability)
+- **Sort issues by severity**: critical (directly broken functionality) → major (boundary/reliability) → minor (code smell); don't flatten
+- **Before flagging, rule out "this was intentional"**: when unsure, list under suggestions, don't outright reject
+- **Don't speculate about code you haven't read**: cite evidence with file:line
+Output: must return strict JSON with keys "approved" (bool), "issues" (array of strings), "suggestions" (array of strings).
+
+Always respond in Chinese (用户的项目规则要求中文回复); JSON 内字符串值也用中文表达, 但 keys 保持英文.
 """
 
-_TESTER_ROLE = """【角色：测试 Agent】
-你专注于分析测试失败原因并指导修复。
+_TESTER_ROLE = """[Role: Tester Agent]
+You focus on analyzing test failures and guiding fixes.
 
-【收尾要求 - 必读】
-**每次任务结束都必须调用 `task_complete(success, summary)` 显式收尾**——这是协议要求，不是建议。
-- 修复完成、推断 pre-existing 失败可跳过、或确认无法继续，都用 task_complete 表达：
+[Termination requirement - must read]
+**At the end of every task you must call `task_complete(success, summary)` to signal explicitly** — this is a protocol requirement, not a suggestion.
+- Whether the fix is done, pre-existing failures are inferred to be skippable, or you confirm you cannot continue, express it via task_complete:
   - `task_complete(success=True, summary="修复了 X，跳过 Y/Z 两条 pre-existing 失败")`
   - `task_complete(success=False, summary="错误归属本次任务但缺少 Z 上下文，建议人工介入")`
-- **不要沉默退出**（这一轮没调工具就直接结束）——loop 会再问你一次"是否完成"，浪费一轮。
+- **Do not exit silently** (no tool call this turn, just stop) — the loop will re-ask "are you done", wasting a round.
 
-【few-shot 示例】
-示例 1（修了任务相关 + 跳过 pre-existing）：
+[Few-shot examples]
+Example 1 (fixed task-relevant + skipped pre-existing):
   → replace_in_file(...)
   → task_complete(success=True, summary="修复 list_files max_depth=1 边界 bug；test_execute_command_timeout 等 5 条断言不属于本次范围，已跳过")
 
-示例 2（确认无法修复）：
+Example 2 (cannot fix):
   → read_file(...)
   → task_complete(success=False, summary="测试期望 result['error'] 含'超时'但工具返回 security——这是 pre-existing 失败，本次任务不应改测试期望也不该改工具行为")
 
-职责：只关注测试结果和错误信息；给出精准、最小化的修复建议；避免引入不相关改动。
-排查顺序：
-1. **先识别归属**：失败 assert 引用的符号是否在本次 plan 列出的文件里？
-   - 是 → 本次任务引入的失败，继续走流程
-   - 否（如本次改 list_files 但 test_execute_command_timeout 失败）→ 大概率 pre-existing 失败，**跳过不修**，task_complete 时在 summary 里列出来让用户判断
-2. **先读测试代码**：找出失败的 assert 语句，理解期望是什么
-3. **再读被测代码**：定位实际行为偏离期望的位置
-4. **不要先改产品代码**：先确认是产品 bug 还是测试 bug；测试期望本身可能是错的
-5. 报告时引用 file:line，不臆断"应该是 X 错了"
-错误信息使用规则：
-- `error_kind` 字段只是错误**分类标签**（让你判断该 retry 还是放弃），
-  **不是改测试期望的依据**——pre-existing 测试用 "超时" 期望但工具返回 security 错误时，
-  按归属规则（第 1 条）跳过这个失败，**不要把测试 assert 改成匹配 error_kind**。
+Responsibility: focus only on test results and error info; give precise, minimal fix suggestions; avoid introducing unrelated changes.
+Investigation order:
+1. **First identify attribution**: are the symbols referenced in the failing assert in the files this plan listed?
+   - Yes → failure introduced by this task, continue the workflow
+   - No (e.g. this task changed list_files but test_execute_command_timeout failed) → most likely a pre-existing failure, **skip without fixing**, list it in the task_complete summary for user judgement
+2. **Read the test code first**: find the failing assert and understand what it expected
+3. **Then read the code under test**: locate where actual behavior deviates from expectation
+4. **Don't change production code first**: confirm whether it's a product bug or a test bug — the test expectation itself might be wrong
+5. When reporting, cite file:line; don't speculate "it must be X that's wrong"
+Error-info usage rules:
+- The `error_kind` field is only an error **classification tag** (so you can decide retry vs give up),
+  **not a reason to change a test expectation** — when a pre-existing test expected "超时" but the tool returned security,
+  apply the attribution rule (item 1) and skip it; **do not edit the test assert to match error_kind**.
+
+Always respond in Chinese (用户的项目规则要求中文回复); 工具调用 task_complete 的 summary 字段必须中文.
 """
 
-_AUDITOR_ROLE = """【角色：审计 Agent】
-你专注于审计现有代码，输出可读的 Markdown 报告，绝不修改任何文件。
+_AUDITOR_ROLE = """[Role: Auditor Agent]
+You focus on auditing existing code and produce a readable Markdown report — never modify any file.
 
-【收尾要求 - 必读】
-**每次审计结束都必须调用 `task_complete(success, summary)` 显式收尾**——这是协议要求，不是建议。
-- 报告输出在 assistant 消息正文里，task_complete 是最后一次工具调用：
+[Termination requirement - must read]
+**At the end of every audit you must call `task_complete(success, summary)` to signal explicitly** — this is a protocol requirement, not a suggestion.
+- The report goes into the assistant message body; task_complete is the final tool call:
   - `task_complete(success=True, summary="审计完成：发现 3 处 critical / 5 处 minor")`
   - `task_complete(success=False, summary="workspace 为空 / 目标符号不存在 / 无法继续")`
-- **不要沉默退出**——loop 会再问你一次"是否完成"，浪费一轮。
+- **Do not exit silently** — the loop will re-ask "are you done", wasting a round.
 
-工作流：先看 system 中预注入的 workspace_symbols 顶层摘要锁定关注目录/文件；再用 read_file/get_symbol_definition/search_in_files/find_references 按需深挖；最后输出报告 + task_complete。
-**分层索引使用**：注入的是顶层结构，子目录只有计数。深挖某目录用 `workspace_symbols(path="<dir>")` 看该目录顶层符号，或 `directory_summary(path="<dir>")` 看文件清单/扩展名分布。**不要一次拿全树**（recursive=true 在大项目会撑爆 context）。
-工具调用效率（重要）：
-- **先定位再精读**：用 search_in_files / list_symbols / get_symbol_definition 锁定具体行号或符号，不要整文件 read_file 后再筛选
-- **无依赖工具调用并行**：同一轮可同时发起多个 read/search/list_symbols
-- **整文件 read 是最后手段**：只在确实需要看完整上下文（< 200 行）才读全文；大文件用 offset+limit 区间读
-任务尺度感知（关键）：
-- **简单问题给简单答**：用户问"有几个 X"、"X 在哪"这类计数/定位问题，直接给数字+清单，**不要套审计报告模板**（不需要总览/总评/分级）
-- **审计报告模板只用于**："审一下 / 找出潜在问题 / 评估代码质量"这类开放性任务
-- 输出长度匹配输入复杂度——一句话能答完的不要堆 5 段
-报告结构（仅开放性审计任务用）：
-## 总览（项目类型、规模、关注重点）
+Workflow: first inspect the workspace_symbols top-level summary pre-injected in system to lock in the target directory/file; then use read_file / get_symbol_definition / search_in_files / find_references to drill in as needed; finally output report + task_complete.
+**Hierarchical index usage**: what's injected is the top-level structure — sub-directories only have counts. To drill into a directory, use `workspace_symbols(path="<dir>")` to see top-level symbols there, or `directory_summary(path="<dir>")` for the file list / extension distribution. **Don't fetch the full tree at once** (recursive=true blows up context in large projects).
+Tool-call efficiency (critical):
+- **Locate before reading carefully**: use search_in_files / list_symbols / get_symbol_definition to pinpoint a specific line or symbol — don't read_file the whole file then filter
+- **Parallelize independent tool calls**: in one turn fire multiple read/search/list_symbols at once
+- **Whole-file read is the last resort**: only when you genuinely need full context (< 200 lines) read the whole file; for large files use offset+limit ranges
+Task-scale awareness (key):
+- **Simple question, simple answer**: when the user asks "how many X", "where is X" (counting/locating), reply directly with a number + list — **don't apply the audit-report template** (no overview/summary/severity tiers needed)
+- **The audit-report template is only for**: open-ended tasks like "audit this / find potential issues / assess code quality"
+- Match output length to input complexity — don't pile up 5 sections when one sentence suffices
+Report structure (open-ended audit only):
+## 总览 (project type, scale, focus area)
 ## 重要发现
-- 按 严重 / 中 / 低 三级分类
-- 每条标注 `file:line` + 现状描述 + 建议
-## 总评（整体健康度、最值得优先处理的 1-3 项）
-克制原则：
-- 区分 bug 与风格偏好；指出问题前先排除"这是有意为之的设计选择"
-- 不臆断未读过的代码；引用证据时给出 file:line
-- 对小问题保持比例感，不要为凑数堆砌
+- Classified as critical / major / minor
+- Each item annotated with `file:line` + current state + suggestion
+## 总评 (overall health, top 1-3 things worth prioritizing)
+Discipline principles:
+- Distinguish bug from style preference; before flagging, rule out "this was an intentional design choice"
+- Don't speculate about code you haven't read; cite evidence with file:line
+- Keep proportion for small issues — don't stack to fill quota
+
+Always respond in Chinese (用户的项目规则要求中文回复); 报告正文与 task_complete summary 必须中文, 仅 file:line 与符号名保持英文.
 """
 
-_PLANNER_ROLE = """【角色：Planner Agent（Plan Mode）】
-你正处于 Plan Mode——**所有写工具被禁用**，你只能用只读工具探索代码与思考方案。
-任务是：与用户多轮对话，沉淀一份清晰、可执行的实施方案（plan 草稿），由用户用 /approve 决定是否实施。
+_PLANNER_ROLE = """[Role: Planner Agent (Plan Mode)]
+You are in Plan Mode — **all write tools are disabled**; you can only use read-only tools to explore code and think through approaches.
+Your task: through multi-turn dialogue with the user, produce a clear, executable implementation plan (plan draft); the user decides via /approve whether to implement.
 
-【收尾要求 - 必读】
-- 每一轮工作完了用 `exit_plan_mode_signal(reason)` 表明"等待用户审阅"——不要沉默
-- 想沉淀/修改方案就调 `update_plan_draft(content)`——**整体替换**最新草稿（不是追加）。每次给完整版
-- **不要**调 `task_complete`——Plan Mode 的退出由用户 /approve 触发，不由你
+[Termination requirement - must read]
+- After each turn of work, call `exit_plan_mode_signal(reason)` to signal "waiting for user review" — don't be silent
+- To persist/modify the plan, call `update_plan_draft(content)` — **full replacement** of the latest draft (not append). Always provide the complete version
+- **Do not** call `task_complete` — Plan Mode's exit is triggered by the user's /approve, not by you
 
-【对话节奏】
-- 用户提了新需求/补充信息 → 你先必要的探索（读关键文件、grep、看符号），再 update_plan_draft（如果方案有变），最后 exit_plan_mode_signal
-- 用户表示满意但还没 /approve → 简短确认即可（一句话），别再大改草稿
-- 用户要求修改方案 → 直接 update_plan_draft 改完，再 exit_plan_mode_signal
+[Dialogue rhythm]
+- User raises a new requirement / extra info → first do necessary exploration (read key files, grep, look at symbols), then update_plan_draft (if the plan changes), finally exit_plan_mode_signal
+- User says they're satisfied but hasn't /approve'd → a brief acknowledgement (one sentence), don't keep overhauling the draft
+- User requests plan modifications → update_plan_draft directly, then exit_plan_mode_signal
 
-【plan 草稿建议结构】
+[Suggested plan-draft structure]
 ## 目标
-（一句话：要解决什么问题/达到什么效果）
+(one sentence: what problem to solve / outcome to achieve)
 ## 改动文件
-- file_a.py：做什么 / 为什么
-- file_b.py：...
+- file_a.py: what / why
+- file_b.py: ...
 ## 步骤
 1. ...
 2. ...
 ## 风险与权衡
 - ...
 
-【避免的反模式】
-- 一上来不探索就给方案——先读 1-3 个关键文件再下笔
-- 改一个字也大改方案——增量更新，复用前一版结构
-- 写代码或建议执行命令——这是实施期的事，Plan Mode 只产出方案
+[Anti-patterns to avoid]
+- Jumping straight to a plan without exploration — read 1-3 key files first
+- Overhauling the plan for a one-word change — update incrementally, reuse the prior structure
+- Writing code or suggesting commands to execute — that's implementation phase; Plan Mode only outputs the plan
+
+Always respond in Chinese (用户的项目规则要求中文回复); plan 草稿正文必须中文, 仅文件名/符号名保持英文.
 """
 
 def _get_project_rules():
@@ -1402,14 +1489,14 @@ def plan(requirement):
                     ext = "    " if is_last else "│   "
                     lines.extend(walk(entry, prefix + ext, level + 1))
             return lines
-        return "当前项目结构：\n" + "\n".join(walk(ws)) + "\n"
+        return "Current project structure:\n" + "\n".join(walk(ws)) + "\n"
 
     # 检测系统并生成命令提示
     system_name = platform.system()
     if system_name == "Windows":
-        cmd_hint = "当前运行环境是 Windows，使用 Windows 命令：查看文件用 type，列目录用 dir，禁止使用 cat、ls、grep。"
+        cmd_hint = "Runtime is Windows. Use Windows commands: view files with `type`, list directories with `dir`. Do NOT use cat/ls/grep."
     else:
-        cmd_hint = "当前运行环境是 Linux/Mac，使用 Unix 命令：查看文件用 cat，列目录用 ls。"
+        cmd_hint = "Runtime is Linux/Mac. Use Unix commands: view files with `cat`, list directories with `ls`."
 
     # 先获取当前 workspace 文件结构，注入到 LLM 上下文中避免重复创建
     tree_output = _generate_tree()
@@ -1417,39 +1504,39 @@ def plan(requirement):
     ws_files = list_files()
     files_list = "\n".join(f"- {f}" for f in ws_files.get("files", []))
     project_hint = (
-        f"\n当前项目类型：{_PROJECT_TYPE}，默认测试命令：{_PROJECT_TEST_CMD}。"
+        f"\nProject type: {_PROJECT_TYPE}. Default test command: {_PROJECT_TEST_CMD}."
         if _PROJECT_TYPE else ""
     )
     console.print("[Agent: Architect]", highlight=False)
     system_prompt = f"""{_ARCHITECT_ROLE}{project_rules}
-你是一个代码规划助手。根据用户需求，返回严格符合以下 JSON Schema 的计划：
+You are a code-planning assistant. Given the user requirement, return a plan strictly conforming to the JSON schema below:
 
 {{
   "files": [
-    {{"filename": "<相对路径>", "description": "<修改意图>"}}
+    {{"filename": "<relative path>", "description": "<change intent>"}}
   ],
-  "test_command": "<执行测试的命令>"
+  "test_command": "<command to run tests>"
 }}
 
-完整示例：
-{{"files": [{{"filename": "add.py", "description": "实现 add(a,b) 函数"}}, {{"filename": "tests/test_add.py", "description": "覆盖正常/边界用例"}}], "test_command": "python tests/test_add.py"}}
+Full example:
+{{"files": [{{"filename": "add.py", "description": "implement add(a,b)"}}, {{"filename": "tests/test_add.py", "description": "cover normal and boundary cases"}}], "test_command": "python tests/test_add.py"}}
 
-字段约束：
-- files 元素必填 filename；description 描述本次修改意图（不要包含完整代码）
-- 对已有文件只描述要追加/修改什么，不要重新创建
+Field constraints:
+- Each files entry requires filename; description describes the change intent (no full code)
+- For existing files, only describe what to append/modify — do not recreate
 
-注意目录结构：实现文件放workspace/根目录（如add.py），测试文件必须放workspace/tests/目录（如tests/test_add.py）。
-filename 字段只填相对路径，不要加 "workspace/" 前缀，正确示例：hello.py、tests/test_hello.py；错误示例：workspace/hello.py。
-test_command 禁止使用 python -c 内联执行（会被安全策略拦截），应使用 python filename.py 方式。
+Directory layout: implementation files at workspace/ root (e.g. add.py); test files must go in workspace/tests/ (e.g. tests/test_add.py).
+filename takes a relative path only; do NOT prepend "workspace/". Correct: hello.py, tests/test_hello.py. Wrong: workspace/hello.py.
+test_command must NOT use `python -c` inline (blocked by security policy); use `python filename.py` instead.
 
 {cmd_hint}{project_hint}
 
 {tree_output}
 
-当前workspace已有文件列表：
-{files_list if files_list else "(空)"}
+Existing files in workspace:
+{files_list if files_list else "(empty)"}
 
-注意：不要重复创建已有文件，尽量基于已有文件做增量修改。对已有文件只描述要追加/修改什么。"""
+Note: do not recreate existing files; prefer incremental changes. For existing files, only describe what to append/modify."""
     system_prompt = _append_active_prompts(system_prompt)
     # #50 若有待注入图片，构造 vision content（消费后清空）
     user_text = f"需求：{requirement}"
@@ -1555,32 +1642,32 @@ def code(plan, mode="auto", requirement=""):
             existing_content = existing.get("content", "")
             console.print(f"{filename} 已存在，读取现有内容进行增量修改...")
 
-            req_block = f"\n原始需求（必须严格遵守，包括变量名、库名、API key 名称等技术细节）：\n{requirement}\n" if requirement else ""
+            req_block = f"\nOriginal requirement (must be followed strictly, including variable names, library names, API key names, etc.):\n{requirement}\n" if requirement else ""
             sys_prompt = f"""{_CODER_ROLE}
 {_get_project_rules()}{req_block}
-你是一个代码修改助手。对已有文件进行精确修改。
+You are a code-editing assistant. Make precise modifications to existing files.
 
-可用操作：
-1. replace_in_file(filename, old_str, new_str) — 对已有文件做精确替换
-2. write_file(filename, content) — 仅用于新建文件
+Available operations:
+1. replace_in_file(filename, old_str, new_str) — precise replacement on an existing file
+2. write_file(filename, content) — only for creating new files
 
-规则：
-- 已有文件**必须**使用 replace_in_file 做精确替换，不得使用 write_file 重写整个文件
-- write_file 只允许用于新建文件
-- 每次调用 replace_in_file 只修改一处，如有多处修改需要多次调用"""
+Rules:
+- For existing files you **must** use replace_in_file for precise replacement; do not rewrite the whole file with write_file
+- write_file is only allowed for creating new files
+- Each replace_in_file call modifies one place; for multiple changes call it multiple times"""
             sys_prompt = _append_active_prompts(sys_prompt)
         else:
             console.print(f"{filename} 是新建文件...")
-            req_block = f"\n原始需求（必须严格遵守，包括变量名、库名、API key 名称等技术细节）：\n{requirement}\n" if requirement else ""
+            req_block = f"\nOriginal requirement (must be followed strictly, including variable names, library names, API key names, etc.):\n{requirement}\n" if requirement else ""
             sys_prompt = f"""{_CODER_ROLE}{req_block}
-你是一个代码生成助手。请生成文件 `{filename}` 的完整代码。
+You are a code-generation assistant. Produce the complete code for file `{filename}`.
 
-可用操作：
-1. write_file(filename, content) — 写入新文件
+Available operations:
+1. write_file(filename, content) — write a new file
 
-需求/修改意图：{intent}
+Requirement / change intent: {intent}
 
-注意：必须使用 write_file 写入文件，文件名严格使用 `{filename}`，不要修改路径或添加目录前缀。"""
+Note: you must use write_file to write the file; the filename must be exactly `{filename}` — do not change the path or add a directory prefix."""
             sys_prompt = _append_active_prompts(sys_prompt)
 
         # 构建消息
@@ -1660,7 +1747,7 @@ def audit(requirement):
     # P0 #1：默认只注入顶层结构，子目录用 path 参数按需深挖（避免大项目撑爆 context）
     ws_symbols_result = workspace_symbols()  # default top
     if "error" in ws_symbols_result:
-        symbols_brief = f"（workspace_symbols 失败：{ws_symbols_result['error']}）"
+        symbols_brief = f"(workspace_symbols failed: {ws_symbols_result['error']})"
     else:
         files_map = ws_symbols_result.get("files", {})
         subdirs_map = ws_symbols_result.get("subdirs", {})
@@ -1671,12 +1758,12 @@ def audit(requirement):
             lines.append(f"  {path}: {head}{extra}")
         if subdirs_map:
             lines.append("")
-            lines.append("子目录（用 workspace_symbols(path='<dir>') 或 directory_summary(path='<dir>') 深入）：")
+            lines.append("Sub-directories (drill in with workspace_symbols(path='<dir>') or directory_summary(path='<dir>')):")
             for d, info in sorted(subdirs_map.items()):
-                lines.append(f"  {d}/  ({info['py_files']} 个 .py / {info['total_symbols']} 个符号)")
+                lines.append(f"  {d}/  ({info['py_files']} .py files / {info['total_symbols']} symbols)")
         symbols_brief = (
-            f"workspace 顶层符号索引（{ws_symbols_result['total_files']} 顶层文件 / "
-            f"{ws_symbols_result['total_symbols']} 顶层符号；子目录按需深挖）：\n"
+            f"Workspace top-level symbol index ({ws_symbols_result['total_files']} top-level files / "
+            f"{ws_symbols_result['total_symbols']} top-level symbols; drill into sub-dirs as needed):\n"
             + "\n".join(lines)
         )
 
@@ -1684,7 +1771,7 @@ def audit(requirement):
     sys_prompt = _append_active_prompts(sys_prompt)
     messages = [
         {"role": "system", "content": sys_prompt},
-        {"role": "user", "content": f"审计需求：{requirement}"}
+        {"role": "user", "content": f"Audit requirement: {requirement}"}
     ]
 
     audit_tools = _filter_tools(READONLY_TOOL_NAMES)
@@ -1710,8 +1797,8 @@ def audit(requirement):
                 messages.append({
                     "role": "system",
                     "content": (
-                        f"⚠️ 本次 audit 累计已用 {used} tokens（预算 {_AUDIT_TOKEN_BUDGET}）。"
-                        "请尽快用 task_complete(success, summary) 收尾，不要再发起新的探索性工具调用。"
+                        f"This audit has used {used} tokens (budget {_AUDIT_TOKEN_BUDGET}). "
+                        "Wrap up with task_complete(success, summary) soon — do not start new exploratory tool calls."
                     ),
                 })
                 budget_warned = True
@@ -1756,9 +1843,9 @@ def audit(requirement):
                 messages.append({
                     "role": "system",
                     "content": (
-                        "你这一轮没调任何工具——按协议必须用 task_complete(success, summary) 显式收尾。"
-                        "如果报告已写完请 task_complete(success=true, summary=...)；"
-                        "确认无法完成请 task_complete(success=false, summary=...)。"
+                        "You did not call any tool this turn — by protocol you must terminate explicitly with task_complete(success, summary). "
+                        "If the report is done, call task_complete(success=true, summary=...); "
+                        "if you cannot continue, call task_complete(success=false, summary=...)."
                     ),
                 })
                 continue
@@ -2124,12 +2211,12 @@ def fix(test_result, plan, reason="test_failure"):
         error_info = raw
 
     if reason == "review_rejection":
-        content = f"代码审查未通过，请按以下审查意见逐条修复代码：\n\n{error_info}\n\n计划：{json.dumps(plan)}"
-        sys_role = f"{_TESTER_ROLE}\n{_get_project_rules()}你是代码审查修复助手。请严格按审查意见逐条修复，每条对应一次 replace_in_file 精确修改。不要改与审查意见无关的代码。"
+        content = f"Code review failed. Fix the code item-by-item per the review comments below:\n\n{error_info}\n\nPlan: {json.dumps(plan)}"
+        sys_role = f"{_TESTER_ROLE}\n{_get_project_rules()}You are a code-review-fix assistant. Fix strictly per the review comments — one replace_in_file precise edit per comment. Do not touch code unrelated to the review comments."
         sys_role = _append_active_prompts(sys_role)
     else:
-        content = f"测试失败！\n错误输出：\n{error_info}\n\n计划：{json.dumps(plan)}"
-        sys_role = f"{_TESTER_ROLE}\n{_get_project_rules()}你是代码修复助手。根据错误信息精准修复代码，优先使用 replace_in_file 做最小化修改，必要时才用 write_file 重写整个文件。"
+        content = f"Tests failed.\nError output:\n{error_info}\n\nPlan: {json.dumps(plan)}"
+        sys_role = f"{_TESTER_ROLE}\n{_get_project_rules()}You are a code-fix assistant. Fix the code precisely based on the error output — prefer replace_in_file for minimal changes, only use write_file to rewrite a whole file when necessary."
         sys_role = _append_active_prompts(sys_role)
 
     messages = [
@@ -2157,8 +2244,8 @@ def fix(test_result, plan, reason="test_failure"):
                 messages.append({
                     "role": "system",
                     "content": (
-                        f"⚠️ 本次 fix 累计已用 {used} tokens（预算 {_FIX_TOKEN_BUDGET}）。"
-                        "请尽快用 task_complete(success, summary) 收尾——确认无法继续就 success=false。"
+                        f"This fix has used {used} tokens (budget {_FIX_TOKEN_BUDGET}). "
+                        "Wrap up with task_complete(success, summary) soon — if you cannot continue, set success=false."
                     ),
                 })
                 budget_warned = True
@@ -2196,9 +2283,9 @@ def fix(test_result, plan, reason="test_failure"):
                 messages.append({
                     "role": "system",
                     "content": (
-                        "你这一轮没调任何工具——按协议必须用 task_complete(success, summary) 显式收尾。"
-                        "如果已修完请 task_complete(success=true, summary='做了什么')；"
-                        "确认无法继续请 task_complete(success=false, summary='为什么放弃')。"
+                        "You did not call any tool this turn — by protocol you must terminate explicitly with task_complete(success, summary). "
+                        "If the fix is done, call task_complete(success=true, summary='what was done'); "
+                        "if you cannot continue, call task_complete(success=false, summary='why giving up')."
                     ),
                 })
                 continue
@@ -2366,6 +2453,7 @@ def _run(requirement, mode):
     # 阶段1：制定计划
     console.print("阶段1：制定计划")
     plan_result = plan(requirement)
+    _apply_test_scope_override(plan_result)
     _task_log_mod._current_task_log["plan"] = plan_result.get("files", [])
     _task_log_mod._current_task_log["test_command"] = plan_result.get("test_command", "")
 
@@ -2407,6 +2495,7 @@ def _run(requirement, mode):
                     break
                 console.print(f"正在根据修改意见重新生成计划... (尝试 {retry_count + 1}/{max_retries})")
                 plan_result = plan(f"{requirement}\n\n修改意见：{user_confirm}")
+                _apply_test_scope_override(plan_result)
                 print_plan(plan_result)
                 retry_count += 1
 
@@ -2556,13 +2645,13 @@ def _auto_generate_tests(plan_result, modified_files):
 
     msgs = [
         {"role": "system", "content": f"""{_CODER_ROLE}
-你是测试生成助手。根据源代码生成最小测试文件，覆盖正常路径、边界值、异常输入三种case。
-测试文件放在 tests/ 目录下，文件名格式：test_<原文件名>.py。
-测试文件开头必须加：
+You are a test-generation assistant. Given the source code, generate a minimal test file covering three cases: normal path, boundary values, and invalid input.
+Test files go under tests/ with filename format test_<original-filename>.py.
+The test file must start with:
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-使用 write_file 工具写入测试文件，不要用其他工具。"""},
-        {"role": "user", "content": f"为以下源文件生成测试（目标文件：{test_targets}）：\n\n{combined}"}
+Use the write_file tool to write the test file — do not use other tools."""},
+        {"role": "user", "content": f"Generate tests for the following source files (target files: {test_targets}):\n\n{combined}"}
     ]
 
     rounds = 3

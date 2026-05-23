@@ -135,23 +135,25 @@ def _mk_resp(content="", tool_calls=None):
     return resp
 
 
-def test_run_subagent_returns_summary_on_task_complete(tmp_path):
-    """子 agent 调 task_complete 后返回 summary"""
+def test_run_subagent_returns_summary_on_task_complete(tmp_path, monkeypatch):
+    """子 agent 调 task_complete 后返回 summary。
+
+    Pre-existing patch bug：subagent.py:_run_subagent 用 `from llm_client import call_llm`
+    lazy import，patch agent.call_llm 不生效——必须 patch llm_client.call_llm。
+    之前真打 LLM 撞上巧合通过；P1.2 prompt 英文化后 LLM 输出变了，暴露 bug。
+    """
+    import llm_client as _lc
     with state.scoped_session(tmp_path):
         (tmp_path / "main.py").write_text("def f(): pass\n", encoding="utf-8")
 
-        orig = agent.call_llm
-        try:
-            agent.call_llm = lambda msgs, **kw: _mk_resp(
-                content="找到了",
-                tool_calls=[
-                    ("c1", "task_complete",
-                     {"success": True, "summary": "main.py:1 是入口函数 f"}),
-                ],
-            )
-            res = agent._run_subagent("找入口函数", role="explorer", max_steps=4)
-        finally:
-            agent.call_llm = orig
+        monkeypatch.setattr(_lc, "call_llm", lambda msgs, **kw: _mk_resp(
+            content="找到了",
+            tool_calls=[
+                ("c1", "task_complete",
+                 {"success": True, "summary": "main.py:1 是入口函数 f"}),
+            ],
+        ))
+        res = agent._run_subagent("找入口函数", role="explorer", max_steps=4)
 
         assert res["success"] is True
         assert res["summary"] == "main.py:1 是入口函数 f"

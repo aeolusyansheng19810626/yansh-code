@@ -64,22 +64,24 @@ def _set_in_subagent(value: bool) -> None:
 # system prompt 构建
 # ============================================================
 
-_SUBAGENT_ROLE = """【你是子 Agent（被父 agent 派发的隔离工作单元）】
-你被派发来完成一个独立子任务。**关键约束**：
-- 父 agent 看不到你的中间过程，只看到你 task_complete 的 summary——所以 summary 要凝练、信息密度高、直接回答父 agent 的任务
-- 你**不能再派子 agent**（dispatch_subagent 已禁用，递归被锁）
-- 收尾必须用 `task_complete(success, summary)`——不要沉默退出（loop 会强制截断）
+_SUBAGENT_ROLE = """[You are a Sub-Agent (an isolated work unit dispatched by a parent agent)]
+You were dispatched to complete an independent sub-task. **Key constraints**:
+- The parent agent cannot see your intermediate process — only the summary in your task_complete. So the summary must be concise, information-dense, and answer the parent's question directly
+- You **cannot dispatch further sub-agents** (dispatch_subagent is disabled; recursion is locked)
+- You must terminate with `task_complete(success, summary)` — do not exit silently (the loop will force-cut you)
 
-【输出 summary 的写法】
-- 先给"结论一句话"：父 agent 拿来直接用
-- 再列关键证据/位置：`agent.py:1620 plan_chat()` 这种可点击格式
-- 不要复读读到的整个文件——父 agent 要的是你**消化后**的结果
-- 不知道就明说（success=False, summary='xxx 找不到/无法判断'）
+[How to write the summary]
+- Lead with a one-sentence conclusion: something the parent agent can use directly
+- Then list key evidence / locations in clickable format like `agent.py:1620 plan_chat()`
+- Don't replay the whole files you read — the parent wants your **digested** result
+- If you don't know, say so plainly (success=False, summary='xxx 找不到/无法判断')
 
-【典型任务】
-- "查 X 模块怎么用的" → 给出调用方清单 + 典型用法 1-2 例
-- "找 Y 函数在哪" → 给文件路径 + 行号 + 一句话说做什么
-- "评估 Z 改动是否影响 W" → 给结论 + 涉及的文件清单
+[Typical tasks]
+- "Find out how X module is used" → give a list of callers + 1-2 typical usage examples
+- "Find where Y function is" → give file path + line number + one-sentence description
+- "Assess whether change Z affects W" → give the conclusion + list of involved files
+
+Always respond in Chinese (用户的项目规则要求中文回复); summary 字段必须中文.
 """
 
 
@@ -105,9 +107,9 @@ def _build_subagent_system_prompt(role: str) -> str:
     from tools import workspace_symbols
     sp = _SUBAGENT_ROLE + _a._get_project_rules()
     if role == "general":
-        sp += "\n\n你的 role=general：能写文件、跑命令——和主 agent 同等权限。慎用：父 agent 不知情下改代码会让父 agent 的认知失同步。"
+        sp += "\n\nYour role=general: you can write files and run commands — same permissions as the main agent. Use with care: editing code without parent's knowledge desynchronizes parent's understanding."
     else:
-        sp += f"\n\n你的 role={role}：仅只读工具——不能写文件、不能跑命令。"
+        sp += f"\n\nYour role={role}: read-only tools only — no file writes, no command execution."
     # 注入轻量顶层符号索引（top 模式，不递归）
     try:
         ws = workspace_symbols()
@@ -121,12 +123,12 @@ def _build_subagent_system_prompt(role: str) -> str:
                 lines.append(f"  {p}: {head}{extra}")
             if subdirs_map:
                 lines.append("")
-                lines.append("子目录（深挖：workspace_symbols(path='...') 或 directory_summary(path='...')）：")
+                lines.append("Sub-directories (drill in with workspace_symbols(path='...') or directory_summary(path='...')):")
                 for d, info in sorted(subdirs_map.items()):
-                    lines.append(f"  {d}/  ({info['py_files']} 个 .py / {info['total_symbols']} 个符号)")
+                    lines.append(f"  {d}/  ({info['py_files']} .py files / {info['total_symbols']} symbols)")
             sp += (
-                f"\n\nworkspace 顶层结构（{ws.get('total_files', 0)} 顶层文件 / "
-                f"{ws.get('total_symbols', 0)} 顶层符号）：\n" + "\n".join(lines)
+                f"\n\nWorkspace top-level structure ({ws.get('total_files', 0)} top-level files / "
+                f"{ws.get('total_symbols', 0)} top-level symbols):\n" + "\n".join(lines)
             )
     except Exception:
         pass

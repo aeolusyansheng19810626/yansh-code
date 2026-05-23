@@ -67,23 +67,36 @@ def detect_project_type():
     return None, None
 
 
-def _detect_python_test_cmd(ws: Path) -> str:
+def _detect_python_test_cmd(ws: Path, scope: list[str] | None = None) -> str:
+    """Return the test command for a Python project.
+
+    P1.3: when `scope` is a non-empty list of test file paths, return a pytest
+    command that targets only those files (e.g. `pytest tests/unit/test_tools.py`).
+    `scope=None` keeps the original behaviour (run the full suite).
+    `scope=[]` is treated the same as None (no inferred scope → fall back to full).
+    Tox / make-test / poetry-run / uv-run runners are unchanged when scope is set —
+    they still use full suite because their wrappers don't accept arbitrary args
+    and the cost of mis-routing is higher than the cost of running full suite.
+    """
+    scope_arg = " " + " ".join(scope) if scope else ""
+
     pyproject = ws / "pyproject.toml"
     if pyproject.exists():
         try:
             content = pyproject.read_text(encoding="utf-8")
             if "[tool.uv]" in content or (ws / "uv.lock").exists():
                 if shutil.which("uv"):
-                    return "uv run pytest"
+                    return "uv run pytest" + scope_arg
             if "[tool.poetry]" in content or (ws / "poetry.lock").exists():
                 if shutil.which("poetry"):
-                    return "poetry run pytest"
+                    return "poetry run pytest" + scope_arg
             if "[tool.pytest" in content or "[pytest]" in content:
-                return "pytest"
+                return "pytest" + scope_arg
         except Exception:
             pass
 
     if (ws / "tox.ini").exists() and shutil.which("tox"):
+        # tox 包装器对参数不敏感且与 testenv 配置耦合，scope 不注入
         return "tox"
 
     makefile = ws / "Makefile"
@@ -91,13 +104,14 @@ def _detect_python_test_cmd(ws: Path) -> str:
         try:
             mk = makefile.read_text(encoding="utf-8", errors="replace")
             if "test:" in mk or "test :" in mk:
+                # make test 同样是包装器，scope 不注入
                 return "make test"
         except Exception:
             pass
 
     if shutil.which("pytest"):
-        return "pytest"
-    return "python -m pytest"
+        return "pytest" + scope_arg
+    return "python -m pytest" + scope_arg
 
 
 def _detect_node_test_cmd(ws: Path) -> str:
