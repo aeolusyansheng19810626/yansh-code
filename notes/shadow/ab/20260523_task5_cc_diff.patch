@@ -1,0 +1,674 @@
+diff --git a/agent.py b/agent.py
+index 57de1e1..ec1cc25 100644
+--- a/agent.py
++++ b/agent.py
+@@ -1228,7 +1228,7 @@ def _dispatch_tool_call_inner(tool_call, args, *, mode="auto", allow_hil=True,
+         try:
+             result = readonly_handlers[name](**args)
+         except Exception as e:
+-            result = _tools_mod._err("internal", f"工具调用异常: {e}")
++            result = _tools_mod._err("internal", f"工具调用异常: {e}", tool=name)
+         return {"name": name, "args": args, "id": tool_call.id, "result": result}
+ 
+     # P2 #10 MCP 路由：mcp__<server>__<tool> 转发到对应 server
+@@ -1236,11 +1236,11 @@ def _dispatch_tool_call_inner(tool_call, args, *, mode="auto", allow_hil=True,
+         try:
+             result = _mcp_mod.call_tool(name, args)
+         except Exception as e:
+-            result = _tools_mod._err("internal", f"MCP 工具调用异常: {e}")
++            result = _tools_mod._err("internal", f"MCP 工具调用异常: {e}", tool=name)
+         return {"name": name, "args": args, "id": tool_call.id, "result": result}
+ 
+     return {"name": name, "args": args, "id": tool_call.id,
+-            "result": _tools_mod._err("invalid_args", f"未预期的工具: {name}")}
++            "result": _tools_mod._err("invalid_args", f"未预期的工具: {name}", tool=name)}
+ 
+ 
+ def _record_dispatch(out: dict, msgs: list):
+@@ -1302,7 +1302,7 @@ def _dispatch_tool_calls(tool_calls, *, mode, allow_hil, allow_confirm, snap, me
+                     outs[idx] = {
+                         "name": tool_calls[idx].function.name,
+                         "args": {}, "id": tool_calls[idx].id,
+-                        "result": _tools_mod._err("internal", f"并发 dispatch 异常: {e}"),
++                        "result": _tools_mod._err("internal", f"并发 dispatch 异常: {e}", tool=tool_calls[idx].function.name),
+                     }
+ 
+     # 串行处理剩余（含单个 subagent 的情况、所有非 subagent 工具）
+diff --git a/subagent.py b/subagent.py
+index fcba34b..3acd226 100644
+--- a/subagent.py
++++ b/subagent.py
+@@ -294,7 +294,7 @@ def _subagent_handler(task: Optional[str] = None, role: str = "explorer",
+     返回轻量 dict 给父 agent 当作 tool result（不暴露子 agent 内部 messages）。"""
+     import tools as _tools_mod
+     if not task:
+-        return _tools_mod._err("invalid_args", "dispatch_subagent 需要 task 参数")
++        return _tools_mod._err("invalid_args", "dispatch_subagent 需要 task 参数", tool="dispatch_subagent")
+     res = _run_subagent(task, role=role, max_steps=max_steps)
+     console.print(
+         f"[subagent/{res['role']}] {res['steps']} 步 → "
+diff --git a/tests/unit/test_tools.py b/tests/unit/test_tools.py
+index 14a11c4..015a439 100644
+--- a/tests/unit/test_tools.py
++++ b/tests/unit/test_tools.py
+@@ -435,8 +435,8 @@ def test_task_complete_returns_sentinel():
+ 
+ 
+ def test_err_helper_attaches_error_kind():
+-    """_err(kind, msg) 返回含 error 和 error_kind"""
+-    e = _err("permission", "blocked")
++    """_err(kind, msg, tool) 返回含 error 和 error_kind"""
++    e = _err("permission", "blocked", tool="write_file")
+     assert e["error"] == "blocked"
+     assert e["error_kind"] == "permission"
+     assert e["error_kind"] in ERROR_KINDS
+@@ -445,7 +445,15 @@ def test_err_helper_attaches_error_kind():
+ def test_err_helper_rejects_unknown_kind():
+     """未知 kind 触发 assert"""
+     with pytest.raises(AssertionError):
+-        _err("nonexistent_kind", "x")
++        _err("nonexistent_kind", "x", tool="write_file")
++
++
++def test_err_includes_tool_field():
++    """_err 返回的 dict 必须含 'tool' 字段，用于错误溯源"""
++    result = _err("not_found", "missing", tool="read_file")
++    assert result["tool"] == "read_file"
++    assert result["error"] == "missing"
++    assert result["error_kind"] == "not_found"
+ 
+ 
+ def test_error_kind_write_file_path_traversal():
+diff --git a/tools.py b/tools.py
+index cec33a5..1e82e45 100644
+--- a/tools.py
++++ b/tools.py
+@@ -22,11 +22,12 @@ ERROR_KINDS = frozenset({
+ })
+ 
+ 
+-def _err(kind: str, msg: str, **extra) -> dict:
+-    """统一错误构造：保留 'error' 键兼容老调用方，新增 'error_kind'。
++def _err(kind: str, msg: str, tool: str, **extra) -> dict:
++    """统一错误构造：保留 'error' 键兼容老调用方，新增 'error_kind' 和 'tool'。
++    tool 用于错误溯源（哪个工具产生的）。
+     extra 用于附加 returncode/stdout/stderr 之类的辅助字段。"""
+     assert kind in ERROR_KINDS, f"unknown error_kind: {kind}"
+-    out = {"error": msg, "error_kind": kind}
++    out = {"error": msg, "error_kind": kind, "tool": tool}
+     if extra:
+         out.update(extra)
+     return out
+@@ -193,31 +194,32 @@ _CONFIRM_PATTERNS = [
+     (r"^git\s+reset\b",                "git reset"),
+ ]
+ 
+-def _validate_path(filename):
++def _validate_path(filename, tool: str = "_validate_path"):
+     """校验 filename 是否合法（非绝对路径、非越界、无符号链接逃逸）。
+-    返回 (resolved_path, None) 或 (None, error_dict)。"""
++    返回 (resolved_path, None) 或 (None, error_dict)。
++    tool 透传给 _err 用于错误溯源。"""
+     p = Path(filename)
+     if p.is_absolute():
+-        return None, _err("permission", "路径越界：不允许访问workspace外的文件")
++        return None, _err("permission", "路径越界：不允许访问workspace外的文件", tool=tool)
+     if ".." in p.parts:
+-        return None, _err("permission", "路径越界：不允许访问workspace外的文件")
++        return None, _err("permission", "路径越界：不允许访问workspace外的文件", tool=tool)
+     candidate = (_WORKSPACE_ROOT / p).resolve()
+     if not candidate.is_relative_to(_WORKSPACE_ROOT):
+-        return None, _err("permission", "路径越界：不允许访问workspace外的文件")
++        return None, _err("permission", "路径越界：不允许访问workspace外的文件", tool=tool)
+     return candidate, None
+ 
+-def _check_dangerous(command):
++def _check_dangerous(command, tool: str = "execute_command"):
+     """检查命令是否包含危险模式。返回 None 表示安全，否则返回 error_dict。"""
+     for pattern, label in _DANGEROUS_PATTERNS:
+         if re.search(pattern, command, re.IGNORECASE | re.DOTALL):
+             _con().print(f"[安全拦截] 检测到危险命令：{label}", highlight=False)
+             return _err("security", f"安全拦截：检测到危险命令（{label}），已阻止执行",
+-                        returncode=-2, stdout="", stderr="")
++                        tool=tool, returncode=-2, stdout="", stderr="")
+     return None
+ 
+ def write_file(filename, content):
+     """在workspace目录下写入文件"""
+-    resolved, err = _validate_path(filename)
++    resolved, err = _validate_path(filename, tool="write_file")
+     if err:
+         return err
+     os.makedirs(_get_workspace(), exist_ok=True)
+@@ -227,22 +229,22 @@ def write_file(filename, content):
+         _invalidate_ast_cache(resolved)
+         return {"success": f"文件 {filename} 写入成功"}
+     except Exception as e:
+-        return _err("internal", str(e))
++        return _err("internal", str(e), tool="write_file")
+ 
+ def read_file(filename, offset=None, limit=None, max_bytes=None):
+     """读取workspace目录下的文件。
+     可选 offset/limit 按行截取（offset 1-based 起始行；limit 行数上限）。
+     可选 max_bytes 限制读取的字节数；超过时截断内容并在返回 dict 中加入 truncated=True。
+     无截取参数时返回整个文件，行为与原版相同。"""
+-    resolved, err = _validate_path(filename)
++    resolved, err = _validate_path(filename, tool="read_file")
+     if err:
+         return err
+     try:
+         text = resolved.read_text(encoding='utf-8')
+     except FileNotFoundError:
+-        return _err("not_found", f"文件 {filename} 不存在")
++        return _err("not_found", f"文件 {filename} 不存在", tool="read_file")
+     except Exception as e:
+-        return _err("internal", str(e))
++        return _err("internal", str(e), tool="read_file")
+ 
+     # max_bytes 截断处理（在行切片之前）
+     truncated = False
+@@ -274,7 +276,7 @@ def read_file(filename, offset=None, limit=None, max_bytes=None):
+ def execute_command(command):
+     """在workspace目录下执行命令，30秒超时，三级命令策略（deny/safe/confirm）"""
+     # Level 1: deny
+-    danger = _check_dangerous(command)
++    danger = _check_dangerous(command, tool="execute_command")
+     if danger:
+         return danger
+ 
+@@ -294,7 +296,7 @@ def execute_command(command):
+         )
+         if _BATCH_MODE and _BATCH_STRICT:
+             _con().print(f"[batch-strict] 拒绝执行: {label} -> {command}", highlight=False)
+-            return _err("security", f"批处理严格模式拒绝执行: {label}", returncode=-1, stdout="", stderr="")
++            return _err("security", f"批处理严格模式拒绝执行: {label}", tool="execute_command", returncode=-1, stdout="", stderr="")
+         if _BATCH_MODE:
+             _con().print(f"[batch] 自动确认执行 ({label}): {command}", highlight=False)
+         else:
+@@ -305,7 +307,7 @@ def execute_command(command):
+             except EOFError:
+                 answer = "n"
+             if answer != "y":
+-                return _err("security", "用户取消执行", returncode=-1, stdout="", stderr="")
++                return _err("security", "用户取消执行", tool="execute_command", returncode=-1, stdout="", stderr="")
+ 
+     import threading
+     # P1 #6：opt-in 沙箱——若启用，把命令包成 docker run 形态；默认禁用，行为不变
+@@ -363,11 +365,11 @@ def execute_command(command):
+                 except subprocess.TimeoutExpired:
+                     if time.time() - start_time > 30:
+                         process.kill()
+-                        return _err("timeout", "命令执行超时（30秒）")
++                        return _err("timeout", "命令执行超时（30秒）", tool="execute_command")
+         except interrupt.Interrupted:
+             raise
+         except Exception as e:
+-            return _err("internal", str(e))
++            return _err("internal", str(e), tool="execute_command")
+ 
+         t_out.join()
+         t_err.join()
+@@ -378,43 +380,43 @@ def execute_command(command):
+             "returncode": process.returncode
+         }
+     except Exception as e:
+-        return _err("internal", str(e))
++        return _err("internal", str(e), tool="execute_command")
+ 
+ def delete_file(filename):
+     """删除workspace目录下的文件"""
+-    resolved, err = _validate_path(filename)
++    resolved, err = _validate_path(filename, tool="delete_file")
+     if err:
+         return err
+     try:
+         resolved.unlink()
+         return {"success": f"文件 {filename} 删除成功"}
+     except FileNotFoundError:
+-        return _err("not_found", f"文件 {filename} 不存在")
++        return _err("not_found", f"文件 {filename} 不存在", tool="delete_file")
+     except Exception as e:
+-        return _err("internal", str(e))
++        return _err("internal", str(e), tool="delete_file")
+ 
+ def replace_in_file(filename, old_str, new_str):
+     """在workspace文件中精确替换字符串。old_str必须唯一匹配，否则返回错误"""
+-    resolved, err = _validate_path(filename)
++    resolved, err = _validate_path(filename, tool="replace_in_file")
+     if err:
+         return err
+ 
+     try:
+         content = resolved.read_text(encoding='utf-8')
+     except FileNotFoundError:
+-        return _err("not_found", f"文件 {filename} 不存在")
++        return _err("not_found", f"文件 {filename} 不存在", tool="replace_in_file")
+     except Exception as e:
+-        return _err("internal", str(e))
++        return _err("internal", str(e), tool="replace_in_file")
+ 
+     count = content.count(old_str)
+     if count == 0:
+-        return _err("not_found", f"在 {filename} 中未找到要替换的字符串")
++        return _err("not_found", f"在 {filename} 中未找到要替换的字符串", tool="replace_in_file")
+     if count > 1:
+         return _err("invalid_args", (
+             f"在 {filename} 中找到 {count} 处匹配，需唯一匹配。"
+             "请在 old_str 中增加上下文行（前后多带几行代码）以确保唯一；"
+             "或改用 replace_symbol 按函数/类名整体替换。"
+-        ))
++        ), tool="replace_in_file")
+ 
+     content = content.replace(old_str, new_str, 1)
+     try:
+@@ -427,7 +429,7 @@ def replace_in_file(filename, old_str, new_str):
+             "new_str": new_str
+         }
+     except Exception as e:
+-        return _err("internal", str(e))
++        return _err("internal", str(e), tool="replace_in_file")
+ 
+ def _get_ignore_spec():
+     import pathspec
+@@ -464,15 +466,15 @@ def move_file(src, dst):
+     - src不存在返回错误
+     - 路径越界返回错误
+     """
+-    src_path, err = _validate_path(src)
++    src_path, err = _validate_path(src, tool="move_file")
+     if err:
+         return err
+-    dst_path, err = _validate_path(dst)
++    dst_path, err = _validate_path(dst, tool="move_file")
+     if err:
+         return err
+ 
+     if not src_path.exists():
+-        return _err("not_found", f"Source file {src} does not exist")
++        return _err("not_found", f"Source file {src} does not exist", tool="move_file")
+ 
+     # Create dst parent directory
+     dst_path.parent.mkdir(parents=True, exist_ok=True)
+@@ -482,7 +484,7 @@ def move_file(src, dst):
+         shutil.move(str(src_path), str(dst_path))
+         return {"success": f"File moved from {src} to {dst} successfully"}
+     except Exception as e:
+-        return _err("internal", str(e))
++        return _err("internal", str(e), tool="move_file")
+ 
+ def search_in_files(pattern, workspace=None, regex=False, extensions=None):
+     """在workspace目录下搜索文件内容
+@@ -509,9 +511,9 @@ def search_in_files(pattern, workspace=None, regex=False, extensions=None):
+     
+     try:
+         if not abs_search_path.is_relative_to(abs_workspace):
+-            return _err("permission", "Search path exceeds workspace directory")
++            return _err("permission", "Search path exceeds workspace directory", tool="search_in_files")
+     except ValueError:
+-        return _err("permission", "Search path exceeds workspace directory")
++        return _err("permission", "Search path exceeds workspace directory", tool="search_in_files")
+     
+     matches = []
+     spec = _get_ignore_spec()
+@@ -564,7 +566,7 @@ def search_in_files(pattern, workspace=None, regex=False, extensions=None):
+ def get_symbol_definition(symbol_name, file_path=None):
+     """用 tree-sitter 精确查找函数或类定义，返回文件、行号、完整代码。
+     file_path 可选；不填则搜索整个 workspace 的 .py 文件。"""
+-    parser, err = _load_ts_parser()
++    parser, err = _load_ts_parser(tool="get_symbol_definition")
+     if err:
+         return err
+ 
+@@ -604,7 +606,7 @@ def get_symbol_definition(symbol_name, file_path=None):
+ 
+     results = []
+     if file_path:
+-        resolved, err = _validate_path(file_path)
++        resolved, err = _validate_path(file_path, tool="get_symbol_definition")
+         if err:
+             return err
+         results = _search_file(resolved)
+@@ -615,7 +617,7 @@ def get_symbol_definition(symbol_name, file_path=None):
+             results.extend(_search_file(py_file))
+ 
+     if not results:
+-        return _err("not_found", f"未找到符号 '{symbol_name}'")
++        return _err("not_found", f"未找到符号 '{symbol_name}'", tool="get_symbol_definition")
+     return {"matches": results, "total": len(results)}
+ 
+ def apply_patch(patch_text, file_path=None):
+@@ -634,18 +636,18 @@ def apply_patch(patch_text, file_path=None):
+                 file_path = path
+                 break
+         if file_path is None:
+-            return _err("invalid_args", "无法从 patch 推断目标文件路径，请指定 file_path")
++            return _err("invalid_args", "无法从 patch 推断目标文件路径，请指定 file_path", tool="apply_patch")
+ 
+-    resolved, err = _validate_path(file_path)
++    resolved, err = _validate_path(file_path, tool="apply_patch")
+     if err:
+         return err
+ 
+     try:
+         file_lines = resolved.read_text(encoding='utf-8').splitlines(keepends=True)
+     except FileNotFoundError:
+-        return _err("not_found", f"文件 {file_path} 不存在")
++        return _err("not_found", f"文件 {file_path} 不存在", tool="apply_patch")
+     except Exception as e:
+-        return _err("internal", str(e))
++        return _err("internal", str(e), tool="apply_patch")
+ 
+     hunk_re = re.compile(r'^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@')
+     hunks = []
+@@ -656,11 +658,11 @@ def apply_patch(patch_text, file_path=None):
+         if m:
+             old_start = int(m.group(1))
+             if old_start < 1:
+-                return _err("invalid_args", f"补丁行号不合法: 行号 {old_start} < 1")
++                return _err("invalid_args", f"补丁行号不合法: 行号 {old_start} < 1", tool="apply_patch")
+             if old_start > len(file_lines):
+-                return _err("invalid_args", f"补丁行号不合法: 起始行号 {old_start} > 文件总行数 {len(file_lines)}")
++                return _err("invalid_args", f"补丁行号不合法: 起始行号 {old_start} > 文件总行数 {len(file_lines)}", tool="apply_patch")
+             if m.group(2) and old_start > int(m.group(2)):
+-                return _err("invalid_args", f"补丁行号不合法: start ({old_start}) > end ({int(m.group(2))})")
++                return _err("invalid_args", f"补丁行号不合法: start ({old_start}) > end ({int(m.group(2))})", tool="apply_patch")
+ 
+             if current is not None:
+                 hunks.append(current)
+@@ -675,7 +677,7 @@ def apply_patch(patch_text, file_path=None):
+         hunks.append(current)
+ 
+     if not hunks:
+-        return _err("invalid_args", "patch 中未找到有效的 hunk")
++        return _err("invalid_args", "patch 中未找到有效的 hunk", tool="apply_patch")
+ 
+     result = list(file_lines)
+     offset = 0  # 已应用 hunk 导致的行号偏移
+@@ -699,7 +701,7 @@ def apply_patch(patch_text, file_path=None):
+         _invalidate_ast_cache(resolved)
+         return {"success": f"patch 应用成功: {file_path}"}
+     except Exception as e:
+-        return _err("internal", str(e))
++        return _err("internal", str(e), tool="apply_patch")
+ 
+ 
+ # ---------- #41 符号级编辑 ----------
+@@ -715,8 +717,9 @@ _AST_CACHE: dict = {}
+ _TS_PARSER_LOCK = threading.Lock()
+ 
+ 
+-def _load_ts_parser():
+-    """返回 (parser, error_dict)。parser 跨调用复用，init 加锁防多线程同时 init。"""
++def _load_ts_parser(tool: str = "_load_ts_parser"):
++    """返回 (parser, error_dict)。parser 跨调用复用，init 加锁防多线程同时 init。
++    tool 透传给 _err 用于错误溯源。"""
+     global _TS_PARSER
+     if _TS_PARSER is not None:
+         return _TS_PARSER, None
+@@ -731,7 +734,7 @@ def _load_ts_parser():
+             _TS_PARSER = Parser(py_lang)
+             return _TS_PARSER, None
+         except ImportError:
+-            return None, _err("internal", "tree-sitter 未安装，请运行: pip install tree-sitter tree-sitter-python")
++            return None, _err("internal", "tree-sitter 未安装，请运行: pip install tree-sitter tree-sitter-python", tool=tool)
+ 
+ 
+ def _ts_parse_locked(parser, src_bytes):
+@@ -745,19 +748,20 @@ def _invalidate_ast_cache(abs_path):
+     _AST_CACHE.pop(str(abs_path), None)
+ 
+ 
+-def _parse_symbols_cached(abs_path):
++def _parse_symbols_cached(abs_path, tool: str = "_parse_symbols_cached"):
+     """按 mtime 命中 _AST_CACHE；未命中则 parse 并写缓存。
+     返回 (symbols_list, error_dict)；error_dict 为 None 表示成功。
+-    symbols_list 元素：{name, type, line}，仅函数和类。"""
+-    parser, err = _load_ts_parser()
++    symbols_list 元素：{name, type, line}，仅函数和类。
++    tool 透传给 _err 用于错误溯源。"""
++    parser, err = _load_ts_parser(tool=tool)
+     if err:
+         return None, err
+     try:
+         mtime = abs_path.stat().st_mtime
+     except FileNotFoundError as e:
+-        return None, _err("not_found", str(e))
++        return None, _err("not_found", str(e), tool=tool)
+     except Exception as e:
+-        return None, _err("internal", str(e))
++        return None, _err("internal", str(e), tool=tool)
+ 
+     key = str(abs_path)
+     cached = _AST_CACHE.get(key)
+@@ -767,9 +771,9 @@ def _parse_symbols_cached(abs_path):
+     try:
+         src_bytes = abs_path.read_bytes()
+     except FileNotFoundError as e:
+-        return None, _err("not_found", str(e))
++        return None, _err("not_found", str(e), tool=tool)
+     except Exception as e:
+-        return None, _err("internal", str(e))
++        return None, _err("internal", str(e), tool=tool)
+ 
+     tree = _ts_parse_locked(parser, src_bytes)
+     symbols = []
+@@ -794,10 +798,10 @@ def _parse_symbols_cached(abs_path):
+ 
+ def list_symbols(file_path):
+     """列出文件中所有函数和类，返回 name/type/line 列表"""
+-    resolved, err = _validate_path(file_path)
++    resolved, err = _validate_path(file_path, tool="list_symbols")
+     if err:
+         return err
+-    symbols, err = _parse_symbols_cached(resolved)
++    symbols, err = _parse_symbols_cached(resolved, tool="list_symbols")
+     if err:
+         return err
+     return {"symbols": symbols, "total": len(symbols)}
+@@ -806,19 +810,19 @@ def list_symbols(file_path):
+ def replace_symbol(symbol_name, new_code, file_path):
+     """用 tree-sitter 定位符号起止行，整体替换其实现"""
+     import textwrap
+-    parser, err = _load_ts_parser()
++    parser, err = _load_ts_parser(tool="replace_symbol")
+     if err:
+         return err
+-    resolved, err = _validate_path(file_path)
++    resolved, err = _validate_path(file_path, tool="replace_symbol")
+     if err:
+         return err
+     try:
+         src_bytes = resolved.read_bytes()
+         content = resolved.read_text(encoding="utf-8")
+     except FileNotFoundError as e:
+-        return _err("not_found", str(e))
++        return _err("not_found", str(e), tool="replace_symbol")
+     except Exception as e:
+-        return _err("internal", str(e))
++        return _err("internal", str(e), tool="replace_symbol")
+ 
+     tree = _ts_parse_locked(parser, src_bytes)
+ 
+@@ -842,7 +846,7 @@ def replace_symbol(symbol_name, new_code, file_path):
+ 
+     target = _find(tree.root_node)
+     if target is None:
+-        return _err("not_found", f"未找到符号 '{symbol_name}'")
++        return _err("not_found", f"未找到符号 '{symbol_name}'", tool="replace_symbol")
+ 
+     start_line = target.start_point[0]   # 0-based
+     end_line   = target.end_point[0]     # 0-based, inclusive
+@@ -876,7 +880,7 @@ def replace_symbol(symbol_name, new_code, file_path):
+             "lines_replaced": end_line - start_line + 1,
+         }
+     except Exception as e:
+-        return _err("internal", str(e))
++        return _err("internal", str(e), tool="replace_symbol")
+ 
+ _WORKSPACE_SYMBOLS_IGNORE = {".git", ".yansh", "__pycache__", "node_modules", "venv", ".venv", ".pytest_cache"}
+ 
+@@ -895,7 +899,7 @@ def _dir_symbol_count(dirpath: Path, exts: tuple) -> tuple:
+         if not f.name.endswith(exts):
+             continue
+         py_files += 1
+-        symbols, err = _parse_symbols_cached(f)
++        symbols, err = _parse_symbols_cached(f, tool="workspace_symbols")
+         if err:
+             continue
+         total_symbols += len(symbols)
+@@ -917,13 +921,13 @@ def workspace_symbols(extensions=None, path=None, recursive=False):
+ 
+     # 解析 path 参数：相对 workspace；越界拦截
+     if path:
+-        resolved, err = _validate_path(path)
++        resolved, err = _validate_path(path, tool="workspace_symbols")
+         if err:
+             return err
+         if not resolved.exists():
+-            return _err("not_found", f"目录不存在：{path}")
++            return _err("not_found", f"目录不存在：{path}", tool="workspace_symbols")
+         if not resolved.is_dir():
+-            return _err("invalid_args", f"path 不是目录：{path}")
++            return _err("invalid_args", f"path 不是目录：{path}", tool="workspace_symbols")
+         scan_root = resolved
+         rel_base = path.rstrip("/").rstrip("\\")
+     else:
+@@ -941,7 +945,7 @@ def workspace_symbols(extensions=None, path=None, recursive=False):
+                 continue
+             if not f.name.endswith(exts):
+                 continue
+-            symbols, err = _parse_symbols_cached(f)
++            symbols, err = _parse_symbols_cached(f, tool="workspace_symbols")
+             if err:
+                 if "tree-sitter 未安装" in err.get("error", ""):
+                     return err
+@@ -964,7 +968,7 @@ def workspace_symbols(extensions=None, path=None, recursive=False):
+     try:
+         entries = list(scan_root.iterdir())
+     except OSError as e:
+-        return _err("internal", f"读取目录失败：{e}")
++        return _err("internal", f"读取目录失败：{e}", tool="workspace_symbols")
+ 
+     for entry in entries:
+         if entry.name in _WORKSPACE_SYMBOLS_IGNORE:
+@@ -972,7 +976,7 @@ def workspace_symbols(extensions=None, path=None, recursive=False):
+         if entry.is_file():
+             if not entry.name.endswith(exts):
+                 continue
+-            symbols, err = _parse_symbols_cached(entry)
++            symbols, err = _parse_symbols_cached(entry, tool="workspace_symbols")
+             if err:
+                 if "tree-sitter 未安装" in err.get("error", ""):
+                     return err
+@@ -1011,19 +1015,19 @@ def directory_summary(path="."):
+     不递归——只看直接子项。用于 LLM 在大项目里快速了解某目录是干啥的。"""
+     ws_root = Path(_get_workspace())
+     if not ws_root.exists():
+-        return _err("not_found", f"workspace 不存在：{ws_root}")
++        return _err("not_found", f"workspace 不存在：{ws_root}", tool="directory_summary")
+ 
+     if path in (".", ""):
+         target = ws_root
+         rel_base = "."
+     else:
+-        resolved, err = _validate_path(path)
++        resolved, err = _validate_path(path, tool="directory_summary")
+         if err:
+             return err
+         if not resolved.exists():
+-            return _err("not_found", f"目录不存在：{path}")
++            return _err("not_found", f"目录不存在：{path}", tool="directory_summary")
+         if not resolved.is_dir():
+-            return _err("invalid_args", f"path 不是目录：{path}")
++            return _err("invalid_args", f"path 不是目录：{path}", tool="directory_summary")
+         target = resolved
+         rel_base = path.rstrip("/").rstrip("\\").replace("\\", "/")
+ 
+@@ -1037,7 +1041,7 @@ def directory_summary(path="."):
+     try:
+         entries = sorted(target.iterdir(), key=lambda e: e.name)
+     except OSError as e:
+-        return _err("internal", f"读取目录失败：{e}")
++        return _err("internal", f"读取目录失败：{e}", tool="directory_summary")
+ 
+     for entry in entries:
+         if entry.name in _WORKSPACE_SYMBOLS_IGNORE:
+@@ -1082,10 +1086,10 @@ def fetch_webpage(url):
+         # 网络/HTTP 类错误一律视为 transient，让 LLM 自行决定 retry
+         msg = str(e).lower()
+         if "timeout" in msg or "timed out" in msg:
+-            return _err("timeout", str(e))
++            return _err("timeout", str(e), tool="fetch_webpage")
+         if "invalid url" in msg or "missing schema" in msg or "no host" in msg:
+-            return _err("invalid_args", str(e))
+-        return _err("transient", str(e))
++            return _err("invalid_args", str(e), tool="fetch_webpage")
++        return _err("transient", str(e), tool="fetch_webpage")
+ 
+ def search_docs(query):
+     """搜索文档，优先使用 ddgs（duckduckgo_search 新包名），返回前3条结果的标题+摘要+URL"""
+@@ -1155,7 +1159,7 @@ def append_to_file(filename, content):
+     - 路径校验（不能越出workspace）
+     - 写入前自动补一个换行符，避免和原有内容粘连
+     """
+-    resolved, err = _validate_path(filename)
++    resolved, err = _validate_path(filename, tool="append_to_file")
+     if err:
+         return err
+     try:
+@@ -1171,14 +1175,14 @@ def append_to_file(filename, content):
+         _invalidate_ast_cache(resolved)
+         return {"success": f"文件 {filename} 追加成功"}
+     except Exception as e:
+-        return _err("internal", str(e))
++        return _err("internal", str(e), tool="append_to_file")
+ 
+ 
+ def glob_files(pattern, path="."):
+     """在 workspace 内按 glob 模式匹配文件路径，遵循 .gitignore。
+     pattern 同时匹配相对路径（如 'src/**/*.py'）和裸文件名（如 '*.py'）。"""
+     import fnmatch
+-    resolved_root, err = _validate_path(path)
++    resolved_root, err = _validate_path(path, tool="glob_files")
+     if err:
+         return err
+     spec = _get_ignore_spec()
+@@ -1223,17 +1227,17 @@ def git_diff(path=None, staged=False):
+     if staged:
+         args.append("--cached")
+     if path:
+-        resolved, err = _validate_path(path)
++        resolved, err = _validate_path(path, tool="git_diff")
+         if err:
+             return err
+         try:
+             rel = str(resolved.relative_to(_WORKSPACE_ROOT)).replace("\\", "/")
+         except ValueError:
+-            return _err("permission", "path 越界")
++            return _err("permission", "path 越界", tool="git_diff")
+         args.append(rel)
+     rc, stdout, stderr = _git_run_ws(args, timeout=15)
+     if rc != 0 and not stdout:
+-        return _err("invalid_args", stderr.strip() or "git diff 失败（非 git 仓库？）")
++        return _err("invalid_args", stderr.strip() or "git diff 失败（非 git 仓库？）", tool="git_diff")
+     truncated = len(stdout) > 20000
+     return {"diff": stdout[:20000], "truncated": truncated}
+ 
+@@ -1242,7 +1246,7 @@ def git_log(limit=10):
+     """git log --oneline -n <limit>"""
+     rc, stdout, stderr = _git_run_ws(["log", "--oneline", f"-{int(limit)}"], timeout=10)
+     if rc != 0:
+-        return _err("invalid_args", stderr.strip() or "git log 失败")
++        return _err("invalid_args", stderr.strip() or "git log 失败", tool="git_log")
+     return {"log": stdout}
+ 
+ 
+@@ -1254,7 +1258,7 @@ def find_references(symbol, path="."):
+     from pathlib import Path
+     import re
+ 
+-    resolved_root, err = _validate_path(path)
++    resolved_root, err = _validate_path(path, tool="find_references")
+     if err:
+         return err
+ 
