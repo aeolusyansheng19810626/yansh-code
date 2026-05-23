@@ -1,0 +1,220 @@
+[Agent: Auditor]
+审计轮 1: 3 次工具调用
+审计轮 1  3 个子 agent 同时启动
+[预算] audit token 增量 706417 > 120000，提醒 LLM 收尾
+审计轮 2: 1 次工具调用
+审计完成（task_complete: 成功）：审计完成：评估了将 task_complete sentinel 
+工具改为 NL 信号的可行性。识别出 4 文件 8 处核心改动点，3 个严重风险（LLM 
+误触发、parser 漏检、success/failure 语义丢失），2 个中等风险（子 agent 
+双重覆盖、prompt 
+工程耦合）。结论：不推荐，工具协议在此场景是严格更优选择，改动范围大收益为零。
+
+三个子 agent 返回了完整的架构图谱，现在可以综合输出报告。
+
+---
+
+# 方案评估：将 `task_complete` 从 Sentinel 工具改为自然语言信号
+
+## 总览
+
+yansh-code 的 agent 终止机制目前完全依赖**结构化 sentinel 模式**：LLM 调用 
+`task_complete` 工具 → 工具函数返回 `{"_task_complete": True, ...}` dict → 
+各个循环层通过 `out["result"].get("_task_complete")` 
+检测并退出。待评估方案是去掉这个工具，改用 regex 检测 LLM 输出文本中的 `TASK 
+COMPLETE: <summary>` 字样。
+
+---
+
+## 一、改动范围
+
+### 1.1 需要修改的核心文件与函数
+
+| 文件 | 函数 / 位置 | 当前依赖 | 需要改动 |
+|---|---|---|---|
+| `tools.py:35-47` | `task_complete()` 定义 | 返回 sentinel dict | 
+**删除或保留为 no-op** |
+| `tools_schema.py:~L404` | task_complete JSON Schema | 暴露给 LLM 的工具声明 |
+**从 schema 中移除** |
+| `agent.py:1041-1044` | `_dispatch_tool_call()` | 透传 sentinel dict | **移除 
+task_complete 分支** |
+| `agent.py:1616-1630` | `code()` inner loop | 
+`out["result"].get("_task_complete")` | **改为检测 LLM 文本** |
+| `agent.py:1736-1750` | `audit()` loop | 同上 | **改为检测 LLM 文本** |
+| `agent.py:2184-2191` | `fix()` loop | 同上 | **改为检测 LLM 文本** |
+| `subagent.py:221` | `_run_subagent()` tool loop | `out["name"] == 
+"task_complete"` | **改为文本检测** |
+| `task_log.py:85-89` | `finish_task_log()` | 接收 `task_complete_signal` 参数 
+| **信号来源需改变** |
+
+**合计：4 个文件，8 处核心改动点**，所有退出路径都在 `agent.py` 
+的三个子循环（`code`、`audit`、`fix`）和 `subagent.py` 中，没有分散在 
+`main.py`（main.py 只显示最终结果，不做退出判断）。
+
+### 1.2 新增的 parser 组件
+
+每个需要检测退出信号的循环（至少 4 处）都需要插入类似的逻辑：
+
+```
+对每轮 LLM 响应的 message.content 做 regex 扫描
+模式: r'TASK 
+COMPLETE[:\s]+(?P<success>SUCCESS|FAILURE|TRUE|FALSE)\s*[:\-]\s*(?P<summary>.+)
+'
+或者: 末尾一行 'TASK COMPLETE: <summary>'
+```
+
+且需要区分 
+`success=True/False`，这意味着格式必须承载布尔语义，复杂度不低于工具调用本身。
+
+---
+
+## 二、与现有机制的兼容性分析
+
+### 2.1 `fix` loop（`agent.py:2184-2208`）
+
+**当前已有"沉默退出兜底"逻辑**：LLM 一轮未调用任何工具时，fix loop 
+会追问一次，要求显式调用 
+task_complete；第二次仍沉默才判定失败退出。这个兜底路径在新方案下需要**改为检测
+追问回复中的自然语言信号**，且两种沉默（真沉默 vs. 
+只输出文本未输出工具调用）会合并为同一路径，区分难度上升。
+
+### 2.2 `audit` loop（`agent.py:1736-1762`）
+
+同样有追问兜底。`audit()` 返回值中的 `task_complete_signal` 字段被 `run()` 
+的多处出口（`agent.py:2361, 2438, 2477, 2491, 2506, 2513, 2528`）读取并传入 
+`finish_task_log()`。
+
+新方案需确保：
+- 从 LLM 文本中提取出来的 `{success, summary}` 能填充同等语义的结构
+- `finish_task_log(task_complete_signal=...)` 的调用协议不变
+- `task_log.py:138` 的 `show_recent_logs()` 展示 `TC:ok/give-up` 标签，依赖 
+`task_complete_signal.success` 字段——**字段格式必须向后兼容**
+
+### 2.3 `dispatch_subagent`（`subagent.py:221`）
+
+这是**最高风险兼容点**。当前 `_run_subagent()` 通过 `out["name"] == 
+"task_complete"` 在工具调用结构中精确匹配，不依赖 LLM 文本内容。
+
+改为自然语言信号后：
+- 子 agent 的 LLM 响应文本会被发回给父 agent 
+作为工具调用结果（`_subagent_handler` 将 `{success, summary}` 打包返回）
+- 子 agent 内部的文本信号必须被子 agent 自己解析，而非父 agent
+- 子 agent 和主 agent 的循环逻辑**各自都需要**同一套 NL 检测器
+- `_subagent_handler` 返回给父 agent 的仍然是结构化 dict，父 agent 
+侧感知不到变化——但这意味着**子 agent 侧必须先完整实现 NL 检测**
+
+### 2.4 `task_complete_signal` 字段（`task_log.py`）
+
+`task_complete_signal` 字段目前语义明确：`{early_exit: bool, success: bool, 
+summary: str}`，且在日志展示中用于 `TC:ok/give-up` 可读标签。
+
+新方案下该字段的构建来源从"工具调用结果"变成"regex 
+提取结果"，字段本身格式可以保留不变，但**构建时机和置信度会下降**（见风险节）。
+
+---
+
+## 三、风险评估
+
+### 🔴 严重风险
+
+**R1：LLM 误触发（hallucinate）**
+
+LLM 在描述任务、举例、引用用户需求时，可能在输出的正文里写出 "TASK COMPLETE" 
+字样——例如"该方案使任务完成度提升了..."或"等待用户确认任务完成后继续"。Regex 
+无法区分这是元输出（LLM 在说话）还是控制信号（LLM 要终止循环）。
+
+工具调用协议不存在这个问题：`tool_use` 和 `text` 
+是结构化协议的两种不同消息类型，LLM 无法在 `text` 字段里"意外触发"工具调用。
+
+**R2：parser 漏检导致循环不终止**
+
+LLM 的自然语言输出格式高度多变：
+- `"Task is now complete."` 
+- `"TASK COMPLETE: success"` 
+- `"任务已完成，摘要：..."` 
+
+无论 regex 写得多严格，都存在漏检或过检的对立压力。漏检的后果是循环耗尽 token 
+预算才超时退出，而不是正常 summary 收尾，`task_complete_signal` 字段会是 
+None，日志显示异常。
+
+**R3：success/failure 语义丢失**
+
+`task_complete(success=False, summary="...")` 
+是明确的结构化布尔值，表示"主动放弃"而非"成功完成"。自然语言格式需要可靠区分 
+SUCCESS/FAILURE，但 LLM 
+在表达放弃时用语多样（"无法继续"、"遇到阻塞"、"建议用户手动处理"），regex 
+需要额外承载这个语义，失败概率高。
+
+### 🟡 中等风险
+
+**R4：子 agent 路径双重覆盖**
+
+如前所述，主 agent 和子 agent 的循环实现不同（主 agent 三个子循环 + subagent.py
+独立实现），需要在**四处**插入相同的 NL 
+检测逻辑，且任何一处遗漏都会造成该路径下的循环无法正常终止。维护两套并行机制（
+工具协议 + NL 检测）的成本持续累积。
+
+**R5：prompt 工程耦合**
+
+工具调用的 schema 本身就是 prompt，LLM 从 JSON Schema 知道"调用 task_complete 
+工具用于终止"。改成 NL 信号后，需要在系统 prompt 
+里用自然语言描述何时、以何种格式输出终止信号，且该描述随着 LLM 
+版本迭代需要持续调优——这是将控制逻辑从代码移入 
+prompt，增加了不可测试的维护负担。
+
+**R6：多工具调用并发场景**
+
+`_dispatch_tool_calls` 处理的是一批并发工具调用，当前逻辑是扫描所有 outs 找 
+`_task_complete`。NL 信号是消息级别的，一条消息只有一个 
+content，因此这个并发场景的语义反而变简单——但需要明确：NL 
+信号是消息级检测，不是工具调用级检测，检测时机需前移到 `call_llm` 
+的返回处理层。
+
+### 🟢 低风险
+
+**R7：`show_recent_logs` 展示**（`task_log.py:138`）格式兼容，只要 signal dict 
+结构保留即可，改动最小。
+
+---
+
+## 四、推荐结论
+
+### ❌ 不推荐做
+
+**核心理由：工具协议比 regex 
+解析在此场景下是严格更优的选择，没有需要被自然语言信号替代的实际理由。**
+
+具体论据：
+
+1. **工具调用协议本身就是"机器可解析的自然语言信号"的更好实现**。LLM 通过 
+tool_use 消息类型表达意图，和通过文本加特定格式表达意图，在 LLM 
+视角是等价的——但前者在解析层有协议保证（结构化 JSON），后者没有。
+
+2. **改动范围大、风险高，收益不明**。需要改 4 个文件共 8+ 处核心逻辑，引入 3 
+个严重风险，且在功能上只是"换一种表达方式"，不带来新能力。
+
+3. **已有沉默退出兜底路径**（`agent.py:1754-1764, 
+2192-2208`），正是用来处理"LLM 不调用 task_complete 时"的 
+fallback，这证明现有设计对异常情况已有应对，不需要用 NL 信号替代。
+
+4. **`task_complete_signal` 字段的日志语义依赖明确的 success 
+布尔值**，从工具调用结果获取比从自然语言提取更可靠，改动会降低 `task_log.py` 
+的日志质量。
+
+5. **子 agent 路径（`subagent.py:221`）是最脆弱的改动点**：子 agent 的 LLM 
+响应需要被父 agent 完全可解析，而子 agent 
+内部循环还需要自己先解析同样的信号——双层解析逻辑会引入难以调试的竞争条件。
+
+### 如果确实要做，最小风险路径建议
+
+若有其他原因（如 API 限制、不支持工具调用的模型）必须做，建议：
+
+- **不要完全去掉工具协议**，而是做"**双模式兼容**"：优先检测工具调用，fallback 
+到文本检测
+- NL 格式用**严格前缀行**（消息末尾独立一行 `DONE:success:摘要` 或 
+`DONE:failure:摘要`），避免正文污染
+- 将检测逻辑提取为**单一函数**（如 `_detect_completion(outs, 
+text)`），在四个调用点统一复用，而非分散内联
+- `task_complete_signal` 字段在 NL 检测路径下标记来源（`"source": 
+"nl_signal"`），便于日志区分置信度
+
+---
