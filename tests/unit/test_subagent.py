@@ -135,6 +135,72 @@ def _mk_resp(content="", tool_calls=None):
     return resp
 
 
+# ---------- P2.2 subagent 切便宜模型 ----------
+
+
+def test_subagent_model_for_role_explorer_uses_haiku():
+    import subagent as _sa
+    m = _sa._subagent_model_for_role("explorer")
+    assert m is not None
+    assert "haiku" in m.lower()
+
+
+def test_subagent_model_for_role_auditor_uses_haiku():
+    import subagent as _sa
+    m = _sa._subagent_model_for_role("auditor")
+    assert m is not None
+    assert "haiku" in m.lower()
+
+
+def test_subagent_model_for_role_general_returns_none():
+    """general 子 agent 可能写代码，保持父 cascade，不强制 haiku"""
+    import subagent as _sa
+    assert _sa._subagent_model_for_role("general") is None
+
+
+def test_run_subagent_passes_haiku_override_for_explorer(tmp_path, monkeypatch):
+    """explorer 子 agent 实际调 call_llm 时应当传 model_override='...haiku...'"""
+    import llm_client as _lc
+    captured = {}
+
+    def fake_call(messages, **kw):
+        captured["model_override"] = kw.get("model_override")
+        return _mk_resp(
+            content="done",
+            tool_calls=[("c1", "task_complete",
+                         {"success": True, "summary": "x"})],
+        )
+
+    with state.scoped_session(tmp_path):
+        (tmp_path / "f.py").write_text("x=1\n", encoding="utf-8")
+        monkeypatch.setattr(_lc, "call_llm", fake_call)
+        agent._run_subagent("查 X", role="explorer", max_steps=2)
+
+    assert captured.get("model_override") is not None
+    assert "haiku" in captured["model_override"].lower()
+
+
+def test_run_subagent_no_override_for_general(tmp_path, monkeypatch):
+    """general 子 agent 不传 model_override（走父 cascade）"""
+    import llm_client as _lc
+    captured = {}
+
+    def fake_call(messages, **kw):
+        captured["model_override"] = kw.get("model_override")
+        return _mk_resp(
+            content="done",
+            tool_calls=[("c1", "task_complete",
+                         {"success": True, "summary": "x"})],
+        )
+
+    with state.scoped_session(tmp_path):
+        (tmp_path / "f.py").write_text("x=1\n", encoding="utf-8")
+        monkeypatch.setattr(_lc, "call_llm", fake_call)
+        agent._run_subagent("写代码", role="general", max_steps=2)
+
+    assert captured.get("model_override") is None
+
+
 def test_run_subagent_returns_summary_on_task_complete(tmp_path, monkeypatch):
     """子 agent 调 task_complete 后返回 summary。
 
@@ -568,8 +634,13 @@ def test_dispatch_tool_calls_mixed_subagent_and_local_tools(tmp_path):
         assert [m["tool_call_id"] for m in msgs] == ["c1", "c2", "c3", "c4"]
 
 
-def test_dispatch_tool_calls_subagent_exception_isolated(tmp_path):
-    """一个并发 subagent 抛异常不影响其他子 agent 完成"""
+def test_dispatch_tool_calls_subagent_exception_isolated(tmp_path, monkeypatch):
+    """一个并发 subagent 抛异常不影响其他子 agent 完成。
+
+    Pre-existing patch bug：subagent.py:_run_subagent 用 `from llm_client import call_llm`
+    lazy import，patch agent.call_llm 不生效——必须 patch llm_client.call_llm。
+    """
+    import llm_client as _lc
     with state.scoped_session(tmp_path):
         (tmp_path / "a.py").write_text("x=1\n", encoding="utf-8")
 
@@ -590,15 +661,11 @@ def test_dispatch_tool_calls_subagent_exception_isolated(tmp_path):
             _mk_tool_call("s2", "dispatch_subagent",
                           {"task": "B", "role": "explorer", "max_steps": 2}),
         ]
-        orig = agent.call_llm
-        try:
-            agent.call_llm = fake_llm
-            outs = agent._dispatch_tool_calls(
-                tool_calls, mode="audit", allow_hil=False, allow_confirm=False,
-                snap=None, messages=[],
-            )
-        finally:
-            agent.call_llm = orig
+        monkeypatch.setattr(_lc, "call_llm", fake_llm)
+        outs = agent._dispatch_tool_calls(
+            tool_calls, mode="audit", allow_hil=False, allow_confirm=False,
+            snap=None, messages=[],
+        )
 
         assert len(outs) == 2
         # outs[0] (A) 应成功；outs[1] (B) 应是 error 形态（_run_subagent 内 finally 仍 reset）

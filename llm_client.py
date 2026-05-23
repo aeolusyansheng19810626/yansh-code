@@ -184,10 +184,14 @@ def _is_transient_error(exc) -> bool:
     return False
 
 
-def call_llm(messages, tools=None, tool_choice=None, response_format=None, stream: bool | None = None):
+def call_llm(messages, tools=None, tool_choice=None, response_format=None,
+             stream: bool | None = None, model_override: str | None = None):
     """尝试 QUALITY_CASCADE 中的模型依次降级；每模型对 429/5xx 指数退避重试。
     在子线程中执行，每 100ms 检查一次 ESC 中断。
-    stream=True 且 tools=None 时启用流式输出，实时打印 token。"""
+    stream=True 且 tools=None 时启用流式输出，实时打印 token。
+
+    P2.2 model_override：仅跑指定模型（不走 cascade），失败抛错——给 subagent 用便宜模型。
+    """
     use_stream = (stream is True) or (
         stream is None and tools is None and response_format is None
     )
@@ -195,8 +199,11 @@ def call_llm(messages, tools=None, tool_choice=None, response_format=None, strea
     result_holder = [None]
     exc_holder = [None]
 
+    # P2.2：override 时只跑这一个模型；不传则走原 cascade
+    cascade = [model_override] if model_override else QUALITY_CASCADE
+
     def _worker():
-        for model in QUALITY_CASCADE:
+        for model in cascade:
             backoff = 1.0
             for attempt in range(LLM_MAX_RETRIES_PER_MODEL):
                 try:
@@ -253,7 +260,8 @@ def call_llm(messages, tools=None, tool_choice=None, response_format=None, strea
         t.join(timeout=0.1)
 
     if result_holder[0] is None:
-        raise RuntimeError(f"所有模型调用均失败: {exc_holder[0]}")
+        scope_desc = f"override={model_override}" if model_override else "cascade"
+        raise RuntimeError(f"所有模型调用均失败 ({scope_desc}): {exc_holder[0]}")
 
     res = result_holder[0]
     if hasattr(res, "usage") and res.usage:

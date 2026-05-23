@@ -155,6 +155,23 @@ _WRITE_TOOLS = {
 }
 
 
+# P2.2：按 role 切便宜模型
+# explorer/auditor 跑只读探索，sonnet 4.6 是浪费 → haiku 4.5（价格 ~1/3）
+# general 子 agent 可能写代码，保持父 agent 第一档模型
+_SUBAGENT_HAIKU_MODEL = "claude-haiku-4-5"  # ICA gateway ID 格式（无 -YYYYMMDD 后缀）
+
+
+def _subagent_model_for_role(role: str) -> str | None:
+    """返回该 role 应该用的模型 override；None 表示走父 cascade。
+
+    explorer / auditor → haiku 4.5（只读，便宜模型够用）
+    general → None（写代码场景需要 sonnet/opus 级别能力）
+    """
+    if role in ("explorer", "auditor"):
+        return _SUBAGENT_HAIKU_MODEL
+    return None
+
+
 def _run_subagent(task: str, role: str = "explorer", max_steps: int = 8) -> dict:
     """跑一个子 agent，返回 {"success": bool, "summary": str, "steps": int, "role": str}.
 
@@ -201,7 +218,8 @@ def _run_subagent(task: str, role: str = "explorer", max_steps: int = 8) -> dict
                 summary = summary or "（被中断）"
                 break
 
-            response = call_llm(messages, tools=tools_subset, tool_choice="auto", stream=False)
+            response = call_llm(messages, tools=tools_subset, tool_choice="auto",
+                                stream=False, model_override=_subagent_model_for_role(role))
             msg = response.choices[0].message
             messages.append({
                 "role": "assistant",

@@ -824,6 +824,53 @@ def _filter_tools(allowed_names):
         return [t for t in TOOLS if t["function"]["name"] in allowed_names]
 
 
+# ============================================================
+# P2.1: read_file 命中检测 — 同一 agent 实例内重复 read_file (filename, offset, limit)
+# 不重新调真工具、不把 content 再塞进 messages，返回短 error+hint 让 LLM 复用
+# 历史 messages 中已有的 content。
+#
+# 关键：cache 必须 per-thread（thread-local），否则并发子 agent（_run_subagent
+# 在独立线程）会互相命中——子 agent 的 messages 不含父 agent 的 read 结果，
+# 命中拒绝会让子 agent 拿不到 content。每个 thread 独立 set，互不污染。
+# ============================================================
+_read_cache_state = threading.local()
+
+
+def _get_read_cache() -> set:
+    """返回当前线程的 read cache set（不存在就创建）"""
+    s = getattr(_read_cache_state, "cache", None)
+    if s is None:
+        s = set()
+        _read_cache_state.cache = s
+    return s
+
+
+def _read_cache_clear():
+    """清当前线程的 cache。每次 init_task_log（主线程任务边界）调用。"""
+    _read_cache_state.cache = set()
+
+
+def _read_cache_key(args: dict) -> tuple:
+    """从 read_file args 提取 cache key。offset/limit 缺省补 None 保证 dedupe 一致。"""
+    return (
+        str(args.get("filename") or ""),
+        args.get("offset"),
+        args.get("limit"),
+    )
+
+
+def _read_cache_hit_or_record(args: dict) -> bool:
+    """命中返回 True；未命中记录后返回 False。每个线程独立 set。"""
+    key = _read_cache_key(args)
+    if not key[0]:
+        return False  # 空 filename 直接放行让 read_file 自己报错
+    cache = _get_read_cache()
+    if key in cache:
+        return True
+    cache.add(key)
+    return False
+
+
 def _infer_test_scope(plan_files) -> list[str]:
     """P1.3：根据 plan 列出的修改文件推断本次任务相关的测试文件路径列表。
 
@@ -1145,6 +1192,27 @@ def _dispatch_tool_call_inner(tool_call, args, *, mode="auto", allow_hil=True,
     if name == "list_files":
         return {"name": name, "args": args, "id": tool_call.id, "result": list_files()}
     if name in readonly_handlers:
+        # P2.1 read_file 命中检测：同任务内相同 (filename, offset, limit) 重读时
+        # 不调真工具、不返回 content，让 messages 只 append 短 error+hint。
+        # LLM 看到 hint 应当从历史 messages 里复用 content，避免冗余 token。
+        if name == "read_file" and _read_cache_hit_or_record(args):
+            console.print(
+                f"[read_cache] 命中 {args.get('filename')}"
+                f"@offset={args.get('offset')}/limit={args.get('limit')}，跳过实读",
+                style="cyan", highlight=False,
+            )
+            return {
+                "name": name, "args": args, "id": tool_call.id,
+                "result": {
+                    "error": "duplicate_read",
+                    "filename": args.get("filename"),
+                    "offset": args.get("offset"),
+                    "limit": args.get("limit"),
+                    "hint": ("This (filename, offset, limit) was already read earlier in the same task; "
+                             "the content is in your message history. Reuse it instead of reading again. "
+                             "If you genuinely need a fresh read, call with a different range or note it in your reply."),
+                },
+            }
         # P0 安全：audit/plan 上下文下，dispatch_subagent 强制降级为只读 role——
         # 否则 LLM 调 dispatch_subagent(role="general") 派出的子 agent 会用 dispatch_mode="auto"
         # 拿到全工具集（含 write_file / execute_command），绕过 audit 的"只读承诺"。
@@ -2414,6 +2482,7 @@ def _run(requirement, mode):
     os.makedirs(_get_workspace(), exist_ok=True)  # 兜底：新目录首次运行时 workspace/ 可能不存在
     original_requirement = requirement
     init_task_log(requirement, mode)
+    _read_cache_clear()  # P2.1：每个新任务开始清 read_file 命中表
 
     # P2 #8 Skills：每次 run() 入口扫描 + 匹配 skill；后续 plan/code/audit/fix 共用 _ACTIVE_SKILLS_PROMPT
     global _ACTIVE_SKILLS_PROMPT, _ACTIVE_MEMORY_INDEX
