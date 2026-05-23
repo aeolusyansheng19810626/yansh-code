@@ -229,9 +229,10 @@ def write_file(filename, content):
     except Exception as e:
         return _err("internal", str(e))
 
-def read_file(filename, offset=None, limit=None):
+def read_file(filename, offset=None, limit=None, max_bytes=None):
     """读取workspace目录下的文件。
     可选 offset/limit 按行截取（offset 1-based 起始行；limit 行数上限）。
+    可选 max_bytes 限制读取字节数，超出时返回截断内容并附带 truncated: true。
     无截取参数时返回整个文件，行为与原版相同。"""
     resolved, err = _validate_path(filename)
     if err:
@@ -243,17 +244,26 @@ def read_file(filename, offset=None, limit=None):
     except Exception as e:
         return _err("internal", str(e))
     if offset is None and limit is None:
+        if max_bytes is not None and len(text.encode('utf-8')) > max_bytes:
+            truncated_text = text.encode('utf-8')[:max_bytes].decode('utf-8', errors='ignore')
+            return {"content": truncated_text, "truncated": True}
         return {"content": text}
     lines = text.splitlines(keepends=True)
     total = len(lines)
     start = max(0, (offset or 1) - 1)
     end = total if limit is None else min(total, start + max(0, int(limit)))
-    return {
-        "content": "".join(lines[start:end]),
+    content = "".join(lines[start:end])
+    result = {
+        "content": content,
         "total_lines": total,
         "offset": start + 1,
         "lines_returned": end - start,
     }
+    if max_bytes is not None and len(content.encode('utf-8')) > max_bytes:
+        truncated_content = content.encode('utf-8')[:max_bytes].decode('utf-8', errors='ignore')
+        result["content"] = truncated_content
+        result["truncated"] = True
+    return result
 
 def execute_command(command):
     """在workspace目录下执行命令，30秒超时，三级命令策略（deny/safe/confirm）"""

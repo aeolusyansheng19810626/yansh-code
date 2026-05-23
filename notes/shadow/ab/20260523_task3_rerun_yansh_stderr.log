@@ -1,0 +1,228 @@
+[Agent: Auditor]
+审计轮 1: 2 次工具调用
+审计轮 1  2 个子 agent 同时启动
+[预算] audit token 增量 427567 > 120000，提醒 LLM 收尾
+审计轮 2: 1 次工具调用
+审计轮 3: 1 次工具调用
+审计完成（task_complete: 成功）：审计完成：评估了将 task_complete 从 sentinel 
+工具改为 LLM 自然语言信号的可行性。发现 2 处 critical 
+风险（信号解析歧义、success 语义丢失）、3 处 major 风险（30+ 
+测试需重写、权限管控弱化、可观测性下降）、2 处 minor 
+风险；结论：不推荐改造，当前结构化 sentinel 
+设计是有意的工程选择，自然语言替代方案只增加不确定性。
+
+现在我已有足够的信息来撰写完整的评估报告。
+
+---
+
+# task_complete 工具化 → LLM 自然语言信号：可行性评估报告
+
+## 总览
+
+**yansh-code** 是一个多阶段 AI 编码助手，核心执行流为：`plan → code → test → 
+fix (loop) → audit (loop)`，以及并行的 `dispatch_subagent` 
+子任务框架。`task_complete` 目前作为 **sentinel 工具**，通过结构化 tool-call 
+返回 `{"_task_complete": True, "success": bool, "summary": str}` 
+的方式，让各级循环感知 LLM 的终止意图。
+
+改造命题是：**去除 `task_complete` 工具注册，改为 LLM 
+在自然语言输出中嵌入特定标记**（如 `[TASK_COMPLETE: 
+success=true]`）来传递终止信号，由 Python 侧通过文本解析识别。
+
+---
+
+## 一、改动范围
+
+### 1.1 直接涉及的文件与行号
+
+| 文件 | 行号 | 当前作用 | 需要改动 |
+|------|------|----------|----------|
+| `tools.py` | L35–48 | `task_complete()` 函数定义，返回 `_task_complete` dict 
+| 函数本体需改写或移除 |
+| `tools_schema.py` | L405–416 | 工具 schema 注册 + `READONLY_TOOL_NAMES` 
+白名单 | 从 TOOLS 列表删除 schema；从白名单移除 |
+| `agent.py` | L1161–1162 | `_dispatch_tool_call` 中优先识别 `task_complete` 
+工具名 | 删除此快速路径 |
+| `agent.py` | L1771–1786 | Code 阶段 sentinel 检测 `_task_complete` | 改为解析
+`msg.content` 文本 |
+| `agent.py` | L1885–1900 | Audit 阶段 sentinel 检测 | 改为文本解析 |
+| `agent.py` | L2332–2350 | Fix 阶段 sentinel 检测 | 改为文本解析 |
+| `agent.py` | L1421–1475 | Tester/Auditor 系统 prompt 中 `task_complete` 
+使用指引 | 改为自然语言标记约定说明 |
+| `agent.py` | L1900–1927 | Audit silent timeout 追问逻辑（让 LLM 补调 
+`task_complete`） | 改为追问 LLM 输出标记文本 |
+| `agent.py` | L2344–2359 | Fix silent timeout 追问逻辑 | 同上 |
+| `subagent.py` | L88–115 | `_subagent_tools_for_role` 中角色工具过滤 | 从 
+explorer/auditor/general 工具集中移除 `task_complete` |
+| `subagent.py` | L240–269 | 子 agent 循环中检测 `out["name"] == 
+"task_complete"` | 改为从 `msg.content` 提取信号 |
+| `subagent.py` | L261–269 | 子 agent silent timeout 追问 | 改为文本追问 |
+
+**估计直接改动量：约 13 个关键点，分布在 3 个核心文件。**
+
+### 1.2 间接影响
+
+- `task_log.py` 中记录 `task_complete_signal` 的日志结构（L69, 
+L85–89）：信号来源变化，字段含义不变，但提取时机从工具调用时变为文本解析时，可
+能影响日志精度。
+- `tests/` 中超过 30 处单元测试直接 mock/assert `task_complete` 
+工具调用——**这是最大的测试维护成本**，几乎每个 
+`fix()`、`audit()`、`code()`、`_run_subagent()` 的集成测试都需要重写。
+- 所有注入到 LLM 的系统 prompt（Tester/Auditor 角色描述）需要同步更新约定文本。
+
+---
+
+## 二、与 fix loop / dispatch_subagent / task_complete_signal 的兼容性分析
+
+### 2.1 fix loop
+
+**当前机制**：fix() 在每轮工具调用结果里遍历 
+`out["result"].get("_task_complete")`，一旦检测到立即返回 `{"early_exit": True,
+"success": ..., "summary": ...}`，外层 `run()` 
+据此决定继续重试还是终止整个流程。
+
+**改造后需解决**：
+- LLM 在修复代码时通常一轮调用多个工具（`write_file`, 
+`replace_in_file`），自然语言终止标记必须出现在 **`msg.content`（assistant 
+消息正文）** 而不是工具结果里。
+- 问题：LLM 在同一轮可以**先修改文件、再输出终止标记**，Python 
+侧必须在确认所有工具执行完毕后才能扫描 
+`msg.content`，时序上仍然可行，但增加了解析耦合。
+- **success=True vs False 的区分**：当前工具参数 `success: bool` 
+是强类型。改成文本后，需要可靠地从自然语言中提取布尔值——例如 `[TASK_COMPLETE: 
+success=true]` 这种约定格式，存在 LLM 误写成 
+`success=True`（大写）或嵌入句子中的风险。
+
+### 2.2 dispatch_subagent
+
+**当前机制**：子 agent 循环通过 `out["name"] == "task_complete"` 
+识别终止（`subagent.py:L240`），比父 agent 更简单——不需要解析 `_task_complete` 
+dict，直接靠工具名匹配。
+
+**改造后需解决**：
+- 子 agent 有 `max_steps` 限制（上限 
+16），自然语言信号的解析点从"工具调用结果"变成"每轮 
+`msg.content`"，循环控制逻辑需要**在两个位置**（有工具调用的轮次、无工具调用的
+轮次）都做文本扫描，增加代码复杂度。
+- 子 agent 的 explorer/auditor 角色当前被显式允许调用 `task_complete`（在 
+`READONLY_TOOL_NAMES` 
+白名单中），改造后这个权限边界无需工具注册维护，但同时也失去了"只读 agent 
+不能提前终止全局任务"这一通过工具黑白名单管控的能力。
+- **递归保护**：当前 `_is_in_subagent()` 配合工具级黑名单阻止 
+`dispatch_subagent` 嵌套。改造不影响此防护，但子 agent 的终止信号解析与父 agent
+共用同一套文本检测逻辑时，需要确保信号只被对应层级消费，不串层。
+
+### 2.3 task_complete_signal 传播链
+
+`task_complete_signal` 字典从三个 sentinel 检测点（Code/Audit/Fix）生成，经由 
+`report()` 函数打包，最终落地到 `task_log.py` 的持久化记录里。
+
+**兼容性**：字典结构 `{"early_exit": True, "success": bool, "summary": str}` 
+的**接收侧不需要改动**——只要把文本解析的结果包装成同样的 dict 即可。但是：
+- 当前 summary 直接来自 LLM 调用工具时的参数，是 **LLM 
+主动提供的结构化字段**，语义明确。
+- 改造后 summary 
+来自正则/文本提取，可能截取不完整或包含无关内容，降低日志可读性。
+
+### 2.4 silent timeout 二阶追问机制
+
+当前逻辑：LLM 某轮未调任何工具 → 系统追问一次 `"你必须用 task_complete() 收尾"`
+→ 若仍无工具调用则强制截断。
+
+改造后：追问文本需改为 `"你必须在输出末尾加入 [TASK_COMPLETE: success=...] 
+标记"`，追问后需检测 `msg.content` 
+而不是工具调用列表。**但**：当前"无工具调用"这一判断本身就是基于 
+`response_message.tool_calls` 是否为空，改造后 LLM 
+可能既不调工具也不输出标记（纯文本段落），这种静默场景的处理逻辑实质上没有变化
+，属于兼容。
+
+---
+
+## 三、风险
+
+### 🔴 Critical
+
+**R1 — 信号解析歧义（最核心风险）**
+
+工具调用是 **结构化、原子性** 的——LLM 要么调了 `task_complete(success=true, 
+summary="...")`，要么没调，没有中间状态。
+改成文本信号后，LLM 可能：
+- 在报告正文里提到 `"task_complete"` 单词（如讨论架构时），误触发终止；
+- 输出 `[TASK_COMPLETE: success=false]` 但实际还有后续工具调用尚未执行；
+- 大写小写、标点、格式偏差导致正则漏匹配，循环不终止、耗尽 `max_steps`；
+- 在**多工具并发调用轮次**中，`msg.content` 
+与工具调用结果的顺序关系不确定，信号时机难以与工具副作用严格对齐。
+
+**R2 — success/failure 语义丢失**
+
+当前 `success: bool` 直接决定 `fix()` 是否继续重试、`run()` 
+最终返回什么状态码。文本中提取布尔值存在不可靠性，一旦误判（False→True 或 
+True→False），会导致：
+- 本应终止的修复循环继续空转，浪费 token；
+- 本应报告成功的任务被错误标记为失败，影响上层调用方（main.py、CI 集成等）。
+
+### 🟠 Major
+
+**R3 — 测试体系需大规模重写**
+
+30+ 个单元/集成测试基于 `task_complete` 工具调用的 mock 构建。改造后这些 
+fixture 全部失效，需改为构造特定格式的 `msg.content` 
+字符串，**测试重写成本高，且文本匹配测试本身脆弱**（格式稍变就漏掉）。
+
+**R4 — audit 模式权限管控弱化**
+
+`READONLY_TOOL_NAMES` 白名单目前同时承担"允许只读 agent 
+终止自身"的功能。去掉工具后，**任何自然语言输出**都可能被解析为终止信号，对 
+`mode="audit"` 下 `dispatch_subagent` 的角色隔离造成微小但真实的边界弱化风险。
+
+**R5 — 调试与可观测性下降**
+
+工具调用会被记录为完整的 `tool_call` 日志条目（含 
+id、参数），对话可回溯。文本信号只存在于 `msg.content` 
+的某处，在长报告中定位终止行为更困难，排查"为什么 LLM 提前退出"的成本显著增加。
+
+### 🟡 Minor
+
+**R6 — prompt 工程维护负担**
+
+当前系统 prompt 里的终止指引文本（agent.py:L1421–1475）明确、可验证（工具有 
+schema 约束）。改成文本标记后，需要在 prompt 里精确描述格式，且无法通过 JSON 
+schema 验证 LLM 
+遵守情况。不同模型（Gemini/Claude/本地模型）对同一格式的遵守程度不一，维护负担
+上升。
+
+**R7 — 与"沉默退出等于 success=True"语义冲突**
+
+当前 docstring 有注释：`"沉默退出（这一轮不调任何工具）= 默认 
+success=True"`（tools.py:L44）。这个约定通过工具调用的有无来区分"显式退出"与"沉
+默退出"。改成文本信号后，两种退出方式在 `msg.content` 
+层面难以区分（都是文字），原有语义可能产生混淆。
+
+---
+
+## 四、推荐结论
+
+### **不推荐改造。**
+
+`task_complete` 作为 sentinel 
+工具的核心价值正是其**结构化、不可歧义**的特性——它是一个协议边界，不是一个功能
+工具。当前设计经过了以下周密的工程考量：
+
+1. **多级循环共用同一 sentinel 
+键**（`_task_complete`），三个不同阶段（code/audit/fix）的检测代码保持统一，改
+成文本解析后三处各自的正则逻辑会产生漂移风险。
+2. **silent timeout 
+二阶追问机制**与工具调用的有无严格耦合，这是一个精巧的防护设计；文本信号无法提
+供等价的形式保证。
+3. **子 agent 
+终止信号的层级隔离**依赖工具调用的结构化属性，文本流中无法天然实现信号的层级归
+属。
+4. **30+ 个测试的重写成本**超过任何潜在收益。
+
+**如果真正的动机是减少 token 开销**（工具 schema 在 prompt 中占用 
+token），更稳妥的方向是：在 token 预算告急时动态压缩工具列表（只保留 
+`task_complete`），而不是把 sentinel 机制整体拆除。**如果动机是简化 LLM 
+行为**，当前的 schema + prompt 
+组合已经是最精确的约束方式，自然语言替代方案只会增加不确定性。
+
+---

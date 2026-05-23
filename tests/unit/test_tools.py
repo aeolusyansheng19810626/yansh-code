@@ -519,3 +519,19 @@ def test_error_field_preserved_for_legacy_callers():
     assert "不存在" in r["error"]
     # 同时新字段也在
     assert r["error_kind"] == "not_found"
+
+
+def test_read_file_max_bytes_truncation():
+    """max_bytes 截断：写入11字节内容，以 max_bytes=5 读取时内容为前5字节且 truncated=True；
+    以 max_bytes=100 读取时不截断（truncated 为 False 或字段不存在）"""
+    write_file("mb_test.txt", "hello world")  # 11 字节
+
+    # 截断路径
+    result = read_file("mb_test.txt", max_bytes=5)
+    assert result["content"] == "hello"
+    assert result.get("truncated") is True
+
+    # 不截断路径
+    result = read_file("mb_test.txt", max_bytes=100)
+    assert result["content"] == "hello world"
+    assert result.get("truncated") is not True
