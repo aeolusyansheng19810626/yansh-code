@@ -130,6 +130,11 @@ _FIX_TOKEN_BUDGET   = 60_000   # fix loop token 增量预算
 _AUDIT_SOFT_LIMIT   = 16       # 原 8
 _AUDIT_TOKEN_BUDGET = 120_000  # audit loop token 增量预算
 
+# backlog #1: fix loop baseline 失败识别
+# 进入 code() 前跑一次 test_command 捕获 baseline failures
+# test+fix 循环里 returncode!=0 但 current\baseline 为空时视为通过
+_BASELINE_FAILURES: set = set()
+
 
 def _cfg(key):
     """读取生效配置值"""
@@ -2294,9 +2299,11 @@ def _parse_review_response(content: str) -> dict:
         _log_json_failure("review", content, err)
     return data
 
-def fix(test_result, plan, reason="test_failure"):
+def fix(test_result, plan, reason="test_failure", baseline_failures=None):
     """根据测试错误或审查意见修复代码（多轮工具调用）
     reason: "test_failure" | "review_rejection"
+    baseline_failures: backlog #1，进入任务前已存在的失败 test id 集合。
+      LLM 看到后应忽略这些 pre-existing 失败，只修增量失败。
 
     返回 dict: {"early_exit": bool, "success": bool, "summary": str}
       - early_exit=True：LLM 主动调了 task_complete，外层应立即按 success 决定终止/标记
@@ -2327,8 +2334,22 @@ def fix(test_result, plan, reason="test_failure"):
         # plan 可能是 plan_result 字典（含 "files"）或直接 list of file dicts，两种都兼容
         plan_items = plan.get("files", []) if isinstance(plan, dict) else (plan or [])
         plan_files = [p.get("filename", "") for p in plan_items if isinstance(p, dict)]
+        # backlog #1：把 baseline pre-existing failures 直接注进 user content
+        # 让 LLM 完全无歧义地知道哪些失败不归本次任务管
+        baseline_block = ""
+        if baseline_failures:
+            _bl_list = sorted(baseline_failures)[:30]  # 30 条上限够人看
+            baseline_block = (
+                f"\n\n**Pre-existing baseline failures（任务开始前已存在，{len(baseline_failures)} 条）**：\n"
+                + "\n".join(f"  - {t}" for t in _bl_list)
+                + ("\n  - ...（省略）" if len(baseline_failures) > 30 else "")
+                + "\n上面这些 test id **不在本次修复范围**——它们在你 plan 之前就已经红。"
+                "如果当前所有失败都来自这个列表，**立即 `task_complete(success=true, summary='所有失败均为 pre-existing baseline，未引入回归')`** 收尾。\n"
+                "只针对**不在上述列表**的新失败 fix。"
+            )
         content = (
-            f"Tests failed.\nError output:\n{error_info}\n\nPlan files (this task's scope): {plan_files}\n\n"
+            f"Tests failed.\nError output:\n{error_info}\n\nPlan files (this task's scope): {plan_files}"
+            f"{baseline_block}\n\n"
             "归属判断（必读 — 走 _TESTER_ROLE 的 Investigation order 第 1 条）：\n"
             "失败断言里的符号 / 函数 / 测试目标对应的源文件，**是否在 Plan files 列表里**？\n"
             "- 在 → 本次任务引入的回归，正常修复\n"
@@ -2446,6 +2467,47 @@ def test(test_command):
 def judge(test_result):
     """判断测试是否通过"""
     return test_result.get("returncode") == 0
+
+
+def _parse_pytest_failures(text: str) -> set:
+    """从 pytest 输出抽 FAILED 行的 test id（形如 'tests/x.py::test_y'）。
+    pytest 短摘要行格式：`FAILED <nodeid> - <msg...>` 或 `FAILED <nodeid>`。
+    解析失败返回空集，不抛异常。"""
+    if not text:
+        return set()
+    import re as _re
+    out = set()
+    # 容忍 colorize / 行首空格；匹配到 ' - ' 或行尾结束
+    for m in _re.finditer(r"^FAILED\s+(\S+?)(?:\s+-\s|$)", text, flags=_re.MULTILINE):
+        out.add(m.group(1))
+    return out
+
+
+def _capture_baseline_failures(test_command: str) -> set:
+    """code() 前跑一次 test_command 捕获 baseline failures。
+    best-effort：任何异常返回 empty set，不影响主流程。"""
+    if not test_command or not test_command.strip():
+        return set()
+    if "pytest" not in test_command:
+        # 非 pytest 命令的输出格式无法解析，跳过 baseline 捕获
+        return set()
+    try:
+        console.print(f"[baseline] 跑一次 {test_command} 记录 pre-existing failures...",
+                      style="cyan", highlight=False)
+        r = execute_command(test_command)
+        text = (r.get("stdout") or "") + "\n" + (r.get("stderr") or "")
+        failures = _parse_pytest_failures(text)
+        if failures:
+            console.print(f"[baseline] 记录 {len(failures)} 条 pre-existing failures（fix 阶段会忽略）",
+                          style="cyan", highlight=False)
+        else:
+            console.print("[baseline] 0 条 pre-existing failures（干净）",
+                          style="cyan", highlight=False)
+        return failures
+    except Exception as e:
+        console.print(f"[baseline] 捕获失败（忽略，不影响主流程）：{e}",
+                      style="yellow", highlight=False)
+        return set()
 
 def report(success, test_result, task_complete_signal=None):
     """输出最终结果。task_complete_signal: LLM 主动声明信号 {early_exit, success, summary}，可选。"""
@@ -2640,6 +2702,12 @@ def _run(requirement, mode):
                 print_plan(plan_result)
                 retry_count += 1
 
+    # backlog #1: 进入 code() 前先跑一次测试，记录 pre-existing failures
+    # 后续 fix 循环只针对增量 failures（current \ baseline）；如果 LLM 改完后
+    # current 等于 baseline 子集 → 视为通过（不再被 baseline 失败误判为回归）
+    global _BASELINE_FAILURES
+    _BASELINE_FAILURES = _capture_baseline_failures(plan_result.get("test_command", ""))
+
     # #37 任务开始前快照已有文件
     file_list = [
         (f.get("filename") if isinstance(f, dict) else f)
@@ -2720,29 +2788,56 @@ def _run(requirement, mode):
             add_to_history(original_requirement, summary)
             finish_task_log(True, attempts, test_result, task_complete_signal=coder_signal)
             return report(True, test_result, task_complete_signal=coder_signal)
-        else:
-            console.print(f"测试失败 (尝试 {attempts + 1}/{max_attempts})")
-            if attempts < max_attempts - 1:
-                fix_signal = fix(test_result, plan_result)
-                # P0 #3 第二波：识别 fix() 的主动声明，避免无谓 retry
-                if fix_signal.get("early_exit"):
-                    _summary = fix_signal.get("summary", "")
-                    if fix_signal.get("success"):
-                        # LLM 说"任务完成（剩下是 pre-existing 等不归我管）"
-                        console.print(f"[task_complete] LLM 主动声明任务完成：{_summary}",
-                                      highlight=False)
-                        add_to_history(original_requirement,
-                                       f"执行了任务（LLM 主动收尾）：{_summary}")
-                        finish_task_log(True, attempts, test_result, task_complete_signal=fix_signal)
-                        return report(True, test_result, task_complete_signal=fix_signal)
-                    else:
-                        # LLM 说"放弃"
-                        console.print(f"[task_complete] LLM 主动放弃任务：{_summary}",
-                                      style="yellow", highlight=False)
-                        add_to_history(original_requirement, f"任务被 LLM 主动放弃：{_summary}")
-                        finish_task_log(False, attempts, test_result, task_complete_signal=fix_signal)
-                        return report(False, test_result, task_complete_signal=fix_signal)
-            attempts += 1
+
+        # backlog #1: returncode!=0 但 current failures 是 baseline 子集 → 视为通过
+        _increment = None
+        if _BASELINE_FAILURES:
+            _cur_text = (test_result.get("stdout") or "") + "\n" + (test_result.get("stderr") or "")
+            _cur_fail = _parse_pytest_failures(_cur_text)
+            _increment = _cur_fail - _BASELINE_FAILURES
+            if _cur_fail and not _increment:
+                console.print(
+                    f"[baseline] 当前 {len(_cur_fail)} 条失败全部在 baseline 内（{len(_BASELINE_FAILURES)} 条 pre-existing）→ 视为通过",
+                    style="green", highlight=False,
+                )
+                files = plan_result.get("files", [])
+                file_names = [f.get("filename") if isinstance(f, dict) else str(f) for f in files]
+                file_names = [name for name in file_names if name]
+                summary = (
+                    f"执行了任务：{original_requirement}。创建/修改了文件：{', '.join(file_names)}。"
+                    f"测试 {len(_cur_fail)} 条失败均为 pre-existing baseline，未引入回归。"
+                )
+                add_to_history(original_requirement, summary)
+                finish_task_log(True, attempts, test_result, task_complete_signal=coder_signal)
+                return report(True, test_result, task_complete_signal=coder_signal)
+
+        console.print(f"测试失败 (尝试 {attempts + 1}/{max_attempts})")
+        if _increment:
+            console.print(
+                f"[baseline] 增量 failures: {len(_increment)} 条（baseline {len(_BASELINE_FAILURES)} 条已忽略）",
+                style="cyan", highlight=False,
+            )
+        if attempts < max_attempts - 1:
+            fix_signal = fix(test_result, plan_result, baseline_failures=_BASELINE_FAILURES)
+            # P0 #3 第二波：识别 fix() 的主动声明，避免无谓 retry
+            if fix_signal.get("early_exit"):
+                _summary = fix_signal.get("summary", "")
+                if fix_signal.get("success"):
+                    # LLM 说"任务完成（剩下是 pre-existing 等不归我管）"
+                    console.print(f"[task_complete] LLM 主动声明任务完成：{_summary}",
+                                  highlight=False)
+                    add_to_history(original_requirement,
+                                   f"执行了任务（LLM 主动收尾）：{_summary}")
+                    finish_task_log(True, attempts, test_result, task_complete_signal=fix_signal)
+                    return report(True, test_result, task_complete_signal=fix_signal)
+                else:
+                    # LLM 说"放弃"
+                    console.print(f"[task_complete] LLM 主动放弃任务：{_summary}",
+                                  style="yellow", highlight=False)
+                    add_to_history(original_requirement, f"任务被 LLM 主动放弃：{_summary}")
+                    finish_task_log(False, attempts, test_result, task_complete_signal=fix_signal)
+                    return report(False, test_result, task_complete_signal=fix_signal)
+        attempts += 1
 
     console.print("达到最大尝试次数，任务失败")
     # #37 失败时提示回滚
