@@ -103,6 +103,11 @@ _DEFAULTS = {
     "compress_threshold": 6000,
     "keep_recent_turns": 3,
     "human_in_loop": os.getenv("HUMAN_IN_LOOP", "false").lower() == "true",
+    # 重构类任务调度参数：默认覆盖小到中型修改；plan 阶段 LLM 给出 expected_edits 后会动态调高
+    "coder_rounds_per_file": 5,            # 单文件 coder loop 工具调用轮次基线
+    "coder_edits_per_round": 3,            # 假设 LLM 平均一轮发的 edit 数（用于按 expected_edits 算所需轮次）
+    "fix_soft_limit": 12,                  # fix loop 单次 attempt 工具轮次上限（基线）
+    "fix_mechanical_error_bonus": 12,      # 检测到机械错（同类 TypeError 缺参等）时再追加的轮次
 }
 
 _effective_config: dict = dict(_DEFAULTS)

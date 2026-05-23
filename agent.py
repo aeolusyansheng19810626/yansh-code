@@ -1,13 +1,12 @@
 import json
 import os
-import sys
 import shutil
 import threading
 from datetime import datetime
 from console_shared import console, set_json_mode as _set_json_mode
 from pathlib import Path
 from config import (
-    OPENROUTER_API_KEY, OPENROUTER_BASE_URL, WORKSPACE_DIR, get_config,
+    WORKSPACE_DIR, get_config,
     get_model_price,
 )
 from tools import (
@@ -425,6 +424,7 @@ class PlanFile(BaseModel):
     filename: str
     intent: Optional[str] = ""
     description: Optional[str] = ""
+    expected_edits: int = 0  # plan-driven 调度：本文件预计 edit 数；coder 据此动态调高每文件轮次上限
 
 
 class PlanResult(BaseModel):
@@ -1228,7 +1228,7 @@ def _dispatch_tool_call_inner(tool_call, args, *, mode="auto", allow_hil=True,
         try:
             result = readonly_handlers[name](**args)
         except Exception as e:
-            result = _tools_mod._err("internal", f"工具调用异常: {e}")
+            result = _tools_mod._err("internal", f"工具调用异常: {e}", name)
         return {"name": name, "args": args, "id": tool_call.id, "result": result}
 
     # P2 #10 MCP 路由：mcp__<server>__<tool> 转发到对应 server
@@ -1236,11 +1236,11 @@ def _dispatch_tool_call_inner(tool_call, args, *, mode="auto", allow_hil=True,
         try:
             result = _mcp_mod.call_tool(name, args)
         except Exception as e:
-            result = _tools_mod._err("internal", f"MCP 工具调用异常: {e}")
+            result = _tools_mod._err("internal", f"MCP 工具调用异常: {e}", name)
         return {"name": name, "args": args, "id": tool_call.id, "result": result}
 
     return {"name": name, "args": args, "id": tool_call.id,
-            "result": _tools_mod._err("invalid_args", f"未预期的工具: {name}")}
+            "result": _tools_mod._err("invalid_args", f"未预期的工具: {name}", name)}
 
 
 def _record_dispatch(out: dict, msgs: list):
@@ -1302,7 +1302,7 @@ def _dispatch_tool_calls(tool_calls, *, mode, allow_hil, allow_confirm, snap, me
                     outs[idx] = {
                         "name": tool_calls[idx].function.name,
                         "args": {}, "id": tool_calls[idx].id,
-                        "result": _tools_mod._err("internal", f"并发 dispatch 异常: {e}"),
+                        "result": _tools_mod._err("internal", f"并发 dispatch 异常: {e}", tool_calls[idx].function.name),
                     }
 
     # 串行处理剩余（含单个 subagent 的情况、所有非 subagent 工具）
@@ -1349,6 +1349,11 @@ Tool-call efficiency (critical):
 - **Don't dispatch_subagent for small tasks**: a subagent costs 1k+ tokens of cascade overhead before doing anything. Use it only for genuinely large explorations (mapping a module's call sites across many files) or parallelizable independent branches (analyze A/B/C modules at once). For "read 3 functions in 1 file" or "read 1 file + 1 test", call read_file / get_symbol_definition / search_in_files directly — single tool call, no overhead.
   - ❌ Anti-pattern: dispatch_subagent("read find_memory + save_memory + _slugify in memory.py, plus test_X in test_memory.py") — that's 4 read_file calls or 1 list_symbols + 2 read_file, NOT a subagent task.
   - ✓ Correct usage: dispatch_subagent("map all callers of `tools.read_file` across the repo and classify by call pattern") — genuine cross-file exploration.
+- **Batch dense edits aggressively** (critical for refactor tasks): the coder loop has a per-file round budget. If you edit one site at a time, you'll hit the limit before finishing.
+  - **Same pattern repeating**: when N sites match exactly the same `old_str → new_str` (e.g. adding a new required argument to every call of `_err`, renaming an import across a file), use **`replace_in_file(filename, old_str, new_str, replace_all=True)`** — one call replaces all N sites. Only fall back to per-site edits when each site has different surrounding context.
+  - **Multiple edits per turn, parallel**: when a file needs multiple distinct edits (different `old_str` values), fire **all `replace_in_file` tool calls in the same turn** — the harness dispatches them in parallel. Don't serialize one-edit-per-turn.
+  - **Whole-file rewrite for >20 sites with varied context**: if `replace_all` doesn't apply (each site differs) and there are 20+ sites, `write_file` the whole new content in one shot beats 20 round-trips of `replace_in_file`.
+  - ❌ Anti-pattern: 20 turns of `replace_in_file(file, "_err(\"a\", \"x\")", "_err(\"a\", \"x\", tool=\"foo\")")` for 20 different call sites — burns the round budget; either parallelize them in one turn or batch-edit by `replace_all`/`write_file`.
 Task pattern recognition (identify which category before acting, follow the matching rule):
 
 1. **Changing an existing function signature / return shape**
@@ -1591,17 +1596,18 @@ You are a code-planning assistant. Given the user requirement, return a plan str
 
 {{
   "files": [
-    {{"filename": "<relative path>", "description": "<change intent>"}}
+    {{"filename": "<relative path>", "description": "<change intent>", "expected_edits": <int>}}
   ],
   "test_command": "<command to run tests>"
 }}
 
 Full example:
-{{"files": [{{"filename": "add.py", "description": "implement add(a,b)"}}, {{"filename": "tests/test_add.py", "description": "cover normal and boundary cases"}}], "test_command": "python tests/test_add.py"}}
+{{"files": [{{"filename": "add.py", "description": "implement add(a,b)", "expected_edits": 1}}, {{"filename": "tests/test_add.py", "description": "cover normal and boundary cases", "expected_edits": 3}}], "test_command": "python tests/test_add.py"}}
 
 Field constraints:
 - Each files entry requires filename; description describes the change intent (no full code)
 - For existing files, only describe what to append/modify — do not recreate
+- **expected_edits**: estimated number of edit/replace operations this file needs (1 for new file write, 1-3 for tweaks, 5-20 for medium refactor, 30+ for sweeping signature changes). Used by the coder loop to allocate per-file round budget — undercount → coder hits round limit and task fails halfway. When in doubt, **overestimate by 50%**.
 
 Directory layout: implementation files at workspace/ root (e.g. add.py); test files must go in workspace/tests/ (e.g. tests/test_add.py).
 filename takes a relative path only; do NOT prepend "workspace/". Correct: hello.py, tests/test_hello.py. Wrong: workspace/hello.py.
@@ -1695,9 +1701,11 @@ def code(plan, mode="auto", requirement=""):
         if isinstance(file_entry, dict):
             filename = file_entry.get("filename", "")
             intent = file_entry.get("intent", file_entry.get("description", ""))
+            expected_edits = int(file_entry.get("expected_edits", 0) or 0)
         else:
             filename = file_entry
             intent = ""
+            expected_edits = 0
 
         if not filename:
             continue
@@ -1748,8 +1756,23 @@ Requirement / change intent: {intent}
 Note: you must use write_file to write the file; the filename must be exactly `{filename}` — do not change the path or add a directory prefix."""
             sys_prompt = _append_active_prompts(sys_prompt)
 
-        # 构建消息
-        user_content = f"当前文件：{filename}\n修改意图：{intent}"
+        # 构建消息：expected_edits 显式告诉 LLM 本文件改动规模 → 选合适策略
+        # >=15 处提示首选 write_file 整文件重写（变化散乱时）；中等用并行 replace_in_file；<5 单点改
+        if expected_edits >= 15:
+            edit_strategy_hint = (
+                f"\n\n【改动规模提示】expected_edits={expected_edits}。改动较多 — "
+                f"如果各 edit 点 old_str 各不相同（无法 replace_all），**强烈推荐用 write_file 一次重写整个文件**，"
+                f"比 {expected_edits}+ 次 replace_in_file 的回合数省得多。"
+            )
+        elif expected_edits >= 5:
+            edit_strategy_hint = (
+                f"\n\n【改动规模提示】expected_edits={expected_edits}。中等改动 — "
+                f"一轮内并行发多个 replace_in_file（不同 old_str），不要一次只改一处。"
+                f"重复完全相同的 old_str→new_str 用 replace_all=True。"
+            )
+        else:
+            edit_strategy_hint = ""
+        user_content = f"当前文件：{filename}\n修改意图：{intent}{edit_strategy_hint}"
         if file_exists:
             user_content += f"\n\n现有内容：\n```\n{existing_content}\n```"
 
@@ -1759,7 +1782,15 @@ Note: you must use write_file to write the file; the filename must be exactly `{
         ]
 
         # 多轮工具调用循环；新文件第一轮强制调用 write_file
-        attempts_left = 5
+        # plan-driven 调度：基线 N 轮 + ceil(expected_edits / edits_per_round) 余量
+        # 大改动文件不再被 5 轮硬切碎；undercount expected_edits 仍走基线
+        import math as _math
+        _base_rounds = int(_cfg("coder_rounds_per_file") or 5)
+        _edits_per_round = max(1, int(_cfg("coder_edits_per_round") or 3))
+        _expected_rounds = _math.ceil(expected_edits / _edits_per_round) if expected_edits > 0 else 0
+        # 留 +2 buffer 给 read/grep/test 等非-edit 工具调用
+        attempts_left = max(_base_rounds, _expected_rounds + 2)
+        _round_budget = attempts_left  # 警告打印时显示真实上限
         first_call = True
         while attempts_left > 0:
             attempts_left -= 1
@@ -1798,8 +1829,8 @@ Note: you must use write_file to write the file; the filename must be exactly `{
                 break
 
         if attempts_left <= 0 and response_message.tool_calls:
-            # #8 上限耗尽仍在调工具，提示并记录
-            warn = f"[警告] {filename} 已用尽 5 轮工具调用上限"
+            # #8 上限耗尽仍在调工具，提示并记录（上限已 plan-driven 动态调整）
+            warn = f"[警告] {filename} 已用尽 {_round_budget} 轮工具调用上限（expected_edits={expected_edits}）"
             console.print(warn, style="yellow", highlight=False)
             _task_log_mod._current_task_log.setdefault("warnings", []).append(warn)
 
@@ -2319,7 +2350,27 @@ def fix(test_result, plan, reason="test_failure"):
     budget_warned = False
     silent_prompted = False  # 沉默退出兜底：LLM 没调工具时追问一次
 
-    while rounds_used < _FIX_SOFT_LIMIT:
+    # 软上限可配置 + 机械错检测：测试失败如果是同一类 missing argument / TypeError
+    # 这种"批量改完之前都过不了"的机械错，把 fix 上限再放一档预算
+    fix_soft_limit = int(_cfg("fix_soft_limit") or _FIX_SOFT_LIMIT)
+    if reason == "test_failure":
+        import re as _re
+        _missing_arg_count = len(_re.findall(
+            r"TypeError:.+?missing\s+\d+\s+required\s+(?:positional|keyword)\s+argument",
+            error_info,
+        ))
+        # 哪怕只有 1 处同类机械错，也大概率是"signature 改了 / 调用方未全适配"——
+        # 给追加预算让 fix 有机会扫齐所有遗漏点
+        if _missing_arg_count >= 1:
+            bonus = int(_cfg("fix_mechanical_error_bonus") or 12)
+            fix_soft_limit += bonus
+            console.print(
+                f"[fix scheduler] 检测到 {_missing_arg_count} 处同类 TypeError 机械错 → "
+                f"fix 上限提升到 {fix_soft_limit}（base + bonus={bonus}）",
+                style="cyan", highlight=False,
+            )
+
+    while rounds_used < fix_soft_limit:
         rounds_used += 1
         if interrupt.is_interrupted():
             raise interrupt.Interrupted()
@@ -2380,7 +2431,7 @@ def fix(test_result, plan, reason="test_failure"):
                 continue
             console.print("修复完成（沉默退出，已追问过一次）")
             return {"early_exit": False, "success": False, "summary": ""}
-    console.print(f"[警告] fix 已达 {_FIX_SOFT_LIMIT} 轮上限，强制退出", style="yellow", highlight=False)
+    console.print(f"[警告] fix 已达 {fix_soft_limit} 轮上限，强制退出", style="yellow", highlight=False)
     return {"early_exit": False, "success": False, "summary": ""}
 
 def test(test_command):
