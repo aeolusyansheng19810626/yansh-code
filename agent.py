@@ -1427,7 +1427,7 @@ Example 3 — ANTI-PATTERN (DO NOT DO THIS):
   ❌ 测试 `assert "超出" in result["error"]` 失败 → replace_in_file 改成 `assert "越界" in ... or "超出" in ... or "workspace" in ...`
   ❌ 测试 `assert "超时" in result["error"]` 失败 → replace_in_file 改成 `assert "超时" in ... or "安全" in ... or "拦截" in ...`
   ❌ 测试 `assert not any("截断" in l for l in lines)` 失败 → 删掉 assert 或加 `or True`
-  这是把 bug 藏起来，不是修复。正确做法：识别为 pre-existing → search_in_files 或读 notes/shadow/ 下相关笔记 → task_complete(success=true) 跳过。
+  这是把 bug 藏起来，不是修复。正确做法：按 Investigation order 第 1 条做归属判断 — 失败符号不在本次 plan 文件范围 → `task_complete(success=true, summary="...不属本次范围, 已跳过")` 跳过。
 
 Responsibility: focus only on test results and error info; give precise, minimal fix suggestions; avoid introducing unrelated changes.
 Investigation order:
@@ -2286,12 +2286,14 @@ def fix(test_result, plan, reason="test_failure"):
         sys_role = f"{_TESTER_ROLE}\n{_get_project_rules()}You are a code-review-fix assistant. Fix strictly per the review comments — one replace_in_file precise edit per comment. Do not touch code unrelated to the review comments."
         sys_role = _append_active_prompts(sys_role)
     else:
+        plan_files = [p.get("filename", "") for p in (plan or []) if isinstance(p, dict)]
         content = (
-            f"Tests failed.\nError output:\n{error_info}\n\nPlan: {json.dumps(plan)}\n\n"
-            "归属判断（必读）：如果失败的断言里的符号（如 _build_diff_lines、_validate_path、execute_command 安全规则）"
-            "**不在本次 plan 的改动文件范围**，大概率是 pre-existing 失败。"
-            "处理方式：**先 search_in_files 或读 `notes/shadow/` 下相关笔记**找 pre-existing 记录；"
-            "若已有记录或归属判断为 pre-existing → 直接 `task_complete(success=true, summary='...pre-existing 不修复')` 收尾。"
+            f"Tests failed.\nError output:\n{error_info}\n\nPlan files (this task's scope): {plan_files}\n\n"
+            "归属判断（必读 — 走 _TESTER_ROLE 的 Investigation order 第 1 条）：\n"
+            "失败断言里的符号 / 函数 / 测试目标对应的源文件，**是否在 Plan files 列表里**？\n"
+            "- 在 → 本次任务引入的回归，正常修复\n"
+            "- 不在 → 大概率是 pre-existing 失败，**直接 `task_complete(success=true, summary='X/Y/Z 等 N 条不属本次范围, 已跳过')` 收尾**，"
+            "由用户判断是否单独立项；不要读测试文件再去揣摩，归属规则已足够定性。\n\n"
             "**严禁通过弱化测试断言（加 `or` 子句、改字面量、删除关键字）来让失败「过」** —— 这是把 bug 藏起来，不是修。"
         )
         sys_role = f"{_TESTER_ROLE}\n{_get_project_rules()}You are a code-fix assistant. Fix the code precisely based on the error output — prefer replace_in_file for minimal changes, only use write_file to rewrite a whole file when necessary."
