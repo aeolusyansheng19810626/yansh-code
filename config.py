@@ -42,6 +42,12 @@ CLAUDE_OPUS   = "claude-opus-4-7"
 CLAUDE_SONNET = "claude-sonnet-4-6"
 CLAUDE_HAIKU  = "claude-haiku-4-5"
 
+# 通过 ICA gateway 可达的非 Claude 模型（用 OpenAI 兼容 SDK 直调 ICA endpoint）
+# 经 scripts/probe_ica_models.py 验证可调通（2026-05-24）
+ICA_GEMINI_3_PRO = "gemini-3-pro-preview"   # 推理模型，长 context；thinking 占大量 output token
+ICA_GPT_5_4      = "gpt-5.4-gus"            # GPT-5.4，跨 family 容灾
+
+# Vertex AI 直调（已弃用路径，留作历史）
 GEMINI_3_FLASH  = "google/gemini-2.5-flash"
 GEMINI_31_PRO   = "google/gemini-2.5-pro"
 GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY")
