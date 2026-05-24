@@ -46,9 +46,11 @@ yansh-code 是一个本地运行的命令行编程助手 CLI。用户输入自�
 
 auto / code / plan / audit，可在命令行或交互中动态切换（见[运行模式](#运行模式)）
 
-**6 种 agent 角色**
+**5 种 agent 角色**
 
-架构师（plan）、码农（code）、审查员（review）、测试员（fix）、审计员（audit）、子 agent（explorer / auditor / general）
+架构师（plan）、码农（code）、测试员（fix）、审计员（audit）、子 agent（explorer / auditor / general）
+
+> 注：早期还有独立的"审查员（review）"角色，因为割裂上下文 + JSON 协议脆弱导致死循环，已从主流程移除（见 `notes/shadow/2026-05-21_02-remove-reviewer.md`）。`_REVIEWER_ROLE` system prompt 与 `review()` 函数作为独立可调用工具保留，未来可绑到 `/review` skill。
 
 **25+ 工具**
 
