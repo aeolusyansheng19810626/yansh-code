@@ -1360,11 +1360,21 @@ def _dispatch_tool_call_inner(tool_call, args, *, mode="auto", allow_hil=True,
                     style="yellow", highlight=False,
                 )
                 args["role"] = "auditor"
+        # P3 #6.1: dispatch_subagent 入口前测当前线程 read_cache 累计；出口算 delta
+        # 塞到 out **顶层**（不进 result，LLM 看不到，节省 ~25 token/次）。
+        # 并发分支由 _dispatch_tool_calls 读 out["_read_cache_delta"] 合并到主线程。
+        is_subagent_call = (name == "dispatch_subagent")
+        if is_subagent_call:
+            _entry_total, _entry_hits, _ = _read_cache_stats()
         try:
             result = readonly_handlers[name](**args)
         except Exception as e:
             result = _tools_mod._err("internal", f"工具调用异常: {e}", name)
-        return {"name": name, "args": args, "id": tool_call.id, "result": result}
+        out = {"name": name, "args": args, "id": tool_call.id, "result": result}
+        if is_subagent_call:
+            _exit_total, _exit_hits, _ = _read_cache_stats()
+            out["_read_cache_delta"] = (_exit_total - _entry_total, _exit_hits - _entry_hits)
+        return out
 
     # P2 #10 MCP 路由：mcp__<server>__<tool> 转发到对应 server
     if name.startswith("mcp__"):
@@ -1441,13 +1451,13 @@ def _dispatch_tool_calls(tool_calls, *, mode, allow_hil, allow_confirm, snap, me
                     }
         # P3 #6.1: 并发 worker 跑完后合并子线程的 read_cache delta 到主线程
         # （worker 的 threading.local cache 独立，不合并会让 _print_read_cache_summary 漏算）
+        # delta 在 out **顶层**而非 out["result"]——避免序列化给 LLM。
         # 串行分支不在这里——单个 subagent 跑在调用线程，delta 已直接计入。
         for idx in sub_indices:
             out = outs[idx]
             if not isinstance(out, dict):
                 continue
-            r = out.get("result") or {}
-            d = r.get("_read_cache_delta")
+            d = out.get("_read_cache_delta")
             if d and isinstance(d, (list, tuple)) and len(d) == 2:
                 _read_cache_merge(int(d[0]), int(d[1]))
 

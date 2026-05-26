@@ -187,10 +187,6 @@ def _run_subagent(task: str, role: str = "explorer", max_steps: int = 8) -> dict
                 "summary": "子 agent 不能再派子 agent（递归被禁用）。请在父 agent 直接做。",
                 "steps": 0, "role": role}
 
-    # P3 #6.1: 入口记当前线程 read_cache 累计——出口算 delta 回传给父 agent，
-    # 让并发 worker 线程（threading.local 隔离）的 read 命中数能合并到主线程汇总
-    _entry_total, _entry_hits, _ = _a._read_cache_stats()
-
     role = role if role in ("explorer", "general", "auditor") else "explorer"
     max_steps_clamped = max(1, min(int(max_steps or 8), _SUBAGENT_HARD_CAP))
     tools_subset = _subagent_tools_for_role(role)
@@ -289,12 +285,7 @@ def _run_subagent(task: str, role: str = "explorer", max_steps: int = 8) -> dict
         _SUBAGENT_STATS["last_steps"] = steps
         _SUBAGENT_STATS["last_success"] = success
 
-    # P3 #6.1: 算 delta 回传——主线程 _dispatch_tool_calls 只在并发分支合并
-    _exit_total, _exit_hits, _ = _a._read_cache_stats()
-    _read_cache_delta = (_exit_total - _entry_total, _exit_hits - _entry_hits)
-
-    return {"success": success, "summary": summary, "steps": steps, "role": role,
-            "_read_cache_delta": _read_cache_delta}
+    return {"success": success, "summary": summary, "steps": steps, "role": role}
 
 
 def _subagent_handler(task: Optional[str] = None, role: str = "explorer",
@@ -315,9 +306,6 @@ def _subagent_handler(task: Optional[str] = None, role: str = "explorer",
         "summary": res["summary"],
         "steps": res["steps"],
         "role": res["role"],
-        # P3 #6.1: 旁路 metadata，让父 agent 主线程合并 worker 线程 read_cache delta；
-        # 下划线前缀 LLM 通常忽略，且 schema 未声明此字段
-        "_read_cache_delta": res.get("_read_cache_delta", (0, 0)),
     }
 
 

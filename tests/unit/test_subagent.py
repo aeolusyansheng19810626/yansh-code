@@ -201,19 +201,21 @@ def test_run_subagent_no_override_for_general(tmp_path, monkeypatch):
     assert captured.get("model_override") is None
 
 
-def test_run_subagent_returns_read_cache_delta(tmp_path, monkeypatch):
-    """P3 #6.1: _run_subagent return 含 _read_cache_delta，反映本次执行期间当前线程的 read 增量。
+def test_dispatch_subagent_attaches_read_cache_delta_at_top_level(tmp_path, monkeypatch):
+    """P3 #6.1 (Minor 1): dispatch_subagent 后 out 顶层有 _read_cache_delta，
+    out["result"] 内**没有** —— 避免 LLM 看到内部计数 metadata。
 
-    场景：让 fake LLM 第一轮调 read_file 制造命中，第二轮 task_complete 收尾。
-    断言：_read_cache_delta = (2, 0)（第 1 轮 miss + duplicate 命中拦截在 _dispatch 层
-    用 _read_cache_hit_or_record 各 +1；handler 入口 entry stats 是当前线程当前累计）
+    场景：单个 dispatch_subagent，fake LLM 第一轮 read_file 制造 delta，
+    第二轮 task_complete。断言 _dispatch_tool_call 返回的 out 顶层带 delta，
+    result 不带（不会被 _record_dispatch json.dumps 给 LLM）。
 
-    注意：subagent 跑在调用线程，delta 直接反映当前线程 read。
+    注意：必须 patch llm_client.call_llm（subagent.py 用 `from llm_client import call_llm`
+    lazy import，patch agent.call_llm 不生效）。
     """
     import llm_client as _lc
     with state.scoped_session(tmp_path):
-        (tmp_path / "main.py").write_text("def f(): pass\n", encoding="utf-8")
-        agent._read_cache_clear()  # 主线程 stats 清零
+        (tmp_path / "main.py").write_text("x=1\n", encoding="utf-8")
+        agent._read_cache_clear()
 
         call_n = {"i": 0}
 
@@ -228,35 +230,83 @@ def test_run_subagent_returns_read_cache_delta(tmp_path, monkeypatch):
             ])
 
         monkeypatch.setattr(_lc, "call_llm", fake)
-        res = agent._run_subagent("查 main.py", role="explorer", max_steps=4)
+        tc = _mk_tool_call("s1", "dispatch_subagent",
+                           {"task": "查 main.py", "role": "explorer", "max_steps": 4})
+        out = agent._dispatch_tool_call(tc, mode="audit", allow_hil=False,
+                                        allow_confirm=False, snap=None)
 
-        # 验证 return 含 _read_cache_delta
-        assert "_read_cache_delta" in res
-        delta = res["_read_cache_delta"]
-        assert isinstance(delta, tuple)
-        assert len(delta) == 2
-        # 至少 1 次 read（miss），不应是负数
-        assert delta[0] >= 1
-        assert delta[1] >= 0
+        # out 顶层有 _read_cache_delta
+        assert "_read_cache_delta" in out, f"out 缺 _read_cache_delta：{out.keys()}"
+        d = out["_read_cache_delta"]
+        assert isinstance(d, tuple) and len(d) == 2
+        assert d[0] >= 1, f"delta 应至少 1 次 read，实际 {d}"
+
+        # out["result"] **不**含 _read_cache_delta（防 LLM 看到内部 metadata）
+        assert "_read_cache_delta" not in out["result"], \
+            f"result 不应含 _read_cache_delta，会被 json.dumps 给 LLM"
 
 
-def test_subagent_handler_passes_read_cache_delta(tmp_path, monkeypatch):
-    """P3 #6.1: _subagent_handler 透传 _read_cache_delta 给父 agent"""
+def test_concurrent_subagents_merge_delta_to_main_thread(tmp_path, monkeypatch):
+    """P3 #6.1 (Minor 4): 端到端验证 _dispatch_tool_calls 并发分支自动 merge。
+
+    模拟 ≥2 subagent 并发，每个 worker 线程 read_file 触发 read_cache_state
+    （worker 独立的 threading.local）。跑完后主线程 _read_cache_stats 应已合并
+    所有 worker 的 delta。
+    """
     import llm_client as _lc
+    import threading
     with state.scoped_session(tmp_path):
+        (tmp_path / "a.py").write_text("a=1\n", encoding="utf-8")
+        (tmp_path / "b.py").write_text("b=1\n", encoding="utf-8")
+        (tmp_path / "c.py").write_text("c=1\n", encoding="utf-8")
         agent._read_cache_clear()
 
-        monkeypatch.setattr(_lc, "call_llm", lambda msgs, **kw: _mk_resp(
-            tool_calls=[("c1", "task_complete", {"success": True, "summary": "ok"})]
-        ))
+        # 主线程预先 read 1 次（确认 entry 不归零）
+        agent._read_cache_hit_or_record({"filename": "main.py", "offset": None, "limit": None})
 
-        from subagent import _subagent_handler
-        out = _subagent_handler(task="任务", role="explorer", max_steps=2)
+        # 每个 worker 线程的 fake LLM：第 1 轮 read 不同文件，第 2 轮 task_complete
+        call_state = {}
+        call_state_lock = threading.Lock()
+        # 用线程局部计数避免依赖具体线程名
+        worker_id = {"counter": 0}
 
-        # handler 返回 dict 必须含 _read_cache_delta（即使 0/0）
-        assert "_read_cache_delta" in out
-        assert isinstance(out["_read_cache_delta"], tuple)
-        assert len(out["_read_cache_delta"]) == 2
+        def fake_llm(msgs, **kw):
+            tname = threading.current_thread().name
+            with call_state_lock:
+                if tname not in call_state:
+                    worker_id["counter"] += 1
+                    call_state[tname] = {"n": 0, "id": worker_id["counter"]}
+                call_state[tname]["n"] += 1
+                n = call_state[tname]["n"]
+                wid = call_state[tname]["id"]
+            fn = ["a.py", "b.py", "c.py"][(wid - 1) % 3]
+            if n == 1:
+                return _mk_resp(tool_calls=[("r" + tname + str(n), "read_file", {"filename": fn})])
+            return _mk_resp(tool_calls=[
+                ("tc" + tname + str(n), "task_complete", {"success": True, "summary": "ok"})
+            ])
+
+        monkeypatch.setattr(_lc, "call_llm", fake_llm)
+        tool_calls = [
+            _mk_tool_call("s1", "dispatch_subagent", {"task": "A", "role": "explorer", "max_steps": 3}),
+            _mk_tool_call("s2", "dispatch_subagent", {"task": "B", "role": "explorer", "max_steps": 3}),
+            _mk_tool_call("s3", "dispatch_subagent", {"task": "C", "role": "explorer", "max_steps": 3}),
+        ]
+        outs = agent._dispatch_tool_calls(
+            tool_calls, mode="audit", allow_hil=False, allow_confirm=False,
+            snap=None, messages=[],
+        )
+
+        assert len(outs) == 3
+        # 每个 out 顶层都应有 delta，result 内不应有
+        for out in outs:
+            assert "_read_cache_delta" in out
+            assert "_read_cache_delta" not in out["result"]
+
+        # 关键断言：主线程 stats 已合并所有 worker 的 delta
+        # 主线程原 1 次 + 3 个 worker 各 1 次 read = total >= 4
+        total, hits, _ = agent._read_cache_stats()
+        assert total >= 4, f"主线程未合并 worker delta：total={total}, expected >=4"
 
 
 def test_run_subagent_returns_summary_on_task_complete(tmp_path, monkeypatch):
