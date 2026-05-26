@@ -1023,6 +1023,130 @@ def _estimate_messages_tokens(messages) -> int:
     return len(s) // 4
 
 
+def _msg_role(m):
+    """统一从 dict 或 SDK message 对象取 role"""
+    if isinstance(m, dict):
+        return m.get("role")
+    return getattr(m, "role", None)
+
+
+def _split_messages_into_pairs(rest):
+    """P2 #4-B2：把 head 之后的 messages 按 assistant 边界切成 pair。
+
+    每个 pair = 一条 assistant message + 紧随的 tool messages（配对完整）。
+    若 rest 起始处有零散 user message（无 assistant 在前），单独成 pair。
+    保证不破坏 tool_use/tool_result 配对。
+    """
+    pairs = []
+    current = []
+    for m in rest:
+        role = _msg_role(m)
+        if role == "assistant":
+            if current:
+                pairs.append(current)
+            current = [m]
+        else:
+            if current:
+                current.append(m)
+            else:
+                pairs.append([m])
+    if current:
+        pairs.append(current)
+    return pairs
+
+
+def _flatten_pairs_for_summary(pairs) -> str:
+    """把若干 pair 拼成一段对话文本给 summarizer LLM 看"""
+    chunks = []
+    for p in pairs:
+        for m in p:
+            role = _msg_role(m) or "?"
+            if isinstance(m, dict):
+                content = m.get("content", "")
+                tool_calls = m.get("tool_calls")
+            else:
+                content = getattr(m, "content", "") or ""
+                tool_calls = getattr(m, "tool_calls", None)
+            chunks.append(f"[{role}] {content}")
+            if tool_calls:
+                for tc in tool_calls:
+                    if isinstance(tc, dict):
+                        fn = tc.get("function", {}).get("name", "?")
+                        args = tc.get("function", {}).get("arguments", "")
+                    else:
+                        fn = getattr(getattr(tc, "function", None), "name", "?")
+                        args = getattr(getattr(tc, "function", None), "arguments", "")
+                    chunks.append(f"  [tool_call] {fn}({args})")
+    return "\n".join(chunks)
+
+
+_SUMMARIZE_SYSTEM = (
+    "你是对话历史压缩助手。下面是一段 coder agent 的历史对话（含工具调用与结果）。"
+    "请用简洁中文概括：①已调过哪些工具/读了哪些文件 ②关键发现/读到的内容要点 "
+    "③已经做了哪些代码改动（哪个文件改了什么）④当前进展和未完成的任务 ⑤遇到的报错/卡点。"
+    "控制在 800 字内，重要事实不要丢。不要加客套话，直接给结构化要点。"
+)
+
+
+def _summarize_old_history(text: str) -> str:
+    """调一次轻量 LLM 把旧对话压缩成摘要"""
+    summarize_msgs = [
+        {"role": "system", "content": _SUMMARIZE_SYSTEM},
+        {"role": "user", "content": text},
+    ]
+    resp = call_llm(summarize_msgs, tools=None)
+    return (resp.choices[0].message.content or "").strip()
+
+
+def _compact_messages(msgs, keep_recent_pairs: int = 2):
+    """P2 #4-B2：把旧 message 历史压缩成单条 system 摘要，保留最近 N 个 pair 原文。
+
+    切分：[system, user_initial] + [old_pairs...] + [recent_N_pairs]
+    保留头部（system + user_initial）+ 最近 N 个 pair 原文，旧 pair 走 LLM summarize。
+
+    若 pair 总数 <= keep_recent_pairs，直接返回原 msgs（不必 compact）。
+    """
+    if not msgs or len(msgs) < 4:
+        return msgs
+
+    head_count = 0
+    if _msg_role(msgs[0]) == "system":
+        head_count = 1
+    if len(msgs) > head_count and _msg_role(msgs[head_count]) == "user":
+        head_count += 1
+    if head_count == 0:
+        return msgs  # 形态异常，保守不压
+
+    head = list(msgs[:head_count])
+    rest = list(msgs[head_count:])
+
+    pairs = _split_messages_into_pairs(rest)
+    if len(pairs) <= keep_recent_pairs:
+        return msgs
+
+    old_pairs = pairs[:-keep_recent_pairs] if keep_recent_pairs > 0 else pairs
+    recent_pairs = pairs[-keep_recent_pairs:] if keep_recent_pairs > 0 else []
+
+    old_text = _flatten_pairs_for_summary(old_pairs)
+    try:
+        summary = _summarize_old_history(old_text)
+    except Exception as e:
+        # summarize 失败 → 不压（不能丢 history 让 LLM 跑偏）
+        console.print(f"[auto-compact] summarize 失败，保留原 messages：{e}", style="yellow")
+        return msgs
+
+    if not summary:
+        return msgs
+
+    summary_msg = {"role": "system",
+                   "content": f"[历史摘要 - 旧对话已压缩] {summary}"}
+
+    new_msgs = head + [summary_msg]
+    for p in recent_pairs:
+        new_msgs.extend(p)
+    return new_msgs
+
+
 def _infer_test_scope(plan_files) -> list[str]:
     """P1.3：根据 plan 列出的修改文件推断本次任务相关的测试文件路径列表。
 
@@ -2005,8 +2129,44 @@ Note: you must use write_file to write the file; the filename must be exactly `{
         _round_budget = attempts_left  # 警告打印时显示真实上限
         first_call = True
         _signaled_complete_this_file = False  # [P1 #2] 本文件是否已 task_complete(success=True)
+
+        # P2 #4-B2: auto-compact 配置
+        _compact_threshold = int(_cfg("compact_threshold_tokens") or 80_000)
+        _compact_keep_pairs = int(_cfg("compact_keep_recent_pairs") or 2)
+        _compact_thrash_count = 0  # 连续 compact 后仍超阈值的次数
+
         while attempts_left > 0:
             attempts_left -= 1
+
+            # P2 #4-B2: 每轮 call_llm 前检测是否需 compact
+            _est = _estimate_messages_tokens(msgs)
+            if _est > _compact_threshold:
+                console.print(
+                    f"[auto-compact] msgs ~{_est} tokens > {_compact_threshold}，触发压缩...",
+                    style="cyan",
+                )
+                _new_msgs = _compact_messages(msgs, keep_recent_pairs=_compact_keep_pairs)
+                _new_est = _estimate_messages_tokens(_new_msgs)
+                if _new_est >= _est:
+                    # compact 没降下来（pairs 太少或 summarize 没工作）
+                    _compact_thrash_count += 1
+                    if _compact_thrash_count >= 2:
+                        raise RuntimeError(
+                            f"[auto-compact] thrashing：连续 2 次 compact 仍 >= {_compact_threshold} tokens "
+                            f"(est={_est} → {_new_est})，放弃避免死循环"
+                        )
+                    console.print(
+                        f"[auto-compact] 未降低（{_est} → {_new_est}），放过本轮",
+                        style="yellow",
+                    )
+                else:
+                    msgs = _new_msgs
+                    _compact_thrash_count = 0
+                    console.print(
+                        f"[auto-compact] 已压缩 {_est} → {_new_est} tokens",
+                        style="green",
+                    )
+
             if first_call and not file_exists:
                 tc = {"type": "function", "function": {"name": "write_file"}}
             else:

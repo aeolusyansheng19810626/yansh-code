@@ -840,6 +840,213 @@ def test_estimate_messages_tokens_tool_call_message():
     assert 700 < est < 1000
 
 
+# =====================================================================
+# P2 #4-B2：_compact_messages
+# =====================================================================
+
+def _make_assistant_msg(text="ok", tool_calls=None):
+    """构造 assistant message dict（模拟 SDK message 序列化后形态）"""
+    m = {"role": "assistant", "content": text}
+    if tool_calls:
+        m["tool_calls"] = [
+            {"id": cid, "type": "function",
+             "function": {"name": name, "arguments": '{"x":1}'}}
+            for cid, name in tool_calls
+        ]
+    return m
+
+
+def _make_tool_msg(call_id, content="result"):
+    return {"role": "tool", "tool_call_id": call_id, "content": content}
+
+
+def test_compact_returns_original_when_too_few_messages():
+    """msgs < 4 → 不压"""
+    msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
+    assert agent._compact_messages(msgs, keep_recent_pairs=2) == msgs
+
+
+def test_compact_returns_original_when_pairs_below_keep():
+    """pair 数 <= keep_recent_pairs → 不压"""
+    msgs = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "u_initial"},
+        _make_assistant_msg("a1", [("c1", "read_file")]),
+        _make_tool_msg("c1", "file body"),
+    ]
+    # 1 个 pair，keep=2 → 不压
+    assert agent._compact_messages(msgs, keep_recent_pairs=2) == msgs
+
+
+def test_compact_preserves_head_and_recent_and_tool_pairing(monkeypatch):
+    """关键测：head 保留，recent N pairs 保留，tool_call/tool_result 配对不破"""
+    # 构造 5 个 pair，keep=2 → 应压缩前 3 个
+    msgs = [
+        {"role": "system", "content": "system_prompt"},
+        {"role": "user", "content": "user_initial"},
+        # pair 1
+        _make_assistant_msg("a1", [("c1", "read_file")]),
+        _make_tool_msg("c1", "old1"),
+        # pair 2
+        _make_assistant_msg("a2", [("c2", "grep")]),
+        _make_tool_msg("c2", "old2"),
+        # pair 3
+        _make_assistant_msg("a3", [("c3", "read_file")]),
+        _make_tool_msg("c3", "old3"),
+        # pair 4 (recent)
+        _make_assistant_msg("a4", [("c4", "replace_in_file")]),
+        _make_tool_msg("c4", "recent4"),
+        # pair 5 (recent)
+        _make_assistant_msg("a5", [("c5", "test_runner")]),
+        _make_tool_msg("c5", "recent5"),
+    ]
+
+    captured = {}
+    def fake_call_llm(messages, **kw):
+        captured["summarize_msgs"] = messages
+        resp = MagicMock()
+        m = MagicMock()
+        m.content = "[摘要] 调过 read/grep，读了 X.py，未改动"
+        resp.choices = [MagicMock(message=m)]
+        return resp
+
+    monkeypatch.setattr(agent, "call_llm", fake_call_llm)
+
+    out = agent._compact_messages(msgs, keep_recent_pairs=2)
+
+    # 头部保留
+    assert out[0]["role"] == "system" and out[0]["content"] == "system_prompt"
+    assert out[1]["role"] == "user" and out[1]["content"] == "user_initial"
+    # 第 3 条是摘要 system message
+    assert out[2]["role"] == "system"
+    assert "历史摘要" in out[2]["content"]
+    assert "摘要" in out[2]["content"]
+    # 后续 4 条是 recent 2 个 pair（assistant + tool）
+    assert len(out) == 2 + 1 + 4
+    assert out[3]["content"] == "a4"
+    assert out[4]["tool_call_id"] == "c4"
+    assert out[5]["content"] == "a5"
+    assert out[6]["tool_call_id"] == "c5"
+    # 旧 pair 内容不应在新 msgs 里出现
+    serialized = str(out)
+    assert "old1" not in serialized
+    assert "old2" not in serialized
+    assert "old3" not in serialized
+    # summarize 调用真发生了
+    assert "summarize_msgs" in captured
+    # summarize prompt 含旧 pair 内容
+    summary_user = next(m for m in captured["summarize_msgs"] if m["role"] == "user")
+    assert "old1" in summary_user["content"]
+    assert "old3" in summary_user["content"]
+
+
+def test_compact_total_size_decreases(monkeypatch):
+    """compact 后总 token 估算应显著下降"""
+    big = "x" * 5000
+    msgs = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "u"},
+    ]
+    # 加 6 个 pair，每个含 5KB 内容
+    for i in range(6):
+        msgs.append(_make_assistant_msg(f"a{i}", [(f"c{i}", "read_file")]))
+        msgs.append(_make_tool_msg(f"c{i}", big))
+
+    monkeypatch.setattr(agent, "call_llm", lambda m, **kw: SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="短摘要"))]
+    ))
+
+    before = agent._estimate_messages_tokens(msgs)
+    out = agent._compact_messages(msgs, keep_recent_pairs=2)
+    after = agent._estimate_messages_tokens(out)
+    assert after < before * 0.5, f"compact 后 ({after}) 应 < 压缩前 ({before}) 的 50%"
+
+
+def test_compact_empty_summary_falls_back(monkeypatch):
+    """summarize 返回空 → 不压（避免丢历史）"""
+    msgs = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "u"},
+        _make_assistant_msg("a1", [("c1", "read_file")]),
+        _make_tool_msg("c1", "x"),
+        _make_assistant_msg("a2", [("c2", "grep")]),
+        _make_tool_msg("c2", "y"),
+        _make_assistant_msg("a3", [("c3", "edit")]),
+        _make_tool_msg("c3", "z"),
+    ]
+    monkeypatch.setattr(agent, "call_llm", lambda m, **kw: SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=""))]
+    ))
+    out = agent._compact_messages(msgs, keep_recent_pairs=2)
+    assert out == msgs
+
+
+def test_compact_summarize_exception_falls_back(monkeypatch):
+    """summarize 抛异常 → 不压"""
+    msgs = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "u"},
+        _make_assistant_msg("a1", [("c1", "read_file")]),
+        _make_tool_msg("c1", "x"),
+        _make_assistant_msg("a2", [("c2", "grep")]),
+        _make_tool_msg("c2", "y"),
+        _make_assistant_msg("a3", [("c3", "edit")]),
+        _make_tool_msg("c3", "z"),
+    ]
+    def boom(m, **kw):
+        raise RuntimeError("LLM down")
+    monkeypatch.setattr(agent, "call_llm", boom)
+    out = agent._compact_messages(msgs, keep_recent_pairs=2)
+    assert out == msgs
+
+
+def test_split_messages_into_pairs_basic():
+    """切分核心逻辑：按 assistant 边界切，tool message 紧跟 assistant"""
+    rest = [
+        _make_assistant_msg("a1", [("c1", "read_file")]),
+        _make_tool_msg("c1", "r1"),
+        _make_assistant_msg("a2", [("c2", "grep")]),
+        _make_tool_msg("c2", "r2a"),
+        _make_tool_msg("c2", "r2b"),  # 假设有多个 tool result
+        _make_assistant_msg("a3"),  # 无 tool_calls
+    ]
+    pairs = agent._split_messages_into_pairs(rest)
+    assert len(pairs) == 3
+    assert len(pairs[0]) == 2  # a1 + c1
+    assert len(pairs[1]) == 3  # a2 + c2 + c2
+    assert len(pairs[2]) == 1  # a3
+
+
+def test_split_messages_into_pairs_leading_user():
+    """rest 起始有 user（无 assistant 在前）→ 单独成 pair"""
+    rest = [
+        {"role": "user", "content": "follow up"},
+        _make_assistant_msg("a1", [("c1", "read")]),
+        _make_tool_msg("c1", "r"),
+    ]
+    pairs = agent._split_messages_into_pairs(rest)
+    assert len(pairs) == 2
+    assert pairs[0][0]["role"] == "user"
+    assert pairs[1][0]["role"] == "assistant"
+
+
+def test_estimate_under_threshold_no_compact():
+    """msgs 不到阈值时调用方不应触发 compact（接口契约：调用方负责检测）
+
+    本测验证 _compact_messages 即便被低阈值调用也行为正确：
+    pair 数 <= keep → 返回原 msgs 不调用 LLM
+    """
+    msgs = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "u"},
+        _make_assistant_msg("a1", [("c1", "read")]),
+        _make_tool_msg("c1", "r"),
+    ]
+    # 不 monkeypatch call_llm，故若错误调用 LLM 会真发请求；测试应该不调
+    out = agent._compact_messages(msgs, keep_recent_pairs=2)
+    assert out == msgs
+
+
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, "-v"])
