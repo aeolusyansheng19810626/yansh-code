@@ -1797,6 +1797,7 @@ Note: you must use write_file to write the file; the filename must be exactly `{
         attempts_left = max(_base_rounds, _expected_rounds + 2)
         _round_budget = attempts_left  # 警告打印时显示真实上限
         first_call = True
+        _signaled_complete_this_file = False  # [P1 #2] 本文件是否已 task_complete(success=True)
         while attempts_left > 0:
             attempts_left -= 1
             if first_call and not file_exists:
@@ -1826,6 +1827,7 @@ Note: you must use write_file to write the file; the filename must be exactly `{
                             return {"early_exit": True, "success": False, "summary": _summary}
                         # success=True：本文件完成，跳出 inner loop（multi-file 循环继续）
                         coder_signal = {"early_exit": True, "success": True, "summary": _summary}
+                        _signaled_complete_this_file = True
                         _early_exit_inner = True
                         break
                 if _early_exit_inner:
@@ -1833,8 +1835,9 @@ Note: you must use write_file to write the file; the filename must be exactly `{
             else:
                 break
 
-        if attempts_left <= 0 and response_message.tool_calls:
+        if attempts_left <= 0 and response_message.tool_calls and not _signaled_complete_this_file:
             # #8 上限耗尽仍在调工具，提示并记录（上限已 plan-driven 动态调整）
+            # [P1 #2] task_complete(success=True) 跟用尽同轮触发时不警告 — coder 已主动收尾
             warn = f"[警告] {filename} 已用尽 {_round_budget} 轮工具调用上限（expected_edits={expected_edits}）"
             console.print(warn, style="yellow", highlight=False)
             _task_log_mod._current_task_log.setdefault("warnings", []).append(warn)

@@ -208,6 +208,52 @@ def test_code_returns_none_when_no_task_complete(tmp_path):
     assert result is None
 
 
+def test_code_no_warning_when_task_complete_in_final_round(tmp_path):
+    """[P1 #2] task_complete(success=True) 与 attempts_left=0 同轮触发时不打 '已用尽' 警告"""
+    import config, tools
+    import task_log as _task_log_mod
+    config.set_workspace_dir(str(tmp_path))
+    tools._reinit_paths()
+    (tmp_path / "calc.py").write_text("def add(a,b): return a+b\n", encoding="utf-8")
+
+    # 把每文件预算压到 2 轮，便于触发"最后一轮"边界
+    orig_cfg = agent._cfg
+    agent._cfg = lambda k: 2 if k == "coder_rounds_per_file" else orig_cfg(k)
+
+    # 重置 task_log warnings
+    _task_log_mod._current_task_log.clear()
+    _task_log_mod._current_task_log.update({"warnings": []})
+
+    call_count = {"n": 0}
+    def mock_llm(msgs, **kw):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return _make_response(tool_calls=[("c1", "read_file", {"filename": "calc.py"})])
+        # 第 2 轮（最后一轮，attempts_left 减到 0 那一次）调 task_complete success=True
+        return _make_response(tool_calls=[("c2", "task_complete",
+                                            {"success": True, "summary": "看完了，无需改动"})])
+
+    orig_llm = agent.call_llm
+    try:
+        agent.call_llm = mock_llm
+        result = agent.code(
+            {"files": [{"filename": "calc.py", "intent": "审视"}], "test_command": ""},
+            mode="code",
+            requirement="看一下",
+        )
+    finally:
+        agent.call_llm = orig_llm
+        agent._cfg = orig_cfg
+
+    # task_complete success=True → coder_signal 上送
+    assert result is not None
+    assert result["success"] is True
+    # 关键断言：_task_log 里不能有"已用尽"警告
+    warnings = _task_log_mod._current_task_log.get("warnings", [])
+    assert not any("已用尽" in w for w in warnings), \
+        f"task_complete 同轮触发时不应警告，但警告记录为: {warnings}"
+
+
 def test_report_includes_task_complete_signal_when_provided():
     sig = {"early_exit": True, "success": True, "summary": "完成"}
     out = agent.report(True, {"returncode": 0}, task_complete_signal=sig)
