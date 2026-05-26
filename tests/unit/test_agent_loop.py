@@ -254,6 +254,127 @@ def test_code_no_warning_when_task_complete_in_final_round(tmp_path):
         f"task_complete 同轮触发时不应警告，但警告记录为: {warnings}"
 
 
+# ============= P1 #4: plan 接受 coder "无需修改" 信号 =============
+
+def test_summary_no_changes_chinese():
+    """中文 summary 含强信号关键词时命中"""
+    assert agent._summary_says_no_changes("三处均已存在，无需修改")
+    assert agent._summary_says_no_changes("不需要修改")
+    assert agent._summary_says_no_changes("max_bytes 已实现，无需改动")
+
+
+def test_summary_no_changes_english():
+    """英文 summary 含强信号关键词时命中（大小写不敏感）"""
+    assert agent._summary_says_no_changes("All three places already exist; no changes needed")
+    assert agent._summary_says_no_changes("Already implemented; nothing to modify")
+    assert agent._summary_says_no_changes("NOTHING TO MODIFY")
+
+
+def test_summary_no_changes_negative():
+    """正常修复 summary 不命中"""
+    assert not agent._summary_says_no_changes("已修复 list_files max_depth=1 边界 bug")
+    assert not agent._summary_says_no_changes("Added multiply function")
+    assert not agent._summary_says_no_changes("修了 3 处缺参问题")
+    assert not agent._summary_says_no_changes("")
+
+
+def test_summary_no_changes_avoids_partial_already_exists_false_positive():
+    """[P1 #4 reviewer 误报回归] 局部'已存在/已实现'但实际还要改剩余 → 不应命中
+
+    这些是 reviewer 实测的 5 个误吞 case，单独 trigger 会造成
+    multi-file short-circuit 误跳过剩余文件。
+    """
+    # case 1: 局部已存在但还要改其他
+    assert not agent._summary_says_no_changes("已经实现了 list_files，但还需要修改 max_depth")
+    # case 2: "都已经" 独立太宽
+    assert not agent._summary_says_no_changes("我都已经看完了，开始改第一个")
+    # case 3: 描述被改对象的"已存在"
+    assert not agent._summary_says_no_changes("已存在的逻辑被替换")
+    # case 4: 部分已存在剩余处理
+    assert not agent._summary_says_no_changes("部分已存在，剩余的开始处理")
+    # case 5: 英文同类
+    assert not agent._summary_says_no_changes("Already implemented X, but need to add Y")
+
+
+def test_code_short_circuits_remaining_files_on_no_changes_needed(tmp_path):
+    """[P1 #4] coder 第 1 文件报'无需修改' → 跳过剩余 expected_edits 文件"""
+    import config, tools
+    config.set_workspace_dir(str(tmp_path))
+    tools._reinit_paths()
+    # 准备 2 个文件
+    (tmp_path / "a.py").write_text("# a\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("# b\n", encoding="utf-8")
+
+    call_log = []
+    def mock_llm(msgs, **kw):
+        # 从 user content 看当前处理哪个文件
+        last_user = next((m for m in reversed(msgs) if m.get("role") == "user"), None)
+        text = (last_user.get("content") if last_user else "") or ""
+        for fn in ("a.py", "b.py"):
+            if f"当前文件：{fn}" in text:
+                call_log.append(fn)
+                break
+        # 第 1 文件直接 task_complete success=True，summary 含'无需修改'
+        return _make_response(tool_calls=[("c1", "task_complete",
+                                            {"success": True,
+                                             "summary": "代码已存在，无需修改"})])
+
+    orig = agent.call_llm
+    try:
+        agent.call_llm = mock_llm
+        result = agent.code(
+            {"files": [{"filename": "a.py", "intent": "1"},
+                       {"filename": "b.py", "intent": "2"}],
+             "test_command": ""},
+            mode="code", requirement="...",
+        )
+    finally:
+        agent.call_llm = orig
+
+    # 关键断言：b.py 不应被处理（被 short-circuit 跳过）
+    assert "a.py" in call_log
+    assert "b.py" not in call_log, f"P1 #4: b.py 应被 no_changes_needed 信号跳过，实际 call_log: {call_log}"
+    assert result is not None
+    assert result.get("no_changes_needed") is True
+
+
+def test_code_continues_multi_file_when_summary_does_not_match(tmp_path):
+    """coder 第 1 文件 task_complete success=True 但 summary 不含关键词 → multi-file 继续"""
+    import config, tools
+    config.set_workspace_dir(str(tmp_path))
+    tools._reinit_paths()
+    (tmp_path / "a.py").write_text("# a\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("# b\n", encoding="utf-8")
+
+    call_log = []
+    def mock_llm(msgs, **kw):
+        last_user = next((m for m in reversed(msgs) if m.get("role") == "user"), None)
+        text = (last_user.get("content") if last_user else "") or ""
+        for fn in ("a.py", "b.py"):
+            if f"当前文件：{fn}" in text:
+                call_log.append(fn)
+                break
+        return _make_response(tool_calls=[("c1", "task_complete",
+                                            {"success": True, "summary": "已修改完成"})])
+
+    orig = agent.call_llm
+    try:
+        agent.call_llm = mock_llm
+        result = agent.code(
+            {"files": [{"filename": "a.py", "intent": "1"},
+                       {"filename": "b.py", "intent": "2"}],
+             "test_command": ""},
+            mode="code", requirement="...",
+        )
+    finally:
+        agent.call_llm = orig
+
+    # b.py 应被处理（summary 没命中关键词，multi-file 继续）
+    assert call_log == ["a.py", "b.py"]
+    assert result is not None
+    assert not result.get("no_changes_needed")
+
+
 # ============= P1 #6: baseline 识别用户 prompt 关键词过滤 =============
 
 def test_prompt_test_fix_chinese_keywords():

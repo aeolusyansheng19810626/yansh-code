@@ -176,6 +176,37 @@ def _prompt_requests_test_fix(prompt: str) -> bool:
     return any(k in p_low for k in _TEST_FIX_KEYWORDS_EN)
 
 
+# [P1 #4] coder summary 是否在说"本任务无需改动"
+# 命中 → multi-file 循环短路：剩余 expected_edits 不再处理（避免 task #2 烧 91 万 token 改 task 范围外）
+# 只保留"强信号"——单独成立时几乎不可能歧义；移除"已存在"/"已经实现"等弱信号
+# （它们经常出现在"X 已经实现，但还要改 Y"这类局部描述里 → 误吞剩余文件）。
+# 实测误报样本（不应命中）：
+#   "已经实现了 X，但还需要 Y"  / "Already implemented X but need Y"
+#   "都已经" / "X 已存在" 单独
+_NO_CHANGES_KEYWORDS_ZH: list = [
+    "无需修改", "无需改动", "无需更改", "无需调整",
+    "不需要修改", "不需要改动", "不需修改", "不需改动",
+]
+_NO_CHANGES_KEYWORDS_EN: list = [
+    "no changes needed", "no change needed",
+    "no modifications needed", "no modification needed",
+    "no edits needed", "no edit needed",
+    "nothing to change", "nothing to modify", "nothing to fix",
+]
+
+
+def _summary_says_no_changes(summary: str) -> bool:
+    """[P1 #4] coder task_complete 的 summary 是否明确表示"本任务无需修改"。
+    只匹配强信号关键词，避免"X 已经实现但还要改 Y"这类局部描述误吞 multi-file 短路。
+    """
+    if not summary:
+        return False
+    if any(k in summary for k in _NO_CHANGES_KEYWORDS_ZH):
+        return True
+    s_low = summary.lower()
+    return any(k in s_low for k in _NO_CHANGES_KEYWORDS_EN)
+
+
 def _cfg(key):
     """读取生效配置值"""
     return get_config().get(key)
@@ -1868,6 +1899,14 @@ Note: you must use write_file to write the file; the filename must be exactly `{
                         # success=True：本文件完成，跳出 inner loop（multi-file 循环继续）
                         coder_signal = {"early_exit": True, "success": True, "summary": _summary}
                         _signaled_complete_this_file = True
+                        # [P1 #4] coder 报"无需修改" → multi-file 循环 short-circuit
+                        # 任务实际已完成（baseline 已实现），不必再处理剩余 expected_edits 文件
+                        if _summary_says_no_changes(_summary):
+                            coder_signal["no_changes_needed"] = True
+                            console.print(
+                                f"[Coder task_complete] 检测到 '无需修改' 信号 → 跳过剩余 {len(files) - files.index(file_entry) - 1} 个文件",
+                                style="cyan", highlight=False,
+                            )
                         _early_exit_inner = True
                         break
                 if _early_exit_inner:
@@ -1881,6 +1920,10 @@ Note: you must use write_file to write the file; the filename must be exactly `{
             warn = f"[警告] {filename} 已用尽 {_round_budget} 轮工具调用上限（expected_edits={expected_edits}）"
             console.print(warn, style="yellow", highlight=False)
             _task_log_mod._current_task_log.setdefault("warnings", []).append(warn)
+
+        # [P1 #4] coder 报"无需修改" → 直接退出 multi-file 循环
+        if coder_signal and coder_signal.get("no_changes_needed"):
+            break
 
     console.print("代码生成/修改完成")
 
