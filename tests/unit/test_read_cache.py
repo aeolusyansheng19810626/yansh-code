@@ -168,6 +168,47 @@ def test_stats_empty_filename_not_counted():
     assert hits == 0
 
 
+def test_stats_subthread_first_call_no_attribute_error():
+    """子线程首次调用 _read_cache_hit_or_record 不抛 AttributeError，且计数独立于主线程
+
+    覆盖 reviewer 找出的盲点：threading.local 隔离下，子线程从未调过 _read_cache_clear，
+    state.total/hits 属性不存在 → getattr 兜底必须生效；并验证主/子线程计数互不污染。
+    """
+    import threading
+    # 主线程：clear + 1 次 read
+    agent._read_cache_clear()
+    main_a = {"filename": "main.py", "offset": None, "limit": None}
+    agent._read_cache_hit_or_record(main_a)  # 主线程 total=1, hits=0
+
+    sub_results = {}
+    sub_error = []
+
+    def sub_thread():
+        try:
+            # 子线程从未调过 _read_cache_clear，total/hits 属性不存在
+            sub_a = {"filename": "sub.py", "offset": None, "limit": None}
+            agent._read_cache_hit_or_record(sub_a)  # miss → total=1
+            agent._read_cache_hit_or_record(sub_a)  # hit  → total=2, hits=1
+            total, hits, _ = agent._read_cache_stats()
+            sub_results["total"] = total
+            sub_results["hits"] = hits
+        except Exception as e:
+            sub_error.append(e)
+
+    t = threading.Thread(target=sub_thread)
+    t.start()
+    t.join()
+
+    assert not sub_error, f"子线程首次调用抛异常：{sub_error}"
+    # 子线程独立计数
+    assert sub_results["total"] == 2
+    assert sub_results["hits"] == 1
+    # 主线程计数不受子线程影响
+    main_total, main_hits, _ = agent._read_cache_stats()
+    assert main_total == 1
+    assert main_hits == 0
+
+
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, "-v"])

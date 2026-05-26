@@ -2700,15 +2700,19 @@ def _capture_baseline_failures(test_command: str) -> set:
                       style="yellow", highlight=False)
         return set()
 
-def report(success, test_result, task_complete_signal=None):
-    """输出最终结果。task_complete_signal: LLM 主动声明信号 {early_exit, success, summary}，可选。"""
-    # P2.1 命中率：任务结束时打印汇总（total=0 时静默）
-    _total, _hits, _rate = _read_cache_stats()
-    if _total > 0:
+def _print_read_cache_summary():
+    """P2.1 命中率：所有任务出口（正常/中断/异常/早退）调一次。total=0 时静默。
+    在 run() 的 finally 调用，避免 report() 早退路径丢汇总。"""
+    total, hits, rate = _read_cache_stats()
+    if total > 0:
         console.print(
-            f"[read_cache] 总计 {_total} 次, 命中 {_hits} 次 ({_rate * 100:.1f}%)",
+            f"[read_cache] 总计 {total} 次, 命中 {hits} 次 ({rate * 100:.1f}%)",
             highlight=False,
         )
+
+
+def report(success, test_result, task_complete_signal=None):
+    """输出最终结果。task_complete_signal: LLM 主动声明信号 {early_exit, success, summary}，可选。"""
     out = {
         "success": success,
         "test_result": test_result,
@@ -2807,6 +2811,9 @@ def run(requirement, mode="auto"):
         # 异常退出也保存回放
         create_replay_package(str(e))
         raise
+    finally:
+        # P2.1 命中率汇总：所有出口（正常 return / Interrupted / 异常 raise / _run 内部早退 return）都打印
+        _print_read_cache_summary()
 
 
 def _run(requirement, mode):
