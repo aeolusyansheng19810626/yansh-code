@@ -953,8 +953,10 @@ def _get_read_cache() -> set:
 
 
 def _read_cache_clear():
-    """清当前线程的 cache。每次 init_task_log（主线程任务边界）调用。"""
+    """清当前线程的 cache 和计数器。每次 init_task_log（主线程任务边界）调用。"""
     _read_cache_state.cache = set()
+    _read_cache_state.total = 0  # P2.1 命中率：总调用次数
+    _read_cache_state.hits = 0   # P2.1 命中率：命中次数
 
 
 def _read_cache_key(args: dict) -> tuple:
@@ -972,11 +974,22 @@ def _read_cache_hit_or_record(args: dict) -> bool:
     key = _read_cache_key(args)
     if not key[0]:
         return False  # 空 filename 直接放行让 read_file 自己报错
+    # P2.1 命中率：每次调用 total +1
+    _read_cache_state.total = getattr(_read_cache_state, "total", 0) + 1
     cache = _get_read_cache()
     if key in cache:
+        _read_cache_state.hits = getattr(_read_cache_state, "hits", 0) + 1
         return True
     cache.add(key)
     return False
+
+
+def _read_cache_stats() -> tuple:
+    """返回 (total, hits, hit_rate)。hit_rate 为 0.0 当 total=0。"""
+    total = getattr(_read_cache_state, "total", 0)
+    hits = getattr(_read_cache_state, "hits", 0)
+    hit_rate = hits / total if total > 0 else 0.0
+    return total, hits, hit_rate
 
 
 def _infer_test_scope(plan_files) -> list[str]:
@@ -2689,6 +2702,13 @@ def _capture_baseline_failures(test_command: str) -> set:
 
 def report(success, test_result, task_complete_signal=None):
     """输出最终结果。task_complete_signal: LLM 主动声明信号 {early_exit, success, summary}，可选。"""
+    # P2.1 命中率：任务结束时打印汇总（total=0 时静默）
+    _total, _hits, _rate = _read_cache_stats()
+    if _total > 0:
+        console.print(
+            f"[read_cache] 总计 {_total} 次, 命中 {_hits} 次 ({_rate * 100:.1f}%)",
+            highlight=False,
+        )
     out = {
         "success": success,
         "test_result": test_result,

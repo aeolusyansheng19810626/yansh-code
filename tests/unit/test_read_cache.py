@@ -127,6 +127,47 @@ def test_dispatch_other_tools_not_affected(tmp_path):
             assert out["result"].get("error") != "duplicate_read"
 
 
+# ── P2.1 命中率计数器 ────────────────────────────────────────────────────────
+
+
+def test_stats_count_total_and_hits():
+    """多次 read_file：total/hits 计数正确"""
+    agent._read_cache_clear()
+    a1 = {"filename": "b.py", "offset": None, "limit": None}
+    a2 = {"filename": "c.py", "offset": None, "limit": None}
+    agent._read_cache_hit_or_record(a1)  # miss, total=1
+    agent._read_cache_hit_or_record(a2)  # miss, total=2
+    agent._read_cache_hit_or_record(a1)  # hit,  total=3, hits=1
+    agent._read_cache_hit_or_record(a1)  # hit,  total=4, hits=2
+    total, hits, rate = agent._read_cache_stats()
+    assert total == 4
+    assert hits == 2
+    assert abs(rate - 0.5) < 1e-9
+
+
+def test_stats_clear_resets_counters():
+    """_read_cache_clear 后 total/hits 归零"""
+    agent._read_cache_clear()
+    a = {"filename": "d.py", "offset": None, "limit": None}
+    agent._read_cache_hit_or_record(a)
+    agent._read_cache_hit_or_record(a)
+    agent._read_cache_clear()
+    total, hits, _ = agent._read_cache_stats()
+    assert total == 0
+    assert hits == 0
+
+
+def test_stats_empty_filename_not_counted():
+    """空 filename 调用不计入 total（不进 cache 也不统计）"""
+    agent._read_cache_clear()
+    empty = {"filename": "", "offset": None, "limit": None}
+    agent._read_cache_hit_or_record(empty)
+    agent._read_cache_hit_or_record(empty)
+    total, hits, _ = agent._read_cache_stats()
+    assert total == 0
+    assert hits == 0
+
+
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, "-v"])
