@@ -992,6 +992,21 @@ def _read_cache_stats() -> tuple:
     return total, hits, hit_rate
 
 
+def _read_cache_merge(delta_total: int, delta_hits: int) -> None:
+    """把子 agent worker 线程的 read_cache delta 合并到当前线程（通常是主线程）。
+
+    用途：dispatch_subagent 并发跑在 ThreadPoolExecutor worker 线程时，
+    worker 的 read_cache_state 独立于主线程；并发分支跑完后由 _dispatch_tool_calls
+    主线程调本函数把 delta 累加上来，确保 _print_read_cache_summary 汇总完整。
+
+    串行分支（subagent 跑在调用线程）不要调本函数——delta 已直接计入。
+    """
+    if delta_total <= 0:
+        return
+    _read_cache_state.total = getattr(_read_cache_state, "total", 0) + int(delta_total)
+    _read_cache_state.hits = getattr(_read_cache_state, "hits", 0) + int(delta_hits)
+
+
 def _infer_test_scope(plan_files) -> list[str]:
     """P1.3：根据 plan 列出的修改文件推断本次任务相关的测试文件路径列表。
 
@@ -1424,6 +1439,17 @@ def _dispatch_tool_calls(tool_calls, *, mode, allow_hil, allow_confirm, snap, me
                         "args": {}, "id": tool_calls[idx].id,
                         "result": _tools_mod._err("internal", f"并发 dispatch 异常: {e}", tool_calls[idx].function.name),
                     }
+        # P3 #6.1: 并发 worker 跑完后合并子线程的 read_cache delta 到主线程
+        # （worker 的 threading.local cache 独立，不合并会让 _print_read_cache_summary 漏算）
+        # 串行分支不在这里——单个 subagent 跑在调用线程，delta 已直接计入。
+        for idx in sub_indices:
+            out = outs[idx]
+            if not isinstance(out, dict):
+                continue
+            r = out.get("result") or {}
+            d = r.get("_read_cache_delta")
+            if d and isinstance(d, (list, tuple)) and len(d) == 2:
+                _read_cache_merge(int(d[0]), int(d[1]))
 
     # 串行处理剩余（含单个 subagent 的情况、所有非 subagent 工具）
     for i, tc in enumerate(tool_calls):

@@ -201,6 +201,64 @@ def test_run_subagent_no_override_for_general(tmp_path, monkeypatch):
     assert captured.get("model_override") is None
 
 
+def test_run_subagent_returns_read_cache_delta(tmp_path, monkeypatch):
+    """P3 #6.1: _run_subagent return 含 _read_cache_delta，反映本次执行期间当前线程的 read 增量。
+
+    场景：让 fake LLM 第一轮调 read_file 制造命中，第二轮 task_complete 收尾。
+    断言：_read_cache_delta = (2, 0)（第 1 轮 miss + duplicate 命中拦截在 _dispatch 层
+    用 _read_cache_hit_or_record 各 +1；handler 入口 entry stats 是当前线程当前累计）
+
+    注意：subagent 跑在调用线程，delta 直接反映当前线程 read。
+    """
+    import llm_client as _lc
+    with state.scoped_session(tmp_path):
+        (tmp_path / "main.py").write_text("def f(): pass\n", encoding="utf-8")
+        agent._read_cache_clear()  # 主线程 stats 清零
+
+        call_n = {"i": 0}
+
+        def fake(msgs, **kw):
+            call_n["i"] += 1
+            if call_n["i"] == 1:
+                return _mk_resp(tool_calls=[
+                    ("c1", "read_file", {"filename": "main.py"})
+                ])
+            return _mk_resp(tool_calls=[
+                ("c2", "task_complete", {"success": True, "summary": "done"})
+            ])
+
+        monkeypatch.setattr(_lc, "call_llm", fake)
+        res = agent._run_subagent("查 main.py", role="explorer", max_steps=4)
+
+        # 验证 return 含 _read_cache_delta
+        assert "_read_cache_delta" in res
+        delta = res["_read_cache_delta"]
+        assert isinstance(delta, tuple)
+        assert len(delta) == 2
+        # 至少 1 次 read（miss），不应是负数
+        assert delta[0] >= 1
+        assert delta[1] >= 0
+
+
+def test_subagent_handler_passes_read_cache_delta(tmp_path, monkeypatch):
+    """P3 #6.1: _subagent_handler 透传 _read_cache_delta 给父 agent"""
+    import llm_client as _lc
+    with state.scoped_session(tmp_path):
+        agent._read_cache_clear()
+
+        monkeypatch.setattr(_lc, "call_llm", lambda msgs, **kw: _mk_resp(
+            tool_calls=[("c1", "task_complete", {"success": True, "summary": "ok"})]
+        ))
+
+        from subagent import _subagent_handler
+        out = _subagent_handler(task="任务", role="explorer", max_steps=2)
+
+        # handler 返回 dict 必须含 _read_cache_delta（即使 0/0）
+        assert "_read_cache_delta" in out
+        assert isinstance(out["_read_cache_delta"], tuple)
+        assert len(out["_read_cache_delta"]) == 2
+
+
 def test_run_subagent_returns_summary_on_task_complete(tmp_path, monkeypatch):
     """子 agent 调 task_complete 后返回 summary。
 

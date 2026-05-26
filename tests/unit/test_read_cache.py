@@ -209,6 +209,75 @@ def test_stats_subthread_first_call_no_attribute_error():
     assert main_hits == 0
 
 
+# ── P3 #6.1: 子 agent worker 线程 delta 合并 ─────────────────────────────────
+
+
+def test_read_cache_merge_adds_delta():
+    """_read_cache_merge 累加 delta 到当前线程 stats"""
+    agent._read_cache_clear()
+    a = {"filename": "x.py", "offset": None, "limit": None}
+    agent._read_cache_hit_or_record(a)  # total=1, hits=0
+    agent._read_cache_merge(5, 2)       # 模拟 worker 线程回传 delta
+    total, hits, _ = agent._read_cache_stats()
+    assert total == 6
+    assert hits == 2
+
+
+def test_read_cache_merge_zero_delta_noop():
+    """_read_cache_merge(0, 0) 不动 stats（也不创建属性）"""
+    agent._read_cache_clear()
+    agent._read_cache_merge(0, 0)
+    total, hits, _ = agent._read_cache_stats()
+    assert total == 0
+    assert hits == 0
+
+
+def test_read_cache_merge_negative_total_ignored():
+    """_read_cache_merge 收到负数 / 0 total 时静默跳过（防御性）"""
+    agent._read_cache_clear()
+    a = {"filename": "y.py", "offset": None, "limit": None}
+    agent._read_cache_hit_or_record(a)  # total=1
+    agent._read_cache_merge(-3, -1)     # 不应破坏 stats
+    total, hits, _ = agent._read_cache_stats()
+    assert total == 1
+    assert hits == 0
+
+
+def test_subthread_delta_merge_simulates_concurrent_subagent():
+    """模拟并发分支场景：worker 线程独立计数 → 父线程读 delta → merge 后总数完整"""
+    import threading
+    agent._read_cache_clear()
+    main_a = {"filename": "main.py", "offset": None, "limit": None}
+    agent._read_cache_hit_or_record(main_a)  # 主线程 total=1
+
+    worker_delta = {}
+
+    def worker():
+        # 模拟 _run_subagent：入口记 entry，跑工作，出口算 delta
+        entry_total, entry_hits, _ = agent._read_cache_stats()  # worker 线程 0/0
+        sub_a = {"filename": "sub.py", "offset": None, "limit": None}
+        agent._read_cache_hit_or_record(sub_a)  # worker total=1
+        agent._read_cache_hit_or_record(sub_a)  # worker hit → total=2, hits=1
+        agent._read_cache_hit_or_record(sub_a)  # worker hit → total=3, hits=2
+        exit_total, exit_hits, _ = agent._read_cache_stats()
+        worker_delta["delta"] = (exit_total - entry_total, exit_hits - entry_hits)
+
+    t = threading.Thread(target=worker)
+    t.start()
+    t.join()
+
+    # 父线程合并 delta
+    d_total, d_hits = worker_delta["delta"]
+    assert d_total == 3
+    assert d_hits == 2
+    agent._read_cache_merge(d_total, d_hits)
+
+    # 主线程汇总 = 主线程原 1 次 + worker 3 次 = 4 / 2
+    total, hits, _ = agent._read_cache_stats()
+    assert total == 4
+    assert hits == 2
+
+
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, "-v"])
