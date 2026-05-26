@@ -20,14 +20,14 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "读取workspace目录下的文件，可选按行号区间截取（用于大文件分块读取）。注意：刚通过 write_file/replace_in_file/replace_symbol 修改过的文件不要再 read 验证——写工具失败会直接返回错误。优先用 search_in_files / list_symbols 定位再精读区间，而不是整文件 read。",
+            "description": "读取workspace目录下的文件，可选按行号区间截取。**默认 limit=2000 行 / max_bytes=200000**——大文件超出会截断（content 被切短，返回字段含 hint 提示用 offset 续读）。注意：刚通过 write_file/replace_in_file/replace_symbol 修改过的文件不要再 read 验证——写工具失败会直接返回错误。优先用 search_in_files / list_symbols 定位再精读区间，而不是整文件 read。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "filename": {"type": "string", "description": "文件名（相对于workspace）"},
                     "offset":    {"type": "integer", "description": "起始行号（1-based，可选）"},
-                    "limit":     {"type": "integer", "description": "读取行数上限（可选）"},
-                    "max_bytes": {"type": "integer", "description": "读取字节数上限（可选）；超过此限制时返回截断内容，并附带 truncated: true 标记"}
+                    "limit":     {"type": "integer", "description": "读取行数上限（可选，默认 2000；> 2000 行需用 offset 分页或显式传更大 limit）"},
+                    "max_bytes": {"type": "integer", "description": "读取字节数上限（可选，默认 200000）；超过时返回截断内容并附 truncated: true 与 hint"}
                 },
                 "required": ["filename"]
             }

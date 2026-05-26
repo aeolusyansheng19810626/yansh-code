@@ -232,11 +232,16 @@ def write_file(filename, content):
     except Exception as e:
         return _err("internal", str(e))
 
+# P2 #4-A2: read_file 默认值——防大文件 input token 爆炸（参考 yscode 200KB 硬限 / cc 2000 行默认）
+READ_FILE_DEFAULT_LIMIT = 2000      # 行数上限：> 2000 行需显式传 limit 或用 offset 分页
+READ_FILE_DEFAULT_MAX_BYTES = 200_000  # 字节上限：> 200KB 截断并附 truncated 提示
+
+
 def read_file(filename, offset=None, limit=None, max_bytes=None):
     """读取workspace目录下的文件。
-    可选 offset/limit 按行截取（offset 1-based 起始行；limit 行数上限）。
-    可选 max_bytes 限制读取的字节数；超过时截断内容并在返回 dict 中加入 truncated=True。
-    无截取参数时返回整个文件，行为与原版相同。"""
+    可选 offset/limit 按行截取（offset 1-based 起始行；limit 行数上限，**默认 2000**）。
+    可选 max_bytes 限制读取的字节数（**默认 200_000**）；超过时截断内容并在返回 dict 中加入 truncated=True。
+    LLM 显式传 limit=巨大值 / max_bytes=巨大值 可绕过默认限制，但应优先用 offset 分页读。"""
     resolved, err = _validate_path(filename)
     if err:
         return err
@@ -247,23 +252,21 @@ def read_file(filename, offset=None, limit=None, max_bytes=None):
     except Exception as e:
         return _err("internal", str(e))
 
+    # P2 #4-A2: 应用默认值（None → 默认）
+    effective_limit = READ_FILE_DEFAULT_LIMIT if limit is None else int(limit)
+    effective_max_bytes = READ_FILE_DEFAULT_MAX_BYTES if max_bytes is None else int(max_bytes)
+
     # max_bytes 截断处理（在行切片之前）
     truncated = False
-    if max_bytes is not None:
-        encoded = text.encode('utf-8')
-        if len(encoded) > max_bytes:
-            text = encoded[:max_bytes].decode('utf-8', errors='replace')
-            truncated = True
+    encoded = text.encode('utf-8')
+    if len(encoded) > effective_max_bytes:
+        text = encoded[:effective_max_bytes].decode('utf-8', errors='replace')
+        truncated = True
 
-    if offset is None and limit is None:
-        result = {"content": text}
-        if truncated:
-            result["truncated"] = True
-        return result
     lines = text.splitlines(keepends=True)
     total = len(lines)
     start = max(0, (offset or 1) - 1)
-    end = total if limit is None else min(total, start + max(0, int(limit)))
+    end = min(total, start + max(0, effective_limit))
     result = {
         "content": "".join(lines[start:end]),
         "total_lines": total,
@@ -272,6 +275,11 @@ def read_file(filename, offset=None, limit=None, max_bytes=None):
     }
     if truncated:
         result["truncated"] = True
+        result["hint"] = (f"file truncated at {effective_max_bytes} bytes; "
+                          f"use offset to read further or pass max_bytes explicitly to override")
+    if end < total:
+        result["hint_more_lines"] = (f"only first {end - start} lines returned (total {total}); "
+                                     f"use offset={end + 1} to continue or pass limit explicitly")
     return result
 
 def execute_command(command):

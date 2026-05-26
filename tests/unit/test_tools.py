@@ -76,6 +76,50 @@ def test_write_and_read():
     assert result["content"] == "Hello, World!"
 
 
+# ── P2 #4-A2: read_file 默认 limit / max_bytes ────────────────────────────
+
+
+def test_read_file_default_limit_truncates_long_file():
+    """大文件（> 2000 行）默认被截断到 2000 行，附 hint_more_lines 提示"""
+    from tools import READ_FILE_DEFAULT_LIMIT
+    body = "\n".join(f"line{i}" for i in range(5000))  # 5000 行
+    write_file("big_lines.txt", body)
+    result = read_file("big_lines.txt")  # 默认 limit
+    assert result["lines_returned"] == READ_FILE_DEFAULT_LIMIT
+    assert result["total_lines"] == 5000
+    assert "hint_more_lines" in result
+    assert "offset=" in result["hint_more_lines"]
+
+
+def test_read_file_default_max_bytes_truncates_huge_file():
+    """大文件（> 200KB）默认被截断到 max_bytes，附 truncated/hint"""
+    from tools import READ_FILE_DEFAULT_MAX_BYTES
+    body = "x" * (READ_FILE_DEFAULT_MAX_BYTES + 5000)  # 略超
+    write_file("huge_bytes.txt", body)
+    result = read_file("huge_bytes.txt")  # 默认 max_bytes
+    assert result.get("truncated") is True
+    assert "hint" in result
+    assert len(result["content"].encode("utf-8")) <= READ_FILE_DEFAULT_MAX_BYTES
+
+
+def test_read_file_explicit_limit_overrides_default():
+    """显式传 limit 大值绕过默认 2000 限制"""
+    body = "\n".join(f"l{i}" for i in range(3000))
+    write_file("med.txt", body)
+    result = read_file("med.txt", limit=10_000)
+    assert result["lines_returned"] == 3000  # 全读到
+    assert "hint_more_lines" not in result
+
+
+def test_read_file_small_file_no_hint():
+    """小文件（< 2000 行 / < 200KB）默认不应含 hint 字段"""
+    write_file("tiny.txt", "hello\nworld")
+    result = read_file("tiny.txt")
+    assert "hint" not in result
+    assert "hint_more_lines" not in result
+    assert result["content"] == "hello\nworld"
+
+
 def test_delete_file():
     """删除后文件不存在"""
     write_file("tmp.txt", "to be deleted")
