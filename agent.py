@@ -1916,12 +1916,9 @@ def code(plan, mode="auto", requirement=""):
         file_exists = _os.path.exists(filepath)
 
         if file_exists:
-            existing = read_file(filename)
-            if "error" in existing:
-                console.print(f"读取 {filename} 失败: {existing['error']}")
-                continue
-            existing_content = existing.get("content", "")
-            console.print(f"{filename} 已存在，读取现有内容进行增量修改...")
+            # P2 #4-A1: 不再 read_file 取 existing_content（user message 不再内联）
+            # LLM 主动调 read_file 拿内容；这里只确认 file_exists 走 edit 分支
+            console.print(f"{filename} 已存在，进入增量修改流程（LLM 自己 read_file）...")
 
             req_block = f"\nOriginal requirement (must be followed strictly, including variable names, library names, API key names, etc.):\n{requirement}\n" if requirement else ""
             sys_prompt = f"""{_CODER_ROLE}
@@ -1933,6 +1930,7 @@ Available operations:
 2. write_file(filename, content) — only for creating new files
 
 Rules:
+- **Read first**: before any modification you must call read_file (or get_symbol_definition / search_in_files for targeted lookup) on `{filename}` to see the current content. The user message NO LONGER inlines the file body — you must fetch it via tools.
 - For existing files you **must** use replace_in_file for precise replacement; do not rewrite the whole file with write_file
 - write_file is only allowed for creating new files
 - Each replace_in_file call modifies one place; for multiple changes call it multiple times{_exploration}"""
@@ -1968,8 +1966,8 @@ Note: you must use write_file to write the file; the filename must be exactly `{
         else:
             edit_strategy_hint = ""
         user_content = f"当前文件：{filename}\n修改意图：{intent}{edit_strategy_hint}"
-        if file_exists:
-            user_content += f"\n\n现有内容：\n```\n{existing_content}\n```"
+        # P2 #4-A1: 不再内联 existing_content（避免每轮重发整文件）—— 改让 LLM 主动 read_file
+        # 节省每轮 ~20K input token（对应 1500 行文件场景），靠 read_cache 防重复实读
 
         msgs = [
             {"role": "system", "content": sys_prompt},
