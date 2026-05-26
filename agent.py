@@ -1007,6 +1007,22 @@ def _read_cache_merge(delta_total: int, delta_hits: int) -> None:
     _read_cache_state.hits = getattr(_read_cache_state, "hits", 0) + int(delta_hits)
 
 
+def _estimate_messages_tokens(messages) -> int:
+    """P2 #4-B1：粗估 messages 序列的 token 数。
+
+    用 len(json.dumps(...)) // 4 近似（cc 文档 "4 chars ≈ 1 token"，Sonnet/Haiku 都准）。
+    不依赖外部 tokenizer 库，足够给 auto-compact 触发条件用。
+    无法序列化的字段（如 MagicMock）走 default=str 兜底。
+    """
+    if not messages:
+        return 0
+    try:
+        s = json.dumps(messages, ensure_ascii=False, default=str)
+    except Exception:
+        s = str(messages)
+    return len(s) // 4
+
+
 def _infer_test_scope(plan_files) -> list[str]:
     """P1.3：根据 plan 列出的修改文件推断本次任务相关的测试文件路径列表。
 

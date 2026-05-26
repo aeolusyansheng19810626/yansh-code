@@ -786,6 +786,60 @@ def test_audit_returns_signal_on_task_complete(tmp_path):
     assert "3 处" in sig["summary"]
 
 
+# =====================================================================
+# P2 #4-B1：_estimate_messages_tokens helper
+# =====================================================================
+
+def test_estimate_messages_tokens_empty():
+    """空 messages → 0"""
+    assert agent._estimate_messages_tokens([]) == 0
+    assert agent._estimate_messages_tokens(None) == 0
+
+
+def test_estimate_messages_tokens_basic_accuracy():
+    """估算误差 < 30%（cc 文档：4 chars ≈ 1 token，对 ASCII/中英混排都准）"""
+    # 构造 ~4000 字符的英文 message → 期望 ~1000 tokens
+    body = "hello world " * 333  # 333 * 12 = 3996 chars
+    messages = [{"role": "user", "content": body}]
+    est = agent._estimate_messages_tokens(messages)
+    # JSON 序列化会多出 role/content/引号等约 30 chars overhead
+    # 总 chars ~ 4030，估算 ~ 1007 tokens
+    assert 900 < est < 1100, f"est={est}, expected ~1000 ±30%"
+
+
+def test_estimate_messages_tokens_multi_message_additive():
+    """多条 message 累加估算"""
+    msg = {"role": "user", "content": "x" * 1000}
+    one = agent._estimate_messages_tokens([msg])
+    three = agent._estimate_messages_tokens([msg, msg, msg])
+    # 3 条应约等于 1 条的 3 倍（允许 list 括号/逗号小开销）
+    assert 2.8 * one < three < 3.2 * one
+
+
+def test_estimate_messages_tokens_handles_non_serializable():
+    """无法 json 序列化的字段（如 MagicMock）走 default=str 兜底，不抛"""
+    from unittest.mock import MagicMock
+    messages = [{"role": "user", "content": "ok"}, {"role": "assistant", "obj": MagicMock()}]
+    est = agent._estimate_messages_tokens(messages)
+    assert est > 0
+
+
+def test_estimate_messages_tokens_tool_call_message():
+    """tool_calls / tool_result 风格 message 也能估算"""
+    messages = [
+        {"role": "system", "content": "you are a coder"},
+        {"role": "user", "content": "改 x.py"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c1", "type": "function",
+             "function": {"name": "read_file", "arguments": '{"filename":"x.py"}'}}
+        ]},
+        {"role": "tool", "tool_call_id": "c1", "content": "x = 1\n" * 500},
+    ]
+    est = agent._estimate_messages_tokens(messages)
+    # tool result body ~3000 chars → ~750 tokens 起，加上其他约 800-900
+    assert 700 < est < 1000
+
+
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, "-v"])
