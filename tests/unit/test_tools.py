@@ -448,6 +448,29 @@ def test_err_helper_rejects_unknown_kind():
         _err("nonexistent_kind", "x")
 
 
+def test_err_helper_accepts_tool_positional():
+    """[P1 #7] _err(kind, msg, tool) 第三个位置参数（agent.py 异常分发处的调用形式）不再 TypeError，并把 tool 填入返回 dict"""
+    e = _err("internal", "工具调用异常: re.error", "search_in_files")
+    assert e["error"] == "工具调用异常: re.error"
+    assert e["error_kind"] == "internal"
+    assert e["tool"] == "search_in_files"
+
+
+def test_err_helper_tool_optional():
+    """tool 可不传，结构跟旧调用一致"""
+    e = _err("internal", "msg")
+    assert "tool" not in e
+    assert e["error_kind"] == "internal"
+
+
+def test_err_helper_tool_with_extra_kwargs():
+    """tool + extra 同时传"""
+    e = _err("transient", "boom", "execute_command", returncode=1, stderr="fail")
+    assert e["tool"] == "execute_command"
+    assert e["returncode"] == 1
+    assert e["stderr"] == "fail"
+
+
 def test_error_kind_write_file_path_traversal():
     """路径越界 → permission"""
     r = write_file("../secret.txt", "hack")

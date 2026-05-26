@@ -22,11 +22,14 @@ ERROR_KINDS = frozenset({
 })
 
 
-def _err(kind: str, msg: str, **extra) -> dict:
+def _err(kind: str, msg: str, tool: str = None, **extra) -> dict:
     """统一错误构造：保留 'error' 键兼容老调用方，新增 'error_kind'。
+    tool 用于标注异常源工具名（位置参数可传，便于 agent.py 异常分发处直接 _err(kind, msg, name)）。
     extra 用于附加 returncode/stdout/stderr 之类的辅助字段。"""
     assert kind in ERROR_KINDS, f"unknown error_kind: {kind}"
     out = {"error": msg, "error_kind": kind}
+    if tool:
+        out["tool"] = tool
     if extra:
         out.update(extra)
     return out
