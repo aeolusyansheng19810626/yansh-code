@@ -256,30 +256,33 @@ def read_file(filename, offset=None, limit=None, max_bytes=None):
     effective_limit = READ_FILE_DEFAULT_LIMIT if limit is None else int(limit)
     effective_max_bytes = READ_FILE_DEFAULT_MAX_BYTES if max_bytes is None else int(max_bytes)
 
-    # max_bytes 截断处理（在行切片之前）
-    truncated = False
-    encoded = text.encode('utf-8')
-    if len(encoded) > effective_max_bytes:
-        text = encoded[:effective_max_bytes].decode('utf-8', errors='replace')
-        truncated = True
-
+    # P2 #4-A2 review M1: 先按行切（total 反映真实文件行数），再对切片做 byte 截断。
+    # 颠倒过来会让 max_bytes 优先截断 → total_lines 报错且 offset 续读永远读不到后半。
     lines = text.splitlines(keepends=True)
     total = len(lines)
     start = max(0, (offset or 1) - 1)
     end = min(total, start + max(0, effective_limit))
+    sliced = "".join(lines[start:end])
+
+    truncated = False
+    encoded = sliced.encode('utf-8')
+    if len(encoded) > effective_max_bytes:
+        sliced = encoded[:effective_max_bytes].decode('utf-8', errors='replace')
+        truncated = True
+
     result = {
-        "content": "".join(lines[start:end]),
+        "content": sliced,
         "total_lines": total,
         "offset": start + 1,
         "lines_returned": end - start,
     }
     if truncated:
         result["truncated"] = True
-        result["hint"] = (f"file truncated at {effective_max_bytes} bytes; "
-                          f"use offset to read further or pass max_bytes explicitly to override")
+        result["hint"] = (f"slice truncated at {effective_max_bytes} bytes; "
+                          f"narrow limit or pass max_bytes explicitly to override")
     if end < total:
-        result["hint_more_lines"] = (f"only first {end - start} lines returned (total {total}); "
-                                     f"use offset={end + 1} to continue or pass limit explicitly")
+        result["hint_more_lines"] = (f"only lines {start + 1}-{end} returned (total {total}); "
+                                     f"use offset={end + 1} to continue")
     return result
 
 def execute_command(command):

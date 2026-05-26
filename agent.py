@@ -1191,7 +1191,8 @@ def _dispatch_tool_call_inner(tool_call, args, *, mode="auto", allow_hil=True,
         if hil_on:
             old_content = ""
             if overwrite:
-                _r = read_file(fname)
+                # P2 #4-A2 review M2: HIL 取整文件 old_content 用于 diff 显示，绕过默认 limit
+                _r = read_file(fname, limit=10**9, max_bytes=10**9)
                 old_content = _r.get("content", "") if "error" not in _r else ""
             accept, final_content = _hil_confirm(fname, old_content, new_content, not overwrite)
             if not accept:
@@ -1215,7 +1216,8 @@ def _dispatch_tool_call_inner(tool_call, args, *, mode="auto", allow_hil=True,
         old_str = args.get("old_str", "")
         new_str = args.get("new_str", "")
         if hil_on:
-            _r = read_file(rfname)
+            # P2 #4-A2 review M2: HIL diff 需要整文件 old_content，绕过默认 limit
+            _r = read_file(rfname, limit=10**9, max_bytes=10**9)
             old_content = _r.get("content", "") if "error" not in _r else ""
             new_content = old_content.replace(old_str, new_str, 1) if old_str in old_content else old_content
             accept, final_content = _hil_confirm(rfname, old_content, new_content)
@@ -1981,8 +1983,9 @@ Note: you must use write_file to write the file; the filename must be exactly `{
         _base_rounds = int(_cfg("coder_rounds_per_file") or 5)
         _edits_per_round = max(1, int(_cfg("coder_edits_per_round") or 3))
         _expected_rounds = _math.ceil(expected_edits / _edits_per_round) if expected_edits > 0 else 0
-        # 留 +2 buffer 给 read/grep/test 等非-edit 工具调用
-        attempts_left = max(_base_rounds, _expected_rounds + 2)
+        # 留 +3 buffer 给 read/grep/test 等非-edit 工具调用
+        # （P2 #4-A1 后 LLM 必须先 read_file 再 edit，多 1 轮探索；从 +2 升到 +3）
+        attempts_left = max(_base_rounds, _expected_rounds + 3)
         _round_budget = attempts_left  # 警告打印时显示真实上限
         first_call = True
         _signaled_complete_this_file = False  # [P1 #2] 本文件是否已 task_complete(success=True)
@@ -2422,7 +2425,8 @@ def review(requirement, modified_files):
     for filename in dict.fromkeys(modified_files):
         if not filename:
             continue
-        content = read_file(filename).get("content", "")
+        # P2 #4-A2 review M2: review 阶段需要整文件给 reviewer LLM 看，绕过默认 limit
+        content = read_file(filename, limit=10**9, max_bytes=10**9).get("content", "")
         if content:
             file_contents.append(f"--- {filename} ---\n{content}")
             
@@ -3125,7 +3129,8 @@ def _auto_generate_tests(plan_result, modified_files):
 
     file_contents = []
     for src in non_test_srcs:
-        r = read_file(src)
+        # P2 #4-A2 review M2: autogen tests 需要整文件给生成器 LLM 看，绕过默认 limit
+        r = read_file(src, limit=10**9, max_bytes=10**9)
         if "content" in r:
             file_contents.append(f"# {src}\n{r['content']}")
 

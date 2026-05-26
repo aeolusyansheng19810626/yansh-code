@@ -120,6 +120,47 @@ def test_read_file_small_file_no_hint():
     assert result["content"] == "hello\nworld"
 
 
+def test_read_file_offset_can_traverse_huge_file():
+    """P2 #4-A2 review M1 回归测：max_bytes 截断不应破坏 offset 续读
+
+    场景：5000 行 / 250KB 文件（超过默认 limit=2000 + max_bytes=200KB）
+    - 第 1 次 read：默认参数 → 拿前 2000 行，total_lines 必须报真实 5000
+    - 第 2 次 read offset=2001：拿行 2001-4000，仍能报 total_lines=5000
+    - 第 3 次 read offset=4001：拿行 4001-5000
+
+    bug 复现：原实现先 byte 截到 200KB 再 splitlines → total_lines 报错，
+    offset 续读时 max_bytes 又从头截一次，文件后半永远摸不到。
+    """
+    # 5000 行，每行 ~50 字节，约 250KB
+    body = "\n".join(f"line_{i:04d}_" + "x" * 40 for i in range(5000))
+    write_file("huge_traverse.txt", body)
+
+    # 第 1 次：默认 limit=2000
+    r1 = read_file("huge_traverse.txt")
+    assert r1["total_lines"] == 5000, f"total_lines 应是真实 5000，实际 {r1['total_lines']}"
+    assert r1["offset"] == 1
+    assert r1["lines_returned"] == 2000
+    assert "hint_more_lines" in r1
+    assert "line_0000_" in r1["content"]
+    assert "line_1999_" in r1["content"]
+
+    # 第 2 次：offset=2001 续读
+    r2 = read_file("huge_traverse.txt", offset=2001)
+    assert r2["total_lines"] == 5000
+    assert r2["offset"] == 2001
+    assert r2["lines_returned"] == 2000
+    assert "line_2000_" in r2["content"]
+    assert "line_3999_" in r2["content"]
+    assert "line_0000_" not in r2["content"]  # 不应包含前段
+
+    # 第 3 次：offset=4001 续读，读到末尾
+    r3 = read_file("huge_traverse.txt", offset=4001)
+    assert r3["total_lines"] == 5000
+    assert r3["lines_returned"] == 1000  # 只剩 1000 行
+    assert "line_4999_" in r3["content"]  # 文件最后一行
+    assert "hint_more_lines" not in r3  # 已读到末尾
+
+
 def test_delete_file():
     """删除后文件不存在"""
     write_file("tmp.txt", "to be deleted")
