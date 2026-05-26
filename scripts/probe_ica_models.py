@@ -30,6 +30,8 @@ from openai import OpenAI
 load_dotenv()
 
 MODELS = [
+    "claude-haiku-4-5",
+    "claude-sonnet-4-6",
     "claude-opus-4-7",
     "gemini-3-pro-preview",
     "gpt-5.4-gus",

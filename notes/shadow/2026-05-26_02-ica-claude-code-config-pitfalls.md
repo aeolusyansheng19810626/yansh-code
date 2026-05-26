@@ -105,19 +105,33 @@ sonnet / opus 在 `/ica` 路径**碰巧也配了**（优先适配的常用模型
 | **API Provider** | `OpenAI Compatible` |
 | **Base URL** | `https://api.nextgen-beta.ica.ibm.com/ica/v1`（**带 /v1**） |
 | **API Key** | 普通 ICA API Key（不是 Coding Agent Key） |
-| **Model ID** | `claude-sonnet-4-6` / `claude-haiku-4-5` / `claude-opus-4-7` / `gpt-5.4-gus` / `gemini-3-pro-preview`（任选，**不带日期后缀**） |
+| **Model ID** | `claude-sonnet-4-6` / `claude-haiku-4-5` / `claude-opus-4-7` / `gpt-5.1-chat-gus`（任选，**不带日期后缀**） |
 
 **Cline 具体操作**：VS Code 装 Cline → ⚙️ Settings → API Provider 选 `OpenAI Compatible` → 填上面字段 → 点 **Verify** 测连接。
 
+**⚠️ Cline 实测兼容性（2026-05-26）**：
+
+| Model ID | Cline 可用 | 备注 |
+|---|---|---|
+| `claude-sonnet-4-6` | ✅ | probe + Cline 双通 |
+| `claude-haiku-4-5` | ✅ | probe 通，Cline 未专项测 |
+| `claude-opus-4-7` | ✅ | probe 通，Cline 未专项测 |
+| `gpt-5.1-chat-gus` | ✅ | **"chat" 后缀 = 标准 Chat Completions，Cline 兼容** |
+| `gpt-5.4-gus` | ❌ | reasoning 模型，Cline 请求里某字段触发 Azure 404 |
+| `gemini-3-pro-preview` | ❌ | Gemini 适配路径不兼容 Cline 的 OpenAI 格式请求 |
+
+**根因**：Cline 发的请求比 probe 脚本复杂（含 `tools` / `temperature` 等），reasoning 模型（gpt-5.4）和 Gemini 的 ICA 适配层对这些字段不兼容 → 404。probe 极简请求（仅 `model + messages + max_tokens`）全通，但 Cline 不通。
+
+**结论**：Cline + ICA 只用 **Claude 系列** 或 **gpt-5.1-chat-gus**（"chat" 显式标注的非 reasoning 版本）。
+
 **优势**：
-- 5 个模型都可选（含 haiku 和跨 family 的 gpt5 / gemini）
 - 跟 yansh/yscode 已验证路径一致，确保稳定
 - 切模型只改 Model ID 字段
 
 **劣势 / 注意**：
 - Prompt cache 不可用（ICA 反正不透传 — 已 `scripts/probe_ica_cache.py` 验证）
 - Anthropic 协议特有功能（extended thinking reasoning 字段格式）丢失 — 编码场景影响小
-- 错误信息可能没 Anthropic 直连那么详细
+- reasoning 模型（gpt-5.4 / gemini 系）不可用
 
 ---
 
