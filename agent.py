@@ -135,6 +135,17 @@ _AUDIT_TOKEN_BUDGET = 120_000  # audit loop token 增量预算
 # test+fix 循环里 returncode!=0 但 current\baseline 为空时视为通过
 _BASELINE_FAILURES: set = set()
 
+# [P1 #3] 机械错 detector：fix loop 触发追加预算的错误模式
+# 三类共用同一 bonus（signature 改 / 重命名 / 改属性时常批量出现）
+_MECH_ERROR_PATTERNS: list = [
+    (r"TypeError:.+?missing\s+\d+\s+required\s+(?:positional|keyword)\s+argument",
+     "TypeError missing argument"),
+    (r"NameError:\s+name\s+'[^']+'\s+is\s+not\s+defined",
+     "NameError"),
+    (r"AttributeError:\s+'[^']+'\s+object\s+has\s+no\s+attribute\s+'[^']+'",
+     "AttributeError"),
+]
+
 
 def _cfg(key):
     """读取生效配置值"""
@@ -2379,17 +2390,20 @@ def fix(test_result, plan, reason="test_failure", baseline_failures=None):
     fix_soft_limit = int(_cfg("fix_soft_limit") or _FIX_SOFT_LIMIT)
     if reason == "test_failure":
         import re as _re
-        _missing_arg_count = len(_re.findall(
-            r"TypeError:.+?missing\s+\d+\s+required\s+(?:positional|keyword)\s+argument",
-            error_info,
-        ))
-        # 哪怕只有 1 处同类机械错，也大概率是"signature 改了 / 调用方未全适配"——
+        # [P1 #3] detector patterns 在 module-level（_MECH_ERROR_PATTERNS）
+        _mech_hits = []
+        for _pat, _label in _MECH_ERROR_PATTERNS:
+            _c = len(_re.findall(_pat, error_info))
+            if _c > 0:
+                _mech_hits.append((_label, _c))
+        # 哪怕只有 1 处同类机械错，也大概率是"signature 改了 / 调用方未全适配 / 属性重命名"——
         # 给追加预算让 fix 有机会扫齐所有遗漏点
-        if _missing_arg_count >= 1:
+        if _mech_hits:
             bonus = int(_cfg("fix_mechanical_error_bonus") or 12)
             fix_soft_limit += bonus
+            _summary = ", ".join(f"{c}× {label}" for label, c in _mech_hits)
             console.print(
-                f"[fix scheduler] 检测到 {_missing_arg_count} 处同类 TypeError 机械错 → "
+                f"[fix scheduler] 检测到机械错（{_summary}）→ "
                 f"fix 上限提升到 {fix_soft_limit}（base + bonus={bonus}）",
                 style="cyan", highlight=False,
             )

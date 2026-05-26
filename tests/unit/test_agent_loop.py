@@ -254,6 +254,57 @@ def test_code_no_warning_when_task_complete_in_final_round(tmp_path):
         f"task_complete 同轮触发时不应警告，但警告记录为: {warnings}"
 
 
+# ============= P1 #3: mechanical error detector 扩展 =============
+
+def _count_mech(error_info: str) -> dict:
+    """跑一遍 _MECH_ERROR_PATTERNS，返回 {label: count}"""
+    import re as _re
+    hits = {}
+    for pat, label in agent._MECH_ERROR_PATTERNS:
+        c = len(_re.findall(pat, error_info))
+        if c > 0:
+            hits[label] = c
+    return hits
+
+
+def test_mech_detector_typeerror_missing_arg():
+    """老 case 仍被识别"""
+    err = "TypeError: foo() missing 2 required positional arguments: 'a', 'b'"
+    assert _count_mech(err) == {"TypeError missing argument": 1}
+
+
+def test_mech_detector_nameerror():
+    """[P1 #3] NameError 触发追加预算"""
+    err = "NameError: name 'undefined_var' is not defined"
+    assert _count_mech(err) == {"NameError": 1}
+
+
+def test_mech_detector_attributeerror():
+    """[P1 #3] AttributeError 触发追加预算"""
+    err = "AttributeError: 'Foo' object has no attribute 'bar'"
+    assert _count_mech(err) == {"AttributeError": 1}
+
+
+def test_mech_detector_mixed_errors():
+    """3 类同时出现，各类计数独立"""
+    err = (
+        "test_a: TypeError: f() missing 1 required positional argument: 'x'\n"
+        "test_b: NameError: name 'foo' is not defined\n"
+        "test_c: NameError: name 'bar' is not defined\n"
+        "test_d: AttributeError: 'X' object has no attribute 'y'"
+    )
+    hits = _count_mech(err)
+    assert hits["TypeError missing argument"] == 1
+    assert hits["NameError"] == 2
+    assert hits["AttributeError"] == 1
+
+
+def test_mech_detector_no_match():
+    """无机械错时返回空"""
+    err = "AssertionError: expected 5 but got 3"
+    assert _count_mech(err) == {}
+
+
 def test_report_includes_task_complete_signal_when_provided():
     sig = {"early_exit": True, "success": True, "summary": "完成"}
     out = agent.report(True, {"returncode": 0}, task_complete_signal=sig)
