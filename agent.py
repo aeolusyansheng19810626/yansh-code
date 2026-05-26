@@ -207,6 +207,37 @@ def _summary_says_no_changes(summary: str) -> bool:
     return any(k in s_low for k in _NO_CHANGES_KEYWORDS_EN)
 
 
+# [P1 #5] plan 阶段是否需要先探索代码
+# 只保留**强信号组合词**——单字"兼容性"/"现有实现"/"compatibility"/"code details"
+# 在普通 feature 需求里太常见，会误吞导致每次多一次 explorer 调用（5-10K token 浪费）。
+_PLAN_NEEDS_EXPLORATION_KEYWORDS_ZH: list = [
+    "改动范围", "改造方案",
+    "具体行号", "对应行号",
+    "兼容分析", "兼容性分析",
+    "影响范围", "影响分析",
+    "调用关系", "调用链",
+]
+_PLAN_NEEDS_EXPLORATION_KEYWORDS_EN: list = [
+    "specific lines", "line numbers",
+    "affected files", "scope of changes", "change scope",
+    "compatibility analysis", "impact analysis", "impact scope",
+    "call graph", "call chain",
+    "existing implementation",
+]
+
+
+def _plan_needs_exploration(requirement: str) -> bool:
+    """[P1 #5] 用户需求是否要求 plan 输出"含代码细节"的文档/方案。
+    命中 → plan() 先派 explorer 扫码，避免凭概要写错。
+    """
+    if not requirement:
+        return False
+    if any(k in requirement for k in _PLAN_NEEDS_EXPLORATION_KEYWORDS_ZH):
+        return True
+    r_low = requirement.lower()
+    return any(k in r_low for k in _PLAN_NEEDS_EXPLORATION_KEYWORDS_EN)
+
+
 def _cfg(key):
     """读取生效配置值"""
     return get_config().get(key)
@@ -1667,6 +1698,38 @@ def plan(requirement):
         if _PROJECT_TYPE else ""
     )
     console.print("[Agent: Architect]", highlight=False)
+
+    # [P1 #5] 用户要求"行号 / 兼容分析 / 改动范围"等需扫码才能写准的内容
+    # → plan 入 LLM 前先派 explorer 子 agent 扫码，把代码事实作为额外上下文
+    exploration_block = ""
+    if _plan_needs_exploration(requirement):
+        console.print(
+            "[Architect] 检测到任务要求『代码细节级输出』 → 先派 explorer 扫码",
+            style="cyan", highlight=False,
+        )
+        explorer_task = (
+            f"用户任务：\n{requirement}\n\n"
+            "你的任务（只读探索，不修改任何文件）：\n"
+            "1. 用 search_in_files / read_file / get_symbol_definition / list_files 工具扫描代码\n"
+            "2. 定位用户需求涉及的关键文件、函数、类、变量及其行号\n"
+            "3. 总结现有实现结构和调用关系\n"
+            "4. 通过 task_complete(success=True, summary=<报告>) 返回完整探索报告，"
+            "summary 必须包含 file:line 引用，让后续 plan agent 能据此写出准确的代码细节文档。"
+        )
+        try:
+            sub_result = _run_subagent(explorer_task, role="explorer", max_steps=10)
+            sub_summary = (sub_result or {}).get("summary", "").strip()
+            if sub_summary:
+                exploration_block = (
+                    "\n\n# Code exploration results (from explorer subagent)\n"
+                    "Use the following code facts (file:line references) when generating the plan, "
+                    "especially when the plan output needs to describe specific lines, change scopes, or compatibility:\n\n"
+                    f"{sub_summary}\n"
+                )
+        except Exception as _e:
+            console.print(f"[Architect] explorer 失败（继续走原路径）：{_e}",
+                          style="yellow", highlight=False)
+
     system_prompt = f"""{_ARCHITECT_ROLE}{project_rules}
 You are a code-planning assistant. Given the user requirement, return a plan strictly conforming to the JSON schema below:
 
@@ -1696,7 +1759,7 @@ test_command must NOT use `python -c` inline (blocked by security policy); use `
 Existing files in workspace:
 {files_list if files_list else "(empty)"}
 
-Note: do not recreate existing files; prefer incremental changes. For existing files, only describe what to append/modify."""
+Note: do not recreate existing files; prefer incremental changes. For existing files, only describe what to append/modify.{exploration_block}"""
     system_prompt = _append_active_prompts(system_prompt)
     # #50 若有待注入图片，构造 vision content（消费后清空）
     user_text = f"需求：{requirement}"
@@ -1709,10 +1772,15 @@ Note: do not recreate existing files; prefer incremental changes. For existing f
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_content}
     ]
-    return _call_with_json_retry(
+    plan_result = _call_with_json_retry(
         "plan", messages, _parse_plan_with_status,
         response_format={"type": "json_object"},
     )
+    # [P1 #5] 把 explorer summary 持久化到 plan_result，让 coder 阶段也能读到
+    # （否则 plan() 内部消费完就丢了，coder 写文档时仍凭训练知识猜）
+    if exploration_block and isinstance(plan_result, dict):
+        plan_result["_exploration"] = exploration_block
+    return plan_result
 
 
 def _parse_plan_with_status(content: str):
@@ -1766,6 +1834,8 @@ def code(plan, mode="auto", requirement=""):
     from tools import write_file, read_file, replace_in_file
 
     files = plan.get("files", [])
+    # [P1 #5] plan() 派 explorer 时存的代码事实——coder 写文档/重构时拼到 system_prompt
+    _exploration = plan.get("_exploration", "") if isinstance(plan, dict) else ""
     console.print("[Agent: Coder]", highlight=False)
     console.print(f"计划处理 {len(files)} 个文件...")
     coder_signal = None  # 多文件循环结束时上送给 run()
@@ -1816,7 +1886,7 @@ Available operations:
 Rules:
 - For existing files you **must** use replace_in_file for precise replacement; do not rewrite the whole file with write_file
 - write_file is only allowed for creating new files
-- Each replace_in_file call modifies one place; for multiple changes call it multiple times"""
+- Each replace_in_file call modifies one place; for multiple changes call it multiple times{_exploration}"""
             sys_prompt = _append_active_prompts(sys_prompt)
         else:
             console.print(f"{filename} 是新建文件...")
@@ -1829,7 +1899,7 @@ Available operations:
 
 Requirement / change intent: {intent}
 
-Note: you must use write_file to write the file; the filename must be exactly `{filename}` — do not change the path or add a directory prefix."""
+Note: you must use write_file to write the file; the filename must be exactly `{filename}` — do not change the path or add a directory prefix.{_exploration}"""
             sys_prompt = _append_active_prompts(sys_prompt)
 
         # 构建消息：expected_edits 显式告诉 LLM 本文件改动规模 → 选合适策略

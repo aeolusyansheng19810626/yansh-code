@@ -254,6 +254,160 @@ def test_code_no_warning_when_task_complete_in_final_round(tmp_path):
         f"task_complete 同轮触发时不应警告，但警告记录为: {warnings}"
 
 
+# ============= P1 #5: plan 写文档前必须 explorer =============
+
+def test_plan_needs_exploration_chinese():
+    """中文强信号关键词命中"""
+    assert agent._plan_needs_exploration("写一个改造方案文档，含改动范围和兼容性分析")
+    assert agent._plan_needs_exploration("分析 task_complete 的影响范围和调用关系")
+    assert agent._plan_needs_exploration("给出具体行号")
+
+
+def test_plan_needs_exploration_english():
+    """英文强信号关键词命中"""
+    assert agent._plan_needs_exploration("Write a doc describing the impact analysis and affected files")
+    assert agent._plan_needs_exploration("List specific lines that need changes")
+    assert agent._plan_needs_exploration("Document the existing implementation")
+
+
+def test_plan_needs_exploration_negative():
+    """普通需求不命中"""
+    assert not agent._plan_needs_exploration("加一个 multiply 函数")
+    assert not agent._plan_needs_exploration("修复 test_memory.py 的失败")
+    assert not agent._plan_needs_exploration("Add a new endpoint /api/v2")
+    assert not agent._plan_needs_exploration("")
+    assert not agent._plan_needs_exploration(None)
+
+
+def test_plan_needs_exploration_avoids_overbroad_words():
+    """[reviewer 建议] 普通 feature 需求里常见的'兼容性'/'现有实现'/'compatibility'/'code details'
+    单字短语不应触发 explorer dispatch"""
+    assert not agent._plan_needs_exploration("加 X 函数注意兼容性")
+    assert not agent._plan_needs_exploration("在现有实现上加一个开关")
+    assert not agent._plan_needs_exploration("Add error handling considering compatibility")
+    assert not agent._plan_needs_exploration("Document code details for the API")
+
+
+def test_plan_dispatches_explorer_when_keywords_match(tmp_path, monkeypatch):
+    """[P1 #5] requirement 含关键词 → plan() 派 explorer subagent，summary 注入 system_prompt"""
+    import config, tools
+    config.set_workspace_dir(str(tmp_path))
+    tools._reinit_paths()
+    (tmp_path / "x.py").write_text("def foo(): pass\n", encoding="utf-8")
+
+    explorer_called = {"n": 0}
+    def mock_run_subagent(task, role="explorer", max_steps=8):
+        explorer_called["n"] += 1
+        explorer_called["task"] = task
+        explorer_called["role"] = role
+        return {"success": True,
+                "summary": "EXPLORER_REPORT_MARKER: 找到 x.py:1 def foo()",
+                "steps": 2, "role": role}
+
+    captured_msgs = {}
+    def mock_call_with_json_retry(label, msgs, parser, **kw):
+        captured_msgs["msgs"] = msgs
+        return {"files": [{"filename": "doc.md", "description": "x", "expected_edits": 1}],
+                "test_command": ""}
+
+    monkeypatch.setattr(agent, "_run_subagent", mock_run_subagent)
+    monkeypatch.setattr(agent, "_call_with_json_retry", mock_call_with_json_retry)
+
+    result = agent.plan("写一个改造方案文档，含改动范围和具体行号引用")
+
+    assert explorer_called["n"] == 1
+    assert explorer_called["role"] == "explorer"
+    sys_prompt = captured_msgs["msgs"][0]["content"]
+    assert "EXPLORER_REPORT_MARKER" in sys_prompt
+    assert "Code exploration results" in sys_prompt
+    assert result is not None
+    # [P1 #5 reviewer 必改] exploration 必须持久化到 plan_result，coder 阶段才能读
+    assert "_exploration" in result
+    assert "EXPLORER_REPORT_MARKER" in result["_exploration"]
+
+
+def test_code_propagates_exploration_to_coder_sys_prompt(tmp_path):
+    """[P1 #5 reviewer 必改] plan._exploration 必须拼到 coder system_prompt
+    否则 coder 写文档时仍凭训练知识猜（task #3 1 错 2 偏的根因）"""
+    import config, tools
+    config.set_workspace_dir(str(tmp_path))
+    tools._reinit_paths()
+    (tmp_path / "x.py").write_text("def foo(): pass\n", encoding="utf-8")
+
+    captured_sys_prompts = []
+    def mock_llm(msgs, **kw):
+        captured_sys_prompts.append(next(m["content"] for m in msgs if m["role"] == "system"))
+        return _make_response(tool_calls=[("c1", "task_complete",
+                                            {"success": True, "summary": "done"})])
+
+    orig = agent.call_llm
+    try:
+        agent.call_llm = mock_llm
+        agent.code(
+            {"files": [{"filename": "x.py", "intent": "tweak"}],
+             "test_command": "",
+             "_exploration": "\n\n# Code exploration\nx.py:1 def foo()\n"},
+            mode="code", requirement="...",
+        )
+    finally:
+        agent.call_llm = orig
+
+    assert any("Code exploration" in sp for sp in captured_sys_prompts)
+    assert any("x.py:1 def foo()" in sp for sp in captured_sys_prompts)
+
+
+def test_plan_skips_explorer_when_no_keywords(tmp_path, monkeypatch):
+    """[P1 #5] requirement 不含关键词 → plan() 走原路径，不派 explorer"""
+    import config, tools
+    config.set_workspace_dir(str(tmp_path))
+    tools._reinit_paths()
+
+    explorer_called = {"n": 0}
+    def mock_run_subagent(task, role="explorer", max_steps=8):
+        explorer_called["n"] += 1
+        return {"success": True, "summary": "x", "steps": 0, "role": role}
+
+    captured_msgs = {}
+    def mock_call_with_json_retry(label, msgs, parser, **kw):
+        captured_msgs["msgs"] = msgs
+        return {"files": [{"filename": "add.py", "description": "x", "expected_edits": 1}],
+                "test_command": ""}
+
+    monkeypatch.setattr(agent, "_run_subagent", mock_run_subagent)
+    monkeypatch.setattr(agent, "_call_with_json_retry", mock_call_with_json_retry)
+
+    agent.plan("加一个 multiply 函数")
+
+    assert explorer_called["n"] == 0
+    sys_prompt = captured_msgs["msgs"][0]["content"]
+    assert "Code exploration results" not in sys_prompt
+
+
+def test_plan_falls_back_when_explorer_raises(tmp_path, monkeypatch):
+    """[P1 #5] explorer 抛异常时 plan() 不应崩，走原路径"""
+    import config, tools
+    config.set_workspace_dir(str(tmp_path))
+    tools._reinit_paths()
+
+    def mock_run_subagent_raises(task, role="explorer", max_steps=8):
+        raise RuntimeError("explorer 假装挂了")
+
+    captured_msgs = {}
+    def mock_call_with_json_retry(label, msgs, parser, **kw):
+        captured_msgs["msgs"] = msgs
+        return {"files": [], "test_command": ""}
+
+    monkeypatch.setattr(agent, "_run_subagent", mock_run_subagent_raises)
+    monkeypatch.setattr(agent, "_call_with_json_retry", mock_call_with_json_retry)
+
+    # 不应抛
+    agent.plan("写改造方案，含改动范围和兼容分析")
+
+    sys_prompt = captured_msgs["msgs"][0]["content"]
+    # 没有 explorer summary 但 plan 仍能跑
+    assert "Code exploration results" not in sys_prompt
+
+
 # ============= P1 #4: plan 接受 coder "无需修改" 信号 =============
 
 def test_summary_no_changes_chinese():
