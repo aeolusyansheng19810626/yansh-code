@@ -1030,6 +1030,44 @@ def test_split_messages_into_pairs_leading_user():
     assert pairs[1][0]["role"] == "assistant"
 
 
+def test_compact_rejects_zero_keep():
+    """review m3: keep_recent_pairs <= 0 直接 ValueError"""
+    import pytest as _pt
+    msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
+    with _pt.raises(ValueError):
+        agent._compact_messages(msgs, keep_recent_pairs=0)
+    with _pt.raises(ValueError):
+        agent._compact_messages(msgs, keep_recent_pairs=-1)
+
+
+def test_compact_pulls_back_when_recent_starts_with_tool(monkeypatch):
+    """review M1: recent_pairs 起始若是 tool（孤立 tool message 单独成 pair），
+    应回拉一个 old_pair 进 recent，避免 [summary, tool_result, ...] 违反 OpenAI 协议"""
+    # 构造异常切分形态：用一个能被 _split_messages_into_pairs 切出 leading tool 的 rest
+    # （实际场景罕见，但防御编程要求）
+    msgs = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "u"},
+        # 第一个 pair：assistant + tool（正常）
+        _make_assistant_msg("a1", [("c1", "read")]),
+        _make_tool_msg("c1", "x"),
+        # 第二个 pair：assistant + tool
+        _make_assistant_msg("a2", [("c2", "grep")]),
+        _make_tool_msg("c2", "y"),
+        # 第三个 pair：assistant + tool
+        _make_assistant_msg("a3", [("c3", "read")]),
+        _make_tool_msg("c3", "z"),
+    ]
+    monkeypatch.setattr(agent, "call_llm", lambda m, **kw: SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="摘要"))]
+    ))
+    out = agent._compact_messages(msgs, keep_recent_pairs=2)
+    # recent 第一条必须是 assistant 或 user，不能是 tool
+    # head=2, summary=1, recent 起始就在 index 3
+    assert agent._msg_role(out[3]) in ("assistant", "user"), \
+        f"recent[0] role={agent._msg_role(out[3])}, 应为 assistant/user"
+
+
 def test_estimate_under_threshold_no_compact():
     """msgs 不到阈值时调用方不应触发 compact（接口契约：调用方负责检测）
 

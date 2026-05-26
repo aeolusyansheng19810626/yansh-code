@@ -1083,18 +1083,23 @@ def _flatten_pairs_for_summary(pairs) -> str:
 _SUMMARIZE_SYSTEM = (
     "你是对话历史压缩助手。下面是一段 coder agent 的历史对话（含工具调用与结果）。"
     "请用简洁中文概括：①已调过哪些工具/读了哪些文件 ②关键发现/读到的内容要点 "
-    "③已经做了哪些代码改动（哪个文件改了什么）④当前进展和未完成的任务 ⑤遇到的报错/卡点。"
+    "③已经做了哪些代码改动 ④当前进展和未完成的任务 ⑤遇到的报错/卡点。"
+    "**强制项：第 ③ 点必须列出每个被改动的文件名 + 改动函数/区域**（如 'tools.py: read_file 函数'），"
+    "不能泛化为'修改了 X.py 的某些函数'。"
     "控制在 800 字内，重要事实不要丢。不要加客套话，直接给结构化要点。"
 )
 
 
 def _summarize_old_history(text: str) -> str:
-    """调一次轻量 LLM 把旧对话压缩成摘要"""
+    """调一次轻量 LLM 把旧对话压缩成摘要。
+
+    review M3 修：stream=False 防止 summarize 内容流式打印到终端污染 UX。
+    """
     summarize_msgs = [
         {"role": "system", "content": _SUMMARIZE_SYSTEM},
         {"role": "user", "content": text},
     ]
-    resp = call_llm(summarize_msgs, tools=None)
+    resp = call_llm(summarize_msgs, tools=None, stream=False)
     return (resp.choices[0].message.content or "").strip()
 
 
@@ -1105,7 +1110,14 @@ def _compact_messages(msgs, keep_recent_pairs: int = 2):
     保留头部（system + user_initial）+ 最近 N 个 pair 原文，旧 pair 走 LLM summarize。
 
     若 pair 总数 <= keep_recent_pairs，直接返回原 msgs（不必 compact）。
+
+    review minor m3 修：keep=0 禁止（会丢光最新一轮 LLM 状态导致跑偏）。
+    review M1 修：拼接前确保 recent_pairs 起始合法（不是孤立 user 直挂 summary 后）。
     """
+    # review m3：keep=0 是退化路径，禁止使用
+    if keep_recent_pairs <= 0:
+        raise ValueError("keep_recent_pairs 必须 >= 1，否则会丢光最新一轮 LLM 状态")
+
     if not msgs or len(msgs) < 4:
         return msgs
 
@@ -1124,8 +1136,17 @@ def _compact_messages(msgs, keep_recent_pairs: int = 2):
     if len(pairs) <= keep_recent_pairs:
         return msgs
 
-    old_pairs = pairs[:-keep_recent_pairs] if keep_recent_pairs > 0 else pairs
-    recent_pairs = pairs[-keep_recent_pairs:] if keep_recent_pairs > 0 else []
+    old_pairs = pairs[:-keep_recent_pairs]
+    recent_pairs = pairs[-keep_recent_pairs:]
+
+    # review M1：recent_pairs 第一个 pair 起始角色必须是 assistant 或 user
+    # （否则 [summary_system, tool_result, ...] 序列违反 OpenAI tool_result 必紧跟 assistant 约束）
+    # 若不合法，把 old_pairs 末尾的 pair 推回 recent_pairs，直到 recent 起始合法
+    while recent_pairs and old_pairs:
+        first_role = _msg_role(recent_pairs[0][0])
+        if first_role in ("assistant", "user"):
+            break
+        recent_pairs.insert(0, old_pairs.pop())
 
     old_text = _flatten_pairs_for_summary(old_pairs)
     try:
@@ -2133,7 +2154,8 @@ Note: you must use write_file to write the file; the filename must be exactly `{
         # P2 #4-B2: auto-compact 配置
         _compact_threshold = int(_cfg("compact_threshold_tokens") or 80_000)
         _compact_keep_pairs = int(_cfg("compact_keep_recent_pairs") or 2)
-        _compact_thrash_count = 0  # 连续 compact 后仍超阈值的次数
+        _compact_consecutive_over = 0  # review M2: 连续 N 次 compact 后仍超阈值的次数（不论是否降低）
+        _compact_max_consecutive = int(_cfg("compact_max_consecutive_over") or 4)
 
         while attempts_left > 0:
             attempts_left -= 1
@@ -2147,25 +2169,29 @@ Note: you must use write_file to write the file; the filename must be exactly `{
                 )
                 _new_msgs = _compact_messages(msgs, keep_recent_pairs=_compact_keep_pairs)
                 _new_est = _estimate_messages_tokens(_new_msgs)
-                if _new_est >= _est:
-                    # compact 没降下来（pairs 太少或 summarize 没工作）
-                    _compact_thrash_count += 1
-                    if _compact_thrash_count >= 2:
-                        raise RuntimeError(
-                            f"[auto-compact] thrashing：连续 2 次 compact 仍 >= {_compact_threshold} tokens "
-                            f"(est={_est} → {_new_est})，放弃避免死循环"
-                        )
-                    console.print(
-                        f"[auto-compact] 未降低（{_est} → {_new_est}），放过本轮",
-                        style="yellow",
-                    )
-                else:
+                if _new_est < _est:
                     msgs = _new_msgs
-                    _compact_thrash_count = 0
                     console.print(
                         f"[auto-compact] 已压缩 {_est} → {_new_est} tokens",
                         style="green",
                     )
+                else:
+                    # compact 没降下来（pairs 太少或 summarize 失败）
+                    console.print(
+                        f"[auto-compact] 未降低（{_est} → {_new_est}），放过本轮",
+                        style="yellow",
+                    )
+                # review M2 修：thrashing 计数改为"仍超阈值"而非"未降低"
+                # 这样压了但仍超阈值（如 200K → 90K，threshold=80K）也会累计
+                if _new_est > _compact_threshold:
+                    _compact_consecutive_over += 1
+                    if _compact_consecutive_over >= _compact_max_consecutive:
+                        raise RuntimeError(
+                            f"[auto-compact] thrashing：连续 {_compact_max_consecutive} 次 compact 后仍 "
+                            f">{_compact_threshold} tokens (当前 est={_new_est})，放弃避免反复 LLM 调用"
+                        )
+                else:
+                    _compact_consecutive_over = 0
 
             if first_call and not file_exists:
                 tc = {"type": "function", "function": {"name": "write_file"}}
