@@ -254,6 +254,110 @@ def test_code_no_warning_when_task_complete_in_final_round(tmp_path):
         f"task_complete 同轮触发时不应警告，但警告记录为: {warnings}"
 
 
+# ============= P1 #6: baseline 识别用户 prompt 关键词过滤 =============
+
+def test_prompt_test_fix_chinese_keywords():
+    """中文关键词命中"""
+    assert agent._prompt_requests_test_fix("tests/unit/test_memory.py 有测试失败，定位 bug 并修复")
+    assert agent._prompt_requests_test_fix("修复测试")
+    assert agent._prompt_requests_test_fix("修 bug 让单测过")
+    assert agent._prompt_requests_test_fix("失败的测试要 fix")
+    assert agent._prompt_requests_test_fix("测试不通过")
+
+
+def test_prompt_test_fix_english_keywords():
+    """英文关键词命中（大小写不敏感）"""
+    assert agent._prompt_requests_test_fix("Fix the failing tests in test_memory.py")
+    assert agent._prompt_requests_test_fix("FIX BUG in calculator")
+    assert agent._prompt_requests_test_fix("make the tests pass")
+    assert agent._prompt_requests_test_fix("There is a test failure")
+
+
+def test_prompt_test_fix_negative():
+    """无关 prompt 不命中"""
+    assert not agent._prompt_requests_test_fix("加一个 multiply 函数")
+    assert not agent._prompt_requests_test_fix("Add a new feature for caching")
+    assert not agent._prompt_requests_test_fix("写文档说明这个 API 的兼容性")
+    assert not agent._prompt_requests_test_fix("")
+    assert not agent._prompt_requests_test_fix(None)
+
+
+def test_prompt_test_fix_avoids_false_positive_on_unrelated_bug_word():
+    """单独 'bug' 字不命中（避免误吞 prompt 含 debug / bugfix mention）"""
+    # 关键词都是组合词："修 bug" / "fix bug" / "fix the bug"
+    assert not agent._prompt_requests_test_fix("生成一个 bug tracker UI")
+    assert not agent._prompt_requests_test_fix("debug log 加更多上下文")
+
+
+def test_fix_user_content_overrides_tester_role_when_disabled(tmp_path):
+    """[P1 #6] disable_baseline_skip=True 时 fix() user content 含反向覆盖文案，
+    禁止 LLM 按 _TESTER_ROLE Investigation order 归属跳过"""
+    import config, tools
+    config.set_workspace_dir(str(tmp_path))
+    tools._reinit_paths()
+
+    captured_msgs = {}
+    def mock_llm(msgs, **kw):
+        captured_msgs["msgs"] = msgs
+        return _make_response(tool_calls=[("c1", "task_complete",
+                                            {"success": False, "summary": "测试 mock"})])
+
+    orig = agent.call_llm
+    try:
+        agent.call_llm = mock_llm
+        agent.fix(
+            {"returncode": 1, "stderr": "FAILED test_x", "stdout": ""},
+            {"files": [{"filename": "x.py"}], "test_command": ""},
+            baseline_failures=None,
+            disable_baseline_skip=True,
+        )
+    finally:
+        agent.call_llm = orig
+
+    msgs = captured_msgs["msgs"]
+    user_content = next(m["content"] for m in msgs if m["role"] == "user")
+    # 强制覆盖文案存在
+    assert "强制覆盖" in user_content
+    assert "用户明确要求" in user_content or "用户 prompt" in user_content
+    # 禁止按归属跳过
+    assert "不允许按归属规则跳过" in user_content
+    # 旧的"归属判断必读"段不应出现（避免歧义）
+    assert "归属判断（必读" not in user_content
+
+
+def test_fix_user_content_keeps_legacy_path_by_default(tmp_path):
+    """[P1 #6] 未启用 disable_baseline_skip 时走原路径 — 保留归属判断引导"""
+    import config, tools
+    config.set_workspace_dir(str(tmp_path))
+    tools._reinit_paths()
+
+    captured_msgs = {}
+    def mock_llm(msgs, **kw):
+        captured_msgs["msgs"] = msgs
+        return _make_response(tool_calls=[("c1", "task_complete",
+                                            {"success": False, "summary": "测试 mock"})])
+
+    orig = agent.call_llm
+    try:
+        agent.call_llm = mock_llm
+        agent.fix(
+            {"returncode": 1, "stderr": "FAILED test_x", "stdout": ""},
+            {"files": [{"filename": "x.py"}], "test_command": ""},
+            baseline_failures={"tests/unit/test_x.py::test_pre_existing"},
+            disable_baseline_skip=False,
+        )
+    finally:
+        agent.call_llm = orig
+
+    msgs = captured_msgs["msgs"]
+    user_content = next(m["content"] for m in msgs if m["role"] == "user")
+    # 原文案保留
+    assert "归属判断（必读" in user_content
+    assert "Pre-existing baseline failures" in user_content
+    # 强制覆盖文案不应出现
+    assert "强制覆盖" not in user_content
+
+
 # ============= P1 #3: mechanical error detector 扩展 =============
 
 def _count_mech(error_info: str) -> dict:

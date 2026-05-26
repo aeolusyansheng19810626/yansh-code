@@ -146,6 +146,35 @@ _MECH_ERROR_PATTERNS: list = [
      "AttributeError"),
 ]
 
+# [P1 #6] baseline 识别用户请求过滤
+# 用户明确要求修测试 / 修 bug 时不能用 "current failures ⊆ baseline → 视为通过" 逻辑
+# 否则会静默漏修（task #4 暴露：注入 bug 后 1 failed → yansh 把它视为 pre-existing 跳过）
+_TEST_FIX_KEYWORDS_ZH: list = [
+    "测试失败", "失败的测试", "失败测试", "修测试", "修复测试", "修 测试",
+    "测试错误", "测试不通过", "测试不过", "测试报错",
+    "单测失败", "单测不过", "单测不通过", "单测报错", "单测错误",
+    "修 bug", "修复 bug", "修bug", "修复bug", "改 bug", "改bug", "解决 bug", "解决bug",
+]
+_TEST_FIX_KEYWORDS_EN: list = [
+    "fix test", "fix the test", "fix tests", "fix the tests",
+    "failing test", "failing tests", "test failure", "tests fail",
+    "unit test fail", "pytest fail", "pytest failure",
+    "make test pass", "make the test pass", "make tests pass", "make the tests pass",
+    "fix bug", "fix the bug", "fix bugs", "resolve bug", "fix failing",
+]
+
+
+def _prompt_requests_test_fix(prompt: str) -> bool:
+    """[P1 #6] 检查用户 prompt 是否明确要求修测试 / 修 bug。
+    命中 → fix loop 跳过 baseline 子集判定，强制走完整 fix（不能把当前失败当 pre-existing 视为通过）。
+    """
+    if not prompt:
+        return False
+    if any(k in prompt for k in _TEST_FIX_KEYWORDS_ZH):
+        return True
+    p_low = prompt.lower()
+    return any(k in p_low for k in _TEST_FIX_KEYWORDS_EN)
+
 
 def _cfg(key):
     """读取生效配置值"""
@@ -2313,11 +2342,16 @@ def _parse_review_response(content: str) -> dict:
         _log_json_failure("review", content, err)
     return data
 
-def fix(test_result, plan, reason="test_failure", baseline_failures=None):
+def fix(test_result, plan, reason="test_failure", baseline_failures=None,
+        disable_baseline_skip=False):
     """根据测试错误或审查意见修复代码（多轮工具调用）
     reason: "test_failure" | "review_rejection"
     baseline_failures: backlog #1，进入任务前已存在的失败 test id 集合。
       LLM 看到后应忽略这些 pre-existing 失败，只修增量失败。
+    disable_baseline_skip: [P1 #6] 用户 prompt 明确要求修测试 / 修 bug 时设 True。
+      除了不传 baseline_failures（已在调用方处理），还需在 user content 里反向覆盖
+      _TESTER_ROLE 的"归属判断 → 跳过 pre-existing"引导，禁止 LLM 主动按归属规则
+      task_complete(success=true) 跳过失败。
 
     返回 dict: {"early_exit": bool, "success": bool, "summary": str}
       - early_exit=True：LLM 主动调了 task_complete，外层应立即按 success 决定终止/标记
@@ -2361,16 +2395,30 @@ def fix(test_result, plan, reason="test_failure", baseline_failures=None):
                 "如果当前所有失败都来自这个列表，**立即 `task_complete(success=true, summary='所有失败均为 pre-existing baseline，未引入回归')`** 收尾。\n"
                 "只针对**不在上述列表**的新失败 fix。"
             )
-        content = (
-            f"Tests failed.\nError output:\n{error_info}\n\nPlan files (this task's scope): {plan_files}"
-            f"{baseline_block}\n\n"
-            "归属判断（必读 — 走 _TESTER_ROLE 的 Investigation order 第 1 条）：\n"
-            "失败断言里的符号 / 函数 / 测试目标对应的源文件，**是否在 Plan files 列表里**？\n"
-            "- 在 → 本次任务引入的回归，正常修复\n"
-            "- 不在 → 大概率是 pre-existing 失败，**直接 `task_complete(success=true, summary='X/Y/Z 等 N 条不属本次范围, 已跳过')` 收尾**，"
-            "由用户判断是否单独立项；不要读测试文件再去揣摩，归属规则已足够定性。\n\n"
-            "**严禁通过弱化测试断言（加 `or` 子句、改字面量、删除关键字）来让失败「过」** —— 这是把 bug 藏起来，不是修。"
-        )
+        # [P1 #6] disable_baseline_skip=True 时反向覆盖 _TESTER_ROLE 的"归属判断跳过"引导
+        # 否则 LLM 仍会自主按 system role 第 1 条 Investigation order 把失败归为 pre-existing 后 task_complete 跳过
+        if disable_baseline_skip:
+            content = (
+                f"Tests failed.\nError output:\n{error_info}\n\nPlan files (this task's scope): {plan_files}\n\n"
+                "**[强制覆盖 — 用户明确要求修测试 / 修 bug]**\n"
+                "本次任务的用户 prompt 已明确要求修复测试失败 / bug。**所有当前失败的测试都必须尝试修复，不允许按归属规则跳过任何一条**。\n"
+                "- 不要按 _TESTER_ROLE Investigation order 第 1 条做『plan files 归属』判断后跳过\n"
+                "- 不要把失败归为 pre-existing 然后 task_complete(success=true) 收尾\n"
+                "- 只有当所有失败都已**真正修复**（pytest 全绿）时才能 task_complete(success=true)\n"
+                "- 实在修不动某条，task_complete(success=false, summary='...') 表示放弃，**不要 success=true 跳过**\n\n"
+                "**严禁通过弱化测试断言（加 `or` 子句、改字面量、删除关键字）来让失败「过」** —— 这是把 bug 藏起来，不是修。"
+            )
+        else:
+            content = (
+                f"Tests failed.\nError output:\n{error_info}\n\nPlan files (this task's scope): {plan_files}"
+                f"{baseline_block}\n\n"
+                "归属判断（必读 — 走 _TESTER_ROLE 的 Investigation order 第 1 条）：\n"
+                "失败断言里的符号 / 函数 / 测试目标对应的源文件，**是否在 Plan files 列表里**？\n"
+                "- 在 → 本次任务引入的回归，正常修复\n"
+                "- 不在 → 大概率是 pre-existing 失败，**直接 `task_complete(success=true, summary='X/Y/Z 等 N 条不属本次范围, 已跳过')` 收尾**，"
+                "由用户判断是否单独立项；不要读测试文件再去揣摩，归属规则已足够定性。\n\n"
+                "**严禁通过弱化测试断言（加 `or` 子句、改字面量、删除关键字）来让失败「过」** —— 这是把 bug 藏起来，不是修。"
+            )
         sys_role = f"{_TESTER_ROLE}\n{_get_project_rules()}You are a code-fix assistant. Fix the code precisely based on the error output — prefer replace_in_file for minimal changes, only use write_file to rewrite a whole file when necessary."
         sys_role = _append_active_prompts(sys_role)
 
@@ -2793,6 +2841,16 @@ def _run(requirement, mode):
             return report(False, _dummy_tr, task_complete_signal=fix_signal)
         attempts += 1
 
+    # [P1 #6] 用户明确要求修测试 / 修 bug 时禁用 baseline 跳过：
+    # - run() 不把 current ⊆ baseline 视为通过
+    # - fix() 不在 prompt 里注入 baseline 列表 → LLM 不会被诱导 task_complete(success=true) 收尾
+    _user_wants_fix = _prompt_requests_test_fix(original_requirement)
+    if _user_wants_fix and _BASELINE_FAILURES:
+        console.print(
+            f"[baseline] 用户 prompt 要求修测试 / 修 bug → 禁用 baseline 跳过（不再把当前失败误判为 pre-existing）",
+            style="yellow", highlight=False,
+        )
+
     while attempts < max_attempts:
         test_result = test(plan_result.get("test_command", ""))
         if judge(test_result):
@@ -2807,8 +2865,9 @@ def _run(requirement, mode):
             return report(True, test_result, task_complete_signal=coder_signal)
 
         # backlog #1: returncode!=0 但 current failures 是 baseline 子集 → 视为通过
+        # [P1 #6] _user_wants_fix=True 时跳过此逻辑，强制走完整 fix loop
         _increment = None
-        if _BASELINE_FAILURES:
+        if _BASELINE_FAILURES and not _user_wants_fix:
             _cur_text = (test_result.get("stdout") or "") + "\n" + (test_result.get("stderr") or "")
             _cur_fail = _parse_pytest_failures(_cur_text)
             _increment = _cur_fail - _BASELINE_FAILURES
@@ -2835,7 +2894,13 @@ def _run(requirement, mode):
                 style="cyan", highlight=False,
             )
         if attempts < max_attempts - 1:
-            fix_signal = fix(test_result, plan_result, baseline_failures=_BASELINE_FAILURES)
+            # [P1 #6] _user_wants_fix=True 时：
+            # 1) 不传 baseline_failures（user content 没有 baseline_block）
+            # 2) disable_baseline_skip=True 让 fix() 在 user content 里反向覆盖 _TESTER_ROLE 的归属跳过引导
+            _baseline_for_fix = None if _user_wants_fix else _BASELINE_FAILURES
+            fix_signal = fix(test_result, plan_result,
+                             baseline_failures=_baseline_for_fix,
+                             disable_baseline_skip=_user_wants_fix)
             # P0 #3 第二波：识别 fix() 的主动声明，避免无谓 retry
             if fix_signal.get("early_exit"):
                 _summary = fix_signal.get("summary", "")
