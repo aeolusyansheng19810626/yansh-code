@@ -2084,18 +2084,27 @@ def code(plan, mode="auto", requirement=""):
             console.print(f"{filename} 已存在，进入增量修改流程（LLM 自己 read_file）...")
 
             req_block = f"\nOriginal requirement (must be followed strictly, including variable names, library names, API key names, etc.):\n{requirement}\n" if requirement else ""
+            # P2 #4-C: >=20 处批量改动时允许 write_file 整文件重写，避免与 edit_strategy_hint 矛盾
+            _write_rule = (
+                f"- For large batch changes ({expected_edits} edit points on this file): "
+                f"**prefer write_file to rewrite the whole file in one shot** — read the full file first, "
+                f"apply all changes in memory, then write_file once. "
+                f"This is faster and less error-prone than {expected_edits} replace_in_file calls."
+                if expected_edits >= 20 else
+                "- For existing files use replace_in_file for precise edits; "
+                "write_file is only allowed for creating new files"
+            )
             sys_prompt = f"""{_CODER_ROLE}
 {_get_project_rules()}{req_block}
 You are a code-editing assistant. Make precise modifications to existing files.
 
 Available operations:
 1. replace_in_file(filename, old_str, new_str) — precise replacement on an existing file
-2. write_file(filename, content) — only for creating new files
+2. write_file(filename, content) — create new files or rewrite existing files for large batch changes
 
 Rules:
 - **Read first**: before any modification you must call read_file (or get_symbol_definition / search_in_files for targeted lookup) on `{filename}` to see the current content. The user message NO LONGER inlines the file body — you must fetch it via tools.
-- For existing files you **must** use replace_in_file for precise replacement; do not rewrite the whole file with write_file
-- write_file is only allowed for creating new files
+{_write_rule}
 - Each replace_in_file call modifies one place; for multiple changes call it multiple times{_exploration}"""
             sys_prompt = _append_active_prompts(sys_prompt)
         else:
@@ -2152,7 +2161,7 @@ Note: you must use write_file to write the file; the filename must be exactly `{
         _signaled_complete_this_file = False  # [P1 #2] 本文件是否已 task_complete(success=True)
 
         # P2 #4-B2: auto-compact 配置
-        _compact_threshold = int(_cfg("compact_threshold_tokens") or 80_000)
+        _compact_threshold = int(_cfg("compact_threshold_tokens") or 30_000)
         _compact_keep_pairs = int(_cfg("compact_keep_recent_pairs") or 2)
         _compact_consecutive_over = 0  # review M2: 连续 N 次 compact 后仍超阈值的次数（不论是否降低）
         _compact_max_consecutive = int(_cfg("compact_max_consecutive_over") or 4)
