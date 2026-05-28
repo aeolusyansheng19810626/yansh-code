@@ -2161,17 +2161,18 @@ Note: you must use write_file to write the file; the filename must be exactly `{
         _signaled_complete_this_file = False  # [P1 #2] 本文件是否已 task_complete(success=True)
 
         # P2 #4-B2: auto-compact 配置
-        _compact_threshold = int(_cfg("compact_threshold_tokens") or 30_000)
+        _compact_threshold = int(_cfg("compact_threshold_tokens") or 60_000)
         _compact_keep_pairs = int(_cfg("compact_keep_recent_pairs") or 2)
-        _compact_consecutive_over = 0  # review M2: 连续 N 次 compact 后仍超阈值的次数（不论是否降低）
+        _compact_consecutive_over = 0
         _compact_max_consecutive = int(_cfg("compact_max_consecutive_over") or 4)
+        _compact_disabled = False  # M1: thrashing 保护触发后禁用本任务后续 compact
 
         while attempts_left > 0:
             attempts_left -= 1
 
             # P2 #4-B2: 每轮 call_llm 前检测是否需 compact
             _est = _estimate_messages_tokens(msgs)
-            if _est > _compact_threshold:
+            if _est > _compact_threshold and not _compact_disabled:
                 console.print(
                     f"[auto-compact] msgs ~{_est} tokens > {_compact_threshold}，触发压缩...",
                     style="cyan",
@@ -2184,23 +2185,27 @@ Note: you must use write_file to write the file; the filename must be exactly `{
                         f"[auto-compact] 已压缩 {_est} → {_new_est} tokens",
                         style="green",
                     )
+                    # M2: thrashing 判定只在 compact 真正降低时才计
+                    # 压缩率 <15% 才算"压不动"，压下去了但仍超阈值不算 thrashing
+                    _reduction_ratio = (_est - _new_est) / _est
+                    if _reduction_ratio < 0.15:
+                        _compact_consecutive_over += 1
+                        if _compact_consecutive_over >= _compact_max_consecutive:
+                            # M1: 仿 cc——不 raise，禁用后续 compact，让任务继续跑完
+                            console.print(
+                                f"[auto-compact] thrashing 保护：连续 {_compact_max_consecutive} 次压缩率 <15%，"
+                                f"禁用后续 compact 继续执行（est={_new_est}）",
+                                style="yellow",
+                            )
+                            _compact_disabled = True
+                    else:
+                        _compact_consecutive_over = 0
                 else:
-                    # compact 没降下来（pairs 太少或 summarize 失败）
+                    # compact 没降下来（pairs 太少或 summarize 失败），不计 thrashing
                     console.print(
                         f"[auto-compact] 未降低（{_est} → {_new_est}），放过本轮",
                         style="yellow",
                     )
-                # review M2 修：thrashing 计数改为"仍超阈值"而非"未降低"
-                # 这样压了但仍超阈值（如 200K → 90K，threshold=80K）也会累计
-                if _new_est > _compact_threshold:
-                    _compact_consecutive_over += 1
-                    if _compact_consecutive_over >= _compact_max_consecutive:
-                        raise RuntimeError(
-                            f"[auto-compact] thrashing：连续 {_compact_max_consecutive} 次 compact 后仍 "
-                            f">{_compact_threshold} tokens (当前 est={_new_est})，放弃避免反复 LLM 调用"
-                        )
-                else:
-                    _compact_consecutive_over = 0
 
             if first_call and not file_exists:
                 tc = {"type": "function", "function": {"name": "write_file"}}
