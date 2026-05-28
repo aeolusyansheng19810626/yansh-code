@@ -19,6 +19,8 @@ from unittest.mock import MagicMock
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
 import agent
+import llm_client as _lc
+import subagent as _sa
 import tools
 import state
 from tools_schema import READONLY_TOOL_NAMES, TOOLS
@@ -355,12 +357,12 @@ def test_run_subagent_max_steps_clamped_to_hard_cap(tmp_path):
                 ("c" + str(call_count["n"]), "read_file", {"filename": "f.py"})
             ])
 
-        orig = agent.call_llm
+        orig = _lc.call_llm
         try:
-            agent.call_llm = fake_llm
+            _lc.call_llm = fake_llm
             res = agent._run_subagent("永远跑不完的任务", max_steps=999)
         finally:
-            agent.call_llm = orig
+            _lc.call_llm = orig
 
         # cap 真生效：steps 精确等于 _SUBAGENT_HARD_CAP（16）
         assert res["steps"] == agent._SUBAGENT_HARD_CAP, \
@@ -382,12 +384,12 @@ def test_run_subagent_silent_exit_uses_content_as_summary(tmp_path):
                 return _mk_resp(content="")   # 第一轮沉默——触发兜底追问
             return _mk_resp(content="我看完了，没什么要报告的")  # 第二轮有 content 但没工具
 
-        orig = agent.call_llm
+        orig = _lc.call_llm
         try:
-            agent.call_llm = fake_llm
+            _lc.call_llm = fake_llm
             res = agent._run_subagent("任务", role="explorer", max_steps=8)
         finally:
-            agent.call_llm = orig
+            _lc.call_llm = orig
 
         assert "没什么要报告的" in res["summary"]
 
@@ -397,12 +399,12 @@ def test_run_subagent_max_steps_min_clamped_to_1(tmp_path):
     with state.scoped_session(tmp_path):
         (tmp_path / "f.py").write_text("x=1\n", encoding="utf-8")
 
-        orig = agent.call_llm
+        orig = _lc.call_llm
         try:
-            agent.call_llm = lambda msgs, **kw: _mk_resp(content="hi")
+            _lc.call_llm = lambda msgs, **kw: _mk_resp(content="hi")
             res = agent._run_subagent("X", max_steps=-5)
         finally:
-            agent.call_llm = orig
+            _lc.call_llm = orig
 
         assert res["steps"] >= 1
 
@@ -427,15 +429,15 @@ def test_run_subagent_recursion_blocked(tmp_path):
 def test_subagent_handler_returns_dict_for_llm(tmp_path):
     with state.scoped_session(tmp_path):
         (tmp_path / "f.py").write_text("x=1\n", encoding="utf-8")
-        orig = agent.call_llm
+        orig = _lc.call_llm
         try:
-            agent.call_llm = lambda msgs, **kw: _mk_resp(
+            _lc.call_llm = lambda msgs, **kw: _mk_resp(
                 tool_calls=[("c1", "task_complete",
                              {"success": True, "summary": "OK"})],
             )
             out = agent._subagent_handler(task="X", role="explorer", max_steps=4)
         finally:
-            agent.call_llm = orig
+            _lc.call_llm = orig
 
         assert out["success"] is True
         assert out["summary"] == "OK"
@@ -458,16 +460,16 @@ def test_subagent_stats_updated(tmp_path):
         agent._SUBAGENT_STATS["total_steps"] = 0
         (tmp_path / "f.py").write_text("x=1\n", encoding="utf-8")
 
-        orig = agent.call_llm
+        orig = _lc.call_llm
         try:
-            agent.call_llm = lambda msgs, **kw: _mk_resp(
+            _lc.call_llm = lambda msgs, **kw: _mk_resp(
                 tool_calls=[("c1", "task_complete",
                              {"success": True, "summary": "done"})],
             )
             agent._run_subagent("a", role="explorer", max_steps=4)
             agent._run_subagent("b", role="explorer", max_steps=4)
         finally:
-            agent.call_llm = orig
+            _lc.call_llm = orig
 
         stats = agent.get_subagent_stats()
         assert stats["calls"] == 2
@@ -486,16 +488,16 @@ def test_subagent_messages_isolated_from_parent(tmp_path):
         (tmp_path / "f.py").write_text("x=1\n", encoding="utf-8")
         before = list(agent.conversation_history)
 
-        orig = agent.call_llm
+        orig = _lc.call_llm
         try:
-            agent.call_llm = lambda msgs, **kw: _mk_resp(
+            _lc.call_llm = lambda msgs, **kw: _mk_resp(
                 content="子 agent 看到的中间步骤",
                 tool_calls=[("c1", "task_complete",
                              {"success": True, "summary": "短 summary"})],
             )
             agent._run_subagent("X", role="explorer", max_steps=4)
         finally:
-            agent.call_llm = orig
+            _lc.call_llm = orig
 
         after = list(agent.conversation_history)
         assert before == after, "子 agent 不应改父 agent 的 conversation_history"
@@ -507,15 +509,15 @@ def test_in_subagent_flag_resets_after_run(tmp_path):
     with state.scoped_session(tmp_path):
         (tmp_path / "f.py").write_text("x=1\n", encoding="utf-8")
         assert agent._is_in_subagent() is False
-        orig = agent.call_llm
+        orig = _lc.call_llm
         try:
-            agent.call_llm = lambda msgs, **kw: _mk_resp(
+            _lc.call_llm = lambda msgs, **kw: _mk_resp(
                 tool_calls=[("c1", "task_complete",
                              {"success": True, "summary": "OK"})],
             )
             agent._run_subagent("X", role="explorer", max_steps=4)
         finally:
-            agent.call_llm = orig
+            _lc.call_llm = orig
         assert agent._is_in_subagent() is False, "跑完应当重置"
 
 
@@ -527,15 +529,15 @@ def test_in_subagent_flag_resets_on_exception(tmp_path):
         def boom(*a, **kw):
             raise RuntimeError("LLM 挂了")
 
-        orig = agent.call_llm
+        orig = _lc.call_llm
         try:
-            agent.call_llm = boom
+            _lc.call_llm = boom
             try:
                 agent._run_subagent("X", role="explorer", max_steps=4)
             except RuntimeError:
                 pass
         finally:
-            agent.call_llm = orig
+            _lc.call_llm = orig
         assert agent._is_in_subagent() is False
 
 
@@ -609,9 +611,9 @@ def test_dispatch_tool_calls_concurrent_subagents(tmp_path):
             _mk_tool_call("s3", "dispatch_subagent",
                           {"task": "C", "role": "explorer", "max_steps": 2}),
         ]
-        orig = agent.call_llm
+        orig = _lc.call_llm
         try:
-            agent.call_llm = slow_llm
+            _lc.call_llm = slow_llm
             t0 = time.time()
             outs = agent._dispatch_tool_calls(
                 tool_calls, mode="audit", allow_hil=False, allow_confirm=False,
@@ -619,7 +621,7 @@ def test_dispatch_tool_calls_concurrent_subagents(tmp_path):
             )
             elapsed = time.time() - t0
         finally:
-            agent.call_llm = orig
+            _lc.call_llm = orig
 
         assert len(outs) == 3
         # 都成功完成
@@ -649,15 +651,15 @@ def test_dispatch_tool_calls_single_subagent_serial(tmp_path):
             _mk_tool_call("s1", "dispatch_subagent",
                           {"task": "A", "role": "explorer", "max_steps": 2}),
         ]
-        orig = agent.call_llm
+        orig = _lc.call_llm
         try:
-            agent.call_llm = llm_fake
+            _lc.call_llm = llm_fake
             outs = agent._dispatch_tool_calls(
                 tool_calls, mode="audit", allow_hil=False, allow_confirm=False,
                 snap=None, messages=[],
             )
         finally:
-            agent.call_llm = orig
+            _lc.call_llm = orig
 
         assert len(outs) == 1
         # 单个时没启动 thread pool（线程名不带 yansh-subagent 前缀）
@@ -691,16 +693,16 @@ def test_dispatch_tool_calls_concurrency_capped(tmp_path):
                           {"task": f"T{i}", "role": "explorer", "max_steps": 2})
             for i in range(6)
         ]
-        orig = agent.call_llm
+        orig = _lc.call_llm
         cap = agent._SUBAGENT_CONCURRENCY_CAP
         try:
-            agent.call_llm = slow_llm
+            _lc.call_llm = slow_llm
             outs = agent._dispatch_tool_calls(
                 tool_calls, mode="audit", allow_hil=False, allow_confirm=False,
                 snap=None, messages=[],
             )
         finally:
-            agent.call_llm = orig
+            _lc.call_llm = orig
 
         assert len(outs) == 6
         # 同时活跃数 ≤ cap
@@ -726,15 +728,15 @@ def test_dispatch_tool_calls_mixed_subagent_and_local_tools(tmp_path):
             _mk_tool_call("c4", "read_file", {"filename": "main.py"}),
         ]
         msgs = []
-        orig = agent.call_llm
+        orig = _lc.call_llm
         try:
-            agent.call_llm = llm_fake
+            _lc.call_llm = llm_fake
             outs = agent._dispatch_tool_calls(
                 tool_calls, mode="audit", allow_hil=False, allow_confirm=False,
                 snap=None, messages=msgs,
             )
         finally:
-            agent.call_llm = orig
+            _lc.call_llm = orig
 
         # outs 顺序与原 tool_calls 顺序严格一致
         assert [o["id"] for o in outs] == ["c1", "c2", "c3", "c4"]
@@ -804,15 +806,15 @@ def test_subagent_stats_lock_concurrent_increments(tmp_path):
                           {"task": f"T{i}", "role": "explorer", "max_steps": 2})
             for i in range(N)
         ]
-        orig = agent.call_llm
+        orig = _lc.call_llm
         try:
-            agent.call_llm = fast_llm
+            _lc.call_llm = fast_llm
             outs = agent._dispatch_tool_calls(
                 tool_calls, mode="audit", allow_hil=False, allow_confirm=False,
                 snap=None, messages=[],
             )
         finally:
-            agent.call_llm = orig
+            _lc.call_llm = orig
 
         assert len(outs) == N
         stats = agent.get_subagent_stats()
@@ -835,13 +837,13 @@ def test_audit_mode_forces_general_subagent_to_auditor(tmp_path):
     with state.scoped_session(tmp_path):
         orig = agent._run_subagent
         try:
-            agent._run_subagent = fake_run_subagent
+            _sa._run_subagent = fake_run_subagent
             tc = _mk_tool_call("s1", "dispatch_subagent",
                                {"task": "写 pwned.txt", "role": "general"})
             out = agent._dispatch_tool_call(tc, mode="audit",
                                              allow_hil=False, allow_confirm=False)
         finally:
-            agent._run_subagent = orig
+            _sa._run_subagent = orig
 
     # role 已被降级
     assert captured["role"] == "auditor", (
@@ -862,13 +864,13 @@ def test_audit_mode_keeps_explorer_role_unchanged(tmp_path):
     with state.scoped_session(tmp_path):
         orig = agent._run_subagent
         try:
-            agent._run_subagent = fake_run_subagent
+            _sa._run_subagent = fake_run_subagent
             tc = _mk_tool_call("s1", "dispatch_subagent",
                                {"task": "查 X", "role": "explorer"})
             agent._dispatch_tool_call(tc, mode="audit",
                                        allow_hil=False, allow_confirm=False)
         finally:
-            agent._run_subagent = orig
+            _sa._run_subagent = orig
 
     assert captured["role"] == "explorer"
 
@@ -884,13 +886,13 @@ def test_audit_mode_keeps_auditor_role_unchanged(tmp_path):
     with state.scoped_session(tmp_path):
         orig = agent._run_subagent
         try:
-            agent._run_subagent = fake_run_subagent
+            _sa._run_subagent = fake_run_subagent
             tc = _mk_tool_call("s1", "dispatch_subagent",
                                {"task": "审计", "role": "auditor"})
             agent._dispatch_tool_call(tc, mode="auto",
                                        allow_hil=False, allow_confirm=False)
         finally:
-            agent._run_subagent = orig
+            _sa._run_subagent = orig
 
     assert captured["role"] == "auditor"
 
@@ -908,13 +910,13 @@ def test_non_audit_mode_keeps_general_role(tmp_path):
     with state.scoped_session(tmp_path):
         orig = agent._run_subagent
         try:
-            agent._run_subagent = fake_run_subagent
+            _sa._run_subagent = fake_run_subagent
             tc = _mk_tool_call("s1", "dispatch_subagent",
                                {"task": "写代码", "role": "general"})
             agent._dispatch_tool_call(tc, mode="auto",
                                        allow_hil=False, allow_confirm=False)
         finally:
-            agent._run_subagent = orig
+            _sa._run_subagent = orig
 
     assert captured["role"] == "general", "auto 模式不该降级"
 
@@ -1009,15 +1011,15 @@ def test_audit_mode_subagent_cannot_write_file_e2e(tmp_path):
                  {"success": False, "summary": "write 被拒"}),
             ])
 
-        orig = agent.call_llm
+        orig = _lc.call_llm
         try:
-            agent.call_llm = fake_sub_llm
+            _lc.call_llm = fake_sub_llm
             tc = _mk_tool_call("s1", "dispatch_subagent",
                                {"task": "写 pwned.txt", "role": "general", "max_steps": 4})
             out = agent._dispatch_tool_call(tc, mode="audit",
                                              allow_hil=False, allow_confirm=False)
         finally:
-            agent.call_llm = orig
+            _lc.call_llm = orig
 
     # 子 agent role 已被强制降级
     assert out["result"]["role"] == "auditor"
@@ -1054,12 +1056,12 @@ def test_general_subagent_summary_lists_modified_files(tmp_path):
                  {"success": True, "summary": "改了两个文件"}),
             ])
 
-        orig = agent.call_llm
+        orig = _lc.call_llm
         try:
-            agent.call_llm = fake_llm
+            _lc.call_llm = fake_llm
             res = agent._run_subagent("写文件", role="general", max_steps=4)
         finally:
-            agent.call_llm = orig
+            _lc.call_llm = orig
 
     assert res["success"] is True
     # 修改文件清单出现在 summary
@@ -1082,12 +1084,12 @@ def test_explorer_subagent_summary_no_files_addendum(tmp_path):
                  {"success": True, "summary": "看完了"}),
             ])
 
-        orig = agent.call_llm
+        orig = _lc.call_llm
         try:
-            agent.call_llm = fake_llm
+            _lc.call_llm = fake_llm
             res = agent._run_subagent("查 X", role="explorer", max_steps=2)
         finally:
-            agent.call_llm = orig
+            _lc.call_llm = orig
 
     assert "[系统提示]" not in res["summary"]
 
@@ -1105,12 +1107,12 @@ def test_general_subagent_no_files_modified_no_addendum(tmp_path):
                  {"success": True, "summary": "只看不改"}),
             ])
 
-        orig = agent.call_llm
+        orig = _lc.call_llm
         try:
-            agent.call_llm = fake_llm
+            _lc.call_llm = fake_llm
             res = agent._run_subagent("查", role="general", max_steps=2)
         finally:
-            agent.call_llm = orig
+            _lc.call_llm = orig
 
     assert "[系统提示]" not in res["summary"]
 
