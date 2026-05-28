@@ -2934,7 +2934,7 @@ def _capture_baseline_failures(test_command: str) -> set:
     try:
         console.print(f"[baseline] 跑一次 {test_command} 记录 pre-existing failures...",
                       style="cyan", highlight=False)
-        r = execute_command(test_command)
+        r = execute_command(test_command, _timeout_sec=120)
         text = (r.get("stdout") or "") + "\n" + (r.get("stderr") or "")
         failures = _parse_pytest_failures(text)
         if failures:

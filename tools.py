@@ -285,7 +285,7 @@ def read_file(filename, offset=None, limit=None, max_bytes=None):
                                      f"use offset={end + 1} to continue")
     return result
 
-def execute_command(command):
+def execute_command(command, _timeout_sec=30):
     """在workspace目录下执行命令，30秒超时，三级命令策略（deny/safe/confirm）"""
     # Level 1: deny
     danger = _check_dangerous(command)
@@ -375,9 +375,15 @@ def execute_command(command):
                     process.wait(timeout=0.1)
                     break # Finished
                 except subprocess.TimeoutExpired:
-                    if time.time() - start_time > 30:
+                    if time.time() - start_time > _timeout_sec:
                         process.kill()
-                        return _err("timeout", "命令执行超时（30秒）")
+                        t_out.join(timeout=2)
+                        t_err.join(timeout=2)
+                        return _err("timeout", f"命令执行超时（{_timeout_sec}秒）",
+                                    "execute_command",
+                                    stdout=''.join(stdout_lines),
+                                    stderr=''.join(stderr_lines),
+                                    returncode=-1)
         except interrupt.Interrupted:
             raise
         except Exception as e:
