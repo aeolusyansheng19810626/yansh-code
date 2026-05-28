@@ -1659,7 +1659,7 @@ Always respond in Chinese (用户的项目规则要求中文回复).
 
 _CODER_ROLE = """[Role: Coder Agent]
 You focus on producing high-quality code according to the plan.
-Responsibility: execute the plan strictly, do not invent extra features; emphasize code quality and boundary cases; for existing files use replace_in_file for precise edits, never rewrite a whole file.
+Responsibility: execute the plan strictly, do not invent extra features; emphasize code quality and boundary cases; for existing files use replace_in_file for precise edits — unless the file has 20+ scattered edit points, in which case write_file the whole file in one shot is preferred.
 Tool-call efficiency (critical):
 - **Locate before modifying**: use search_in_files / list_symbols / get_symbol_definition to pinpoint the change site — don't read_file the whole file then decide
 - **Parallelize independent tool calls**: in one turn, fire multiple read_file / search_in_files / list_symbols at once — don't serialize
@@ -2123,11 +2123,11 @@ Note: you must use write_file to write the file; the filename must be exactly `{
 
         # 构建消息：expected_edits 显式告诉 LLM 本文件改动规模 → 选合适策略
         # >=15 处提示首选 write_file 整文件重写（变化散乱时）；中等用并行 replace_in_file；<5 单点改
-        if expected_edits >= 15:
+        if expected_edits >= 20:
             edit_strategy_hint = (
-                f"\n\n【改动规模提示】expected_edits={expected_edits}。改动较多 — "
-                f"如果各 edit 点 old_str 各不相同（无法 replace_all），**强烈推荐用 write_file 一次重写整个文件**，"
-                f"比 {expected_edits}+ 次 replace_in_file 的回合数省得多。"
+                f"\n\n【改动规模提示】expected_edits={expected_edits}。大批量改动 — "
+                f"如果各 edit 点 old_str 各不相同（无法 replace_all），**必须用 write_file 一次重写整个文件**（read 全文 → 内存应用所有改动 → write_file），"
+                f"禁止用 {expected_edits}+ 次 replace_in_file 逐点替换（会耗尽 round budget）。"
             )
         elif expected_edits >= 5:
             edit_strategy_hint = (

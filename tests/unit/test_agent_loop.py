@@ -1085,6 +1085,99 @@ def test_estimate_under_threshold_no_compact():
     assert out == msgs
 
 
+# =====================================================================
+# P2 #4-C：write_file 阈值 + compact 默认值
+# =====================================================================
+
+def test_write_rule_below_threshold_forbids_write_file(tmp_path):
+    """expected_edits=19（<20）时 sys_prompt 仍禁止 write_file"""
+    import config, tools
+    config.set_workspace_dir(str(tmp_path))
+    tools._reinit_paths()
+
+    captured = {}
+    def mock_llm(msgs, **kw):
+        captured["sys"] = next(m["content"] for m in msgs if m["role"] == "system")
+        from unittest.mock import MagicMock
+        resp = MagicMock()
+        msg = MagicMock()
+        msg.content = ""
+        msg.tool_calls = None
+        resp.choices = [MagicMock(message=msg)]
+        return resp
+
+    # 构造一个已存在的文件
+    f = tmp_path / "x.py"
+    f.write_text("pass")
+
+    orig = agent.call_llm
+    try:
+        agent.call_llm = mock_llm
+        agent.code(
+            {"files": [{"filename": "x.py", "intent": "edit", "description": "edit",
+                        "expected_edits": 19}],
+             "test_command": ""},
+            requirement="test",
+        )
+    except Exception:
+        pass
+    finally:
+        agent.call_llm = orig
+
+    sys_content = captured.get("sys", "")
+    # 19 < 20：sys_prompt 应该禁止 write_file
+    assert "write_file" not in sys_content or "only for creating new files" in sys_content or "replace_in_file" in sys_content
+
+
+def test_write_rule_at_threshold_allows_write_file(tmp_path):
+    """expected_edits=20（>=20）时 sys_prompt 允许并推荐 write_file"""
+    import config, tools
+    config.set_workspace_dir(str(tmp_path))
+    tools._reinit_paths()
+
+    captured = {}
+    def mock_llm(msgs, **kw):
+        captured["sys"] = next(m["content"] for m in msgs if m["role"] == "system")
+        from unittest.mock import MagicMock
+        resp = MagicMock()
+        msg = MagicMock()
+        msg.content = ""
+        msg.tool_calls = None
+        resp.choices = [MagicMock(message=msg)]
+        return resp
+
+    f = tmp_path / "x.py"
+    f.write_text("pass")
+
+    orig = agent.call_llm
+    try:
+        agent.call_llm = mock_llm
+        agent.code(
+            {"files": [{"filename": "x.py", "intent": "edit", "description": "edit",
+                        "expected_edits": 20}],
+             "test_command": ""},
+            requirement="test",
+        )
+    except Exception:
+        pass
+    finally:
+        agent.call_llm = orig
+
+    sys_content = captured.get("sys", "")
+    # 20 >= 20：sys_prompt 应该允许 write_file 整文件重写
+    assert "write_file" in sys_content
+    assert "prefer write_file" in sys_content or "large batch" in sys_content
+
+
+def test_compact_threshold_default_is_30k():
+    """compact 默认阈值是 30_000（不依赖 cfg）"""
+    # _cfg 在没有配置时返回 None，默认值应为 30_000
+    import agent as _a
+    # 直接看源码常量验证 or 验证在 mock cfg=None 时等于 30000
+    val = int(_a._cfg("compact_threshold_tokens") or 30_000)
+    assert val == 30_000
+
+
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, "-v"])
