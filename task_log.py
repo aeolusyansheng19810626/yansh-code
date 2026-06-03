@@ -90,17 +90,25 @@ def finish_task_log(success, attempts, test_result=None, task_complete_signal=No
         try:
             import llm_client as _lc
             cur = _lc.get_session_token_breakdown()
+            from config import get_model_price
+            by_model = {
+                m: {
+                    "input": b["input"] - _token_baseline.get("by_model", {}).get(m, {}).get("input", 0),
+                    "output": b["output"] - _token_baseline.get("by_model", {}).get(m, {}).get("output", 0),
+                }
+                for m, b in cur["by_model"].items()
+            }
+            cost_usd = sum(
+                v["input"] / 1_000_000 * get_model_price(m)["input"] +
+                v["output"] / 1_000_000 * get_model_price(m)["output"]
+                for m, v in by_model.items()
+            )
             _current_task_log["tokens"] = {
                 "input": cur["input"] - _token_baseline.get("input", 0),
                 "output": cur["output"] - _token_baseline.get("output", 0),
-                "by_model": {
-                    m: {
-                        "input": b["input"] - _token_baseline.get("by_model", {}).get(m, {}).get("input", 0),
-                        "output": b["output"] - _token_baseline.get("by_model", {}).get(m, {}).get("output", 0),
-                    }
-                    for m, b in cur["by_model"].items()
-                },
+                "by_model": by_model,
             }
+            _current_task_log["cost_usd"] = round(cost_usd, 6)
         except Exception:
             pass
         # 在锁内构建好 payload，但实际写盘 IO 释放锁后做

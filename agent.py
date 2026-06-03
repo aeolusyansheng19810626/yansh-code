@@ -238,6 +238,138 @@ def _plan_needs_exploration(requirement: str) -> bool:
     return any(k in r_low for k in _PLAN_NEEDS_EXPLORATION_KEYWORDS_EN)
 
 
+# ── 任务复杂度路由：关键词表 ──────────────────────────────────────────────────
+
+_READONLY_KEYWORDS_ZH: list[str] = [
+    "分析", "解释", "说明", "描述", "理解", "梳理",
+    "总结", "概括", "归纳",
+    "在哪里", "在哪", "哪里定义", "定义在哪", "哪个文件", "找一下", "找找",
+    "调用链", "调用关系", "依赖关系", "引用关系",
+    "列出", "列举", "枚举",
+    "审查", "审阅", "检查", "排查", "诊断",
+    "有没有bug", "有没有 bug", "有没有问题", "是否有问题",
+    "代码质量", "潜在问题", "安全问题",
+    "并发条件", "竞态", "线程安全",
+    "文档", "注释",
+    "评估", "评价", "比较", "对比", "权衡",
+    "可行性",
+]
+_READONLY_KEYWORDS_EN: list[str] = [
+    "analyze", "analyse", "explain", "describe", "understand",
+    "summarize", "summarise", "overview",
+    "where is", "where are", "find", "locate", "list all",
+    "call chain", "call graph", "dependency",
+    "review", "audit", "inspect", "diagnose",
+    "is there a bug", "any issues", "any problems",
+    "code quality", "potential issue", "security issue",
+    "concurrency", "race condition", "thread safety",
+    "document", "comment",
+    "compare", "contrast", "trade-off",
+    "feasibility",
+]
+
+# 命中否定词 → 不走 readonly（用户明确要改代码）
+_WRITE_NEGATION_KEYWORDS_ZH: list[str] = [
+    "修改", "修复", "改一下", "改掉", "更新", "重构",
+    "创建", "新建", "添加", "增加", "删除", "移除",
+    "生成", "补充", "加上", "加一个", "加个",
+    "帮我实现", "帮你实现", "来实现", "去实现",
+    # 裸"实现"不加：会误匹配"实现方式"等名词形式
+]
+_WRITE_NEGATION_KEYWORDS_EN: list[str] = [
+    "fix", "modify", "change", "update",
+    "implement", "create", "add", "remove", "delete",
+    "generate", "build", "make",
+    # "write" 不加：会误匹配函数名 write_file 等
+]
+
+# complex 信号，优先级最高
+_COMPLEX_KEYWORDS_ZH: list[str] = [
+    "重构", "架构", "整个项目", "全部文件", "所有文件",
+    "迁移", "升级", "大规模", "从头", "全新实现",
+    "改动范围", "影响范围", "影响分析", "兼容性分析",
+]
+_COMPLEX_KEYWORDS_EN: list[str] = [
+    "refactor", "redesign", "migrate", "migration",
+    "all files", "entire project", "whole codebase",
+    "impact analysis", "compatibility analysis",
+    "architecture", "large scale", "large-scale",
+    "from scratch",
+]
+
+_CLASSIFY_SYSTEM = """\
+判断编码任务的复杂度档，只回复以下三个单词之一，不要任何解释：
+  readonly  —— 纯分析/审查/解释，不需要修改任何代码
+  simple    —— 单文件/少量改动，改动范围明确
+  complex   —— 多文件/架构级/全局影响
+
+规则：
+1. 含"修改/修复/实现/创建/添加/fix/add/implement"等写入动作 → 不能是 readonly
+2. 纯"分析/解释/审查/找出"且不要求改代码 → readonly
+3. 涉及多文件/重构/架构 → complex
+4. 其余 → simple"""
+
+
+def _llm_classify_task(requirement: str) -> str:
+    """LLM 兜底分类器（Haiku）。失败时抛异常由调用方处理。"""
+    from llm_client import call_llm
+    messages = [
+        {"role": "user", "content": _CLASSIFY_SYSTEM + "\n\n任务：" + requirement[:500]},
+    ]
+    resp = call_llm(messages, tools=None, stream=False,
+                    model_override="claude-haiku-4-5")
+    text = (resp.choices[0].message.content or "").strip().lower()
+    if "readonly" in text:
+        return "readonly"
+    if "complex" in text:
+        return "complex"
+    return "simple"
+
+
+def _classify_task(requirement: str) -> str:
+    """[路由] 判断任务复杂度：readonly / simple / complex。
+
+    优先级：complex 关键词 > 写入否定词（覆盖 readonly）> readonly 关键词 > LLM 兜底 > simple。
+
+    - readonly: 走 audit() 路径，跳过 plan/code/test/fix
+    - simple:   走 code 路径，注入 hint 压缩 plan 规模
+    - complex:  走完整 pipeline，不变
+    """
+    if not requirement:
+        return "simple"
+    req_low = requirement.lower()
+
+    # 1. complex 优先
+    if any(k in requirement for k in _COMPLEX_KEYWORDS_ZH) or \
+       any(k in req_low for k in _COMPLEX_KEYWORDS_EN):
+        return "complex"
+
+    # 2. 检测写入否定词
+    has_write = (
+        any(k in requirement for k in _WRITE_NEGATION_KEYWORDS_ZH) or
+        any(k in req_low for k in _WRITE_NEGATION_KEYWORDS_EN)
+    )
+
+    # 3. readonly（无否定词时）
+    if not has_write:
+        if any(k in requirement for k in _READONLY_KEYWORDS_ZH) or \
+           any(k in req_low for k in _READONLY_KEYWORDS_EN):
+            return "readonly"
+
+    # 4. LLM 兜底（≥20 字的模糊输入）
+    if len(requirement.strip()) >= 20:
+        try:
+            result = _llm_classify_task(requirement)
+            if result == "readonly" and not has_write:
+                return "readonly"
+            if result == "complex":
+                return "complex"
+        except Exception:
+            pass  # 失败降级为 simple
+
+    return "simple"
+
+
 def _cfg(key):
     """读取生效配置值"""
     return get_config().get(key)
@@ -2275,9 +2407,10 @@ Note: you must use write_file to write the file; the filename must be exactly `{
 
     return coder_signal
 
-def audit(requirement):
+def audit(requirement, model_override: str | None = None):
     """审计现有代码，只读多轮工具调用，最终输出 markdown 报告。
-    返回 {"success": bool, "report": str}。"""
+    返回 {"success": bool, "report": str}。
+    model_override: 可指定模型（如 "claude-haiku-4-5" 用于轻量只读任务）。"""
     console.print("[Agent: Auditor]", highlight=False)
 
     # P0 #1：默认只注入顶层结构，子目录用 path 参数按需深挖（避免大项目撑爆 context）
@@ -2339,7 +2472,8 @@ def audit(requirement):
                 })
                 budget_warned = True
 
-        response = call_llm(messages, tools=audit_tools, tool_choice="auto", stream=False)
+        response = call_llm(messages, tools=audit_tools, tool_choice="auto", stream=False,
+                            model_override=model_override)
         msg = response.choices[0].message
         messages.append({
             "role": "assistant",
@@ -3111,6 +3245,30 @@ def _run(requirement, mode):
         return {"success": res["success"],
                 "test_result": {"returncode": 0 if res["success"] else 1,
                                 "stdout": res.get("report", ""), "stderr": ""}}
+
+    # [路由] code/auto 模式：按复杂度路由，减少简单/只读任务的 pipeline 开销
+    # --mode audit 已在上方 early return，本块不影响显式 audit 模式
+    if mode in ("code", "auto"):
+        _task_class = _classify_task(original_requirement)
+        console.print(f"[路由] 任务分类：{_task_class}", highlight=False)
+
+        if _task_class == "readonly":
+            # 只读 → 直接走 audit()，跳过 plan/code/test/fix；用 haiku 降低延迟
+            console.print("[路由] 只读任务 → audit 路径（haiku）", highlight=False)
+            res = audit(original_requirement, model_override="claude-haiku-4-5")
+            finish_task_log(res["success"], 0,
+                            task_complete_signal=res.get("task_complete_signal"))
+            return {"success": res["success"],
+                    "test_result": {"returncode": 0 if res["success"] else 1,
+                                    "stdout": res.get("report", ""), "stderr": ""}}
+
+        if _task_class == "simple":
+            # 简单任务：注入尺度 hint，让 plan() 产出更小的 expected_edits
+            requirement = original_requirement + (
+                "\n\n[任务规模提示] SIMPLE 任务（单文件/少量改动）。"
+                "expected_edits ≤5，不需要 explorer 扫全局依赖。"
+            )
+        # complex → requirement 不变，走完整 pipeline
 
     # 阶段1：制定计划
     console.print("阶段1：制定计划")
