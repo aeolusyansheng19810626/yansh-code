@@ -1141,13 +1141,34 @@ def _read_cache_clear():
     _read_cache_state.hits = 0   # P2.1 命中率：命中次数
 
 
+_CACHE_SENTINEL = "__ALL__"  # limit/max_bytes 缺省 = 读到底，统一规范化
+
+
 def _read_cache_key(args: dict) -> tuple:
-    """从 read_file args 提取 cache key。offset/limit/max_bytes 缺省补 None 保证 dedupe 一致。"""
+    """规范化 cache key，提升同文件不同默认参数读取的命中率。
+    offset None/0/1 → 1（均表示从首行起）；limit/max_bytes None → sentinel（读到底）。
+    """
+    _off = args.get("offset")
+    try:
+        _off = int(_off) if _off is not None else 1
+    except (TypeError, ValueError):
+        _off = 1
+    if _off in (0, 1):
+        _off = 1
+
+    def _norm(v):
+        if v is None:
+            return _CACHE_SENTINEL
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return _CACHE_SENTINEL
+
     return (
         str(args.get("filename") or ""),
-        args.get("offset"),
-        args.get("limit"),
-        args.get("max_bytes"),
+        _off,
+        _norm(args.get("limit")),
+        _norm(args.get("max_bytes")),
     )
 
 
@@ -1820,8 +1841,8 @@ def _dispatch_tool_calls(tool_calls, *, mode, allow_hil, allow_confirm, snap, me
 
 # ---------- #26 Linter / #27 项目类型检测：已迁移至 linter.py ----------
 
-def run_linter():
-    return _linter_mod.run_linter_for(_PROJECT_TYPE)
+def run_linter(files=None):
+    return _linter_mod.run_linter_for(_PROJECT_TYPE, files=files)
 
 _ARCHITECT_ROLE = """[Role: Architect Agent]
 You focus on analyzing requirements and producing implementation plans.
@@ -2286,7 +2307,10 @@ Available operations:
 2. write_file(filename, content) — create new files or rewrite existing files for large batch changes
 
 Rules:
-- **Pre-flight check**: Before reading the full file, use search_in_files to quickly verify whether the key change described in the intent is already present. If the change is already applied, call task_complete(success=True, summary="No changes needed — already implemented") immediately without reading the full file.
+- **Pre-flight check (MANDATORY first step)**: Your FIRST tool call MUST be search_in_files for the exact identifier/string the intent introduces (e.g. the new function name, new param, new key). Then decide by the result:
+  - **Found (total >= 1)**: the change is ALREADY applied. Call task_complete(success=True, summary="No changes needed — already implemented") IMMEDIATELY. Do NOT read_file to "double-check" — search_in_files matching is sufficient and reading the full file wastes the round budget.
+  - **Not found (total == 0)**: the change is missing. Proceed to read_file / get_symbol_definition on the targeted region (not necessarily the whole file) and apply the edit.
+- Never read_file before the pre-flight search. Never re-read a file you have already read this task (results are cached).
 - **Read first**: if the pre-flight check is inconclusive or changes are needed, call read_file (or get_symbol_definition / search_in_files for targeted lookup) on `{filename}` to see the current content. The user message NO LONGER inlines the file body — you must fetch it via tools.
 {_write_rule}
 - Each replace_in_file call modifies one place; for multiple changes call it multiple times{_exploration}"""
@@ -2339,7 +2363,10 @@ Note: you must use write_file to write the file; the filename must be exactly `{
         _expected_rounds = _math.ceil(expected_edits / _edits_per_round) if expected_edits > 0 else 0
         # 留 +3 buffer 给 read/grep/test 等非-edit 工具调用
         # （P2 #4-A1 后 LLM 必须先 read_file 再 edit，多 1 轮探索；从 +2 升到 +3）
+        _hard_cap = int(_cfg("coder_max_rounds_per_file") or 12)
         attempts_left = max(_base_rounds, _expected_rounds + 3)
+        attempts_left = min(attempts_left, _hard_cap)  # P2: 硬上限收紧
+        attempts_left = max(attempts_left, min(_base_rounds, _hard_cap))  # 防 hard_cap < base_rounds 饿死小任务
         _round_budget = attempts_left  # 警告打印时显示真实上限
         first_call = True
         _signaled_complete_this_file = False  # [P1 #2] 本文件是否已 task_complete(success=True)
@@ -2369,27 +2396,29 @@ Note: you must use write_file to write the file; the filename must be exactly `{
                         f"[auto-compact] 已压缩 {_est} → {_new_est} tokens",
                         style="green",
                     )
-                    # M2: thrashing 判定只在 compact 真正降低时才计
-                    # 压缩率 <15% 才算"压不动"，压下去了但仍超阈值不算 thrashing
                     _reduction_ratio = (_est - _new_est) / _est
                     if _reduction_ratio < 0.15:
                         _compact_consecutive_over += 1
-                        if _compact_consecutive_over >= _compact_max_consecutive:
-                            # M1: 仿 cc——不 raise，禁用后续 compact，让任务继续跑完
-                            console.print(
-                                f"[auto-compact] thrashing 保护：连续 {_compact_max_consecutive} 次压缩率 <15%，"
-                                f"禁用后续 compact 继续执行（est={_new_est}）",
-                                style="yellow",
-                            )
-                            _compact_disabled = True
                     else:
                         _compact_consecutive_over = 0
                 else:
-                    # compact 没降下来（pairs 太少或 summarize 失败），不计 thrashing
+                    # P0a: 估值未降低/反增 —— 计入 thrash 连续计数（不再"放过"白触发）
+                    # 不写回 _new_msgs（保留较小的原 msgs），但必须累加计数以触发保护
+                    _compact_consecutive_over += 1
                     console.print(
-                        f"[auto-compact] 未降低（{_est} → {_new_est}），放过本轮",
+                        f"[auto-compact] 未降低（{_est} → {_new_est}），计入 thrash "
+                        f"({_compact_consecutive_over}/{_compact_max_consecutive})",
                         style="yellow",
                     )
+
+                # 统一在两分支后判定保护触发
+                if _compact_consecutive_over >= _compact_max_consecutive:
+                    console.print(
+                        f"[auto-compact] thrashing 保护：连续 {_compact_max_consecutive} 次压缩无效，"
+                        f"禁用后续 compact 继续执行（est={_est}）",
+                        style="yellow",
+                    )
+                    _compact_disabled = True
 
             if first_call and not file_exists:
                 tc = {"type": "function", "function": {"name": "write_file"}}
@@ -2406,6 +2435,23 @@ Note: you must use write_file to write the file; the filename must be exactly `{
                     allow_hil=True, allow_confirm=True, snap=_CURRENT_SNAPSHOT,
                     messages=msgs, console_label="",
                 )
+                # P0b: search_in_files 命中后注入强制早退引导
+                for out in outs:
+                    if out.get("name") == "search_in_files":
+                        _sif_res = out.get("result", {})
+                        if isinstance(_sif_res, dict) and _sif_res.get("total", 0) >= 1:
+                            msgs.append({
+                                "role": "user",
+                                "content": "[pre-flight] search_in_files 已确认目标存在。"
+                                           "若该匹配即 intent 描述的改动，请立即 task_complete"
+                                           "(success=True, summary='No changes needed — already implemented')，禁止再 read_file 确认。",
+                            })
+                            console.print(
+                                "[P0b pre-flight] search_in_files 命中，注入早退引导",
+                                style="cyan", highlight=False,
+                            )
+                            break
+
                 _early_exit_inner = False  # 收到 task_complete sentinel 时用来跳出 inner while
                 for out in outs:
                     # P0 #3 sentinel：Coder 主动声明任务结束
@@ -3466,7 +3512,7 @@ def _run(requirement, mode):
 
 
     # #26 Linter：先跑 ruff，有错误走修复循环
-    linter_result = run_linter()
+    linter_result = run_linter(files=_task_log_mod.snapshot_files_modified())
     if linter_result:
         console.print(f"Linter 发现错误，开始修复 (尝试 {attempts + 1}/{max_attempts})", highlight=False)
         fix_signal = fix(linter_result, plan_result)

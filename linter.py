@@ -7,20 +7,27 @@ import config as _cfg_mod
 from tools import execute_command
 
 
-def run_linter_for(project_type: str | None) -> dict | None:
-    """运行 Linter，有错误返回结果 dict（同 execute_command 输出格式），否则返回 None"""
+def run_linter_for(project_type: str | None, files: list[str] | None = None) -> dict | None:
+    """运行 Linter，有错误返回结果 dict（同 execute_command 输出格式），否则返回 None。
+
+    files: 可选，仅对 Python ruff/mypy 生效；传入时只扫描这些文件，否则扫全 repo (.)。
+    """
     if not project_type:
         return None
+
+    # P1: 收窄 Python lint 范围到已改动文件
+    _py_files = [f for f in (files or []) if str(f).endswith(".py")]
+    _scope = " " + " ".join(f'"{f}"' for f in _py_files) if _py_files else " ."
 
     cmd = None
     if project_type == "Python":
         if shutil.which("ruff"):
-            cmd = "ruff check ."
+            cmd = "ruff check" + _scope
         elif shutil.which("mypy"):
-            cmd = "mypy ."
+            cmd = "mypy" + _scope
         else:
             import sys as _sys
-            cmd = f'"{_sys.executable}" -m ruff check .'
+            cmd = f'"{_sys.executable}" -m ruff check' + _scope
     elif project_type == "Node.js":
         cmd = "npm run lint --if-present"
     elif project_type == "Go":
