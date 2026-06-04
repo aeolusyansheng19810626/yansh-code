@@ -3522,6 +3522,8 @@ def _run(requirement, mode):
                           style="yellow", highlight=False)
 
     # 质量门：plan 里 expected_edits>0 的文件必须出现在 files_modified，否则 coder 未真正完成
+    # fix() 不适合补做编码工作（它只修测试失败），所以这里只记录 missing，
+    # 在 judge(test_result) 通过时拦截，防止假通过。
     _planned_files = {
         f.get("filename") for f in plan_result.get("files", [])
         if isinstance(f, dict) and int(f.get("expected_edits") or 0) > 0
@@ -3533,8 +3535,6 @@ def _run(requirement, mode):
     if _missing_files:
         _missing_msg = f"计划文件未被修改：{', '.join(sorted(_missing_files))}（coder 轮次耗尽未落地编辑）"
         console.print(f"[质量门] {_missing_msg}", style="yellow", highlight=False)
-        _gate_tr = {"returncode": -1, "stdout": "", "stderr": _missing_msg}
-        fix(_gate_tr, plan_result)
 
     console.print("\n阶段3：测试与修复")
     attempts = 0
@@ -3585,6 +3585,21 @@ def _run(requirement, mode):
     while attempts < max_attempts:
         test_result = test(plan_result.get("test_command", ""))
         if judge(test_result):
+            # 质量门二次检查：测试虽通过，但 coder 若未改计划文件，仍视为失败
+            if _missing_files:
+                _still_actual = set(_task_log_mod.snapshot_files_modified())
+                _still_missing = {f for f in _missing_files if f and not any(
+                    (f in a or a.endswith("/" + f) or a.endswith("\\" + f)) for a in _still_actual
+                )}
+                if _still_missing:
+                    console.print(
+                        f"[质量门] 测试通过但计划文件仍未修改：{', '.join(sorted(_still_missing))}，强制标失败",
+                        style="red", highlight=False,
+                    )
+                    _gate_fail_tr = {"returncode": -1, "stdout": "",
+                                     "stderr": f"计划文件未落地：{', '.join(sorted(_still_missing))}"}
+                    finish_task_log(False, attempts, _gate_fail_tr)
+                    return report(False, _gate_fail_tr)
             console.print("测试通过！")
             # 保留快照供 /revert（旧快照由下次任务的 _gc_old_snapshots 自动清理）
             files = plan_result.get("files", [])
