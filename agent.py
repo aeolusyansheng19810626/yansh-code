@@ -276,22 +276,17 @@ _WRITE_NEGATION_KEYWORDS_ZH: list[str] = [
     "生成", "补充", "加上", "加一个", "加个",
     "帮我实现", "帮你实现", "来实现", "去实现",
     # 裸"实现"不加：会误匹配"实现方式"等名词形式
-    # 功能/领域名词型写入信号（task9 误判补全）
-    "功能", "字段", "单测", "单元测试", "捕获", "抛出",
-    "新增", "接口", "参数", "子命令",
+    # 动宾结构型写入信号（任务9误判补全；避免裸名词如"功能/接口"误匹配readonly描述）
+    "新增", "字段", "单测", "单元测试", "子命令",
 ]
 _WRITE_NEGATION_KEYWORDS_EN: list[str] = [
     "fix", "modify", "change", "update",
     "implement", "create", "add", "remove", "delete",
     "generate", "build", "make",
     # "write" 不加：会误匹配函数名 write_file 等
-    # 功能/领域名词型写入信号（task9 误判补全）
-    "feature", "unit test", "field", "raise", "cli", "flag", "exception",
+    # 领域写入信号（去掉 cli/--/raise 等易误匹配的宽泛词）
+    "unit test", "field", "exception", "flag",
 ]
-
-# 强写入信号：命中任一即否决 readonly，优先于 LLM 兜底
-_HARD_WRITE_SIGNALS_ZH = ("功能", "字段", "单测", "单元测试", "捕获", "新增", "接口", "加 ", "加\n")
-_HARD_WRITE_SIGNALS_EN = ("feature", "unit test", "field", "raise ", "cli ", " -- ", "exception")
 
 # complex 信号，优先级最高
 _COMPLEX_KEYWORDS_ZH: list[str] = [
@@ -317,7 +312,7 @@ _CLASSIFY_SYSTEM = """\
 1. 含"修改/修复/实现/创建/添加/fix/add/implement"等写入动作 → 不能是 readonly
 2. 纯"分析/解释/审查/找出"且不要求改代码 → readonly
 3. 涉及多文件/重构/架构 → complex
-4. 含编号步骤（1./2./3.）+"加 X 字段"+"加 N 个单测"+"CLI 加参数"+"raise 异常" → 一定不是 readonly
+4. 含具体增改动作（加字段/加测试/加参数/加分支/抛异常/raise/新增接口等），即使被分析性动词包装也不是 readonly
 5. 其余 → simple"""
 
 
@@ -358,9 +353,7 @@ def _classify_task(requirement: str) -> str:
     # 2. 检测写入否定词（含强写入信号，优先于 LLM 兜底）
     has_write = (
         any(k in requirement for k in _WRITE_NEGATION_KEYWORDS_ZH) or
-        any(k in req_low for k in _WRITE_NEGATION_KEYWORDS_EN) or
-        any(k in requirement for k in _HARD_WRITE_SIGNALS_ZH) or
-        any(k in req_low for k in _HARD_WRITE_SIGNALS_EN)
+        any(k in req_low for k in _WRITE_NEGATION_KEYWORDS_EN)
     )
 
     # 3. readonly（无否定词时）
@@ -2452,8 +2445,8 @@ Note: you must use write_file to write the file; the filename must be exactly `{
                 # fix/修复类任务禁用：命中代表 bug 仍在，不是已完成
                 _req_lc = (requirement or "").lower()
                 _is_fix_task = any(k in (requirement or "") for k in (
-                    "修复", "修改", "崩溃", "bug", "错误", "问题", "失败",
-                )) or any(k in _req_lc for k in ("fix", "crash", "bug", "error", "broken"))
+                    "修复", "修改", "崩溃", "bug", "错误", "报错", "问题", "失败", "异常",
+                )) or any(k in _req_lc for k in ("fix", "crash", "bug", "error", "broken", "fail", "exception"))
                 if not _is_fix_task:
                     for out in outs:
                         if out.get("name") == "search_in_files":
