@@ -2286,7 +2286,8 @@ Available operations:
 2. write_file(filename, content) — create new files or rewrite existing files for large batch changes
 
 Rules:
-- **Read first**: before any modification you must call read_file (or get_symbol_definition / search_in_files for targeted lookup) on `{filename}` to see the current content. The user message NO LONGER inlines the file body — you must fetch it via tools.
+- **Pre-flight check**: Before reading the full file, use search_in_files to quickly verify whether the key change described in the intent is already present. If the change is already applied, call task_complete(success=True, summary="No changes needed — already implemented") immediately without reading the full file.
+- **Read first**: if the pre-flight check is inconclusive or changes are needed, call read_file (or get_symbol_definition / search_in_files for targeted lookup) on `{filename}` to see the current content. The user message NO LONGER inlines the file body — you must fetch it via tools.
 {_write_rule}
 - Each replace_in_file call modifies one place; for multiple changes call it multiple times{_exploration}"""
             sys_prompt = _append_active_prompts(sys_prompt)

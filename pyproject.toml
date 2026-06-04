@@ -25,6 +25,9 @@ dependencies = [
 [project.scripts]
 yansh = "main:main"
 
+[tool.ruff]
+exclude = [".yansh", ".git", "__pycache__", "node_modules", "venv"]
+
 [tool.setuptools]
 py-modules = [
     "main", "agent", "tools", "config", "monitor", "interrupt",
