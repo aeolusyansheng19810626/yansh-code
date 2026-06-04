@@ -276,13 +276,22 @@ _WRITE_NEGATION_KEYWORDS_ZH: list[str] = [
     "生成", "补充", "加上", "加一个", "加个",
     "帮我实现", "帮你实现", "来实现", "去实现",
     # 裸"实现"不加：会误匹配"实现方式"等名词形式
+    # 功能/领域名词型写入信号（task9 误判补全）
+    "功能", "字段", "单测", "单元测试", "捕获", "抛出",
+    "新增", "接口", "参数", "子命令",
 ]
 _WRITE_NEGATION_KEYWORDS_EN: list[str] = [
     "fix", "modify", "change", "update",
     "implement", "create", "add", "remove", "delete",
     "generate", "build", "make",
     # "write" 不加：会误匹配函数名 write_file 等
+    # 功能/领域名词型写入信号（task9 误判补全）
+    "feature", "unit test", "field", "raise", "cli", "flag", "exception",
 ]
+
+# 强写入信号：命中任一即否决 readonly，优先于 LLM 兜底
+_HARD_WRITE_SIGNALS_ZH = ("功能", "字段", "单测", "单元测试", "捕获", "新增", "接口", "加 ", "加\n")
+_HARD_WRITE_SIGNALS_EN = ("feature", "unit test", "field", "raise ", "cli ", " -- ", "exception")
 
 # complex 信号，优先级最高
 _COMPLEX_KEYWORDS_ZH: list[str] = [
@@ -308,7 +317,8 @@ _CLASSIFY_SYSTEM = """\
 1. 含"修改/修复/实现/创建/添加/fix/add/implement"等写入动作 → 不能是 readonly
 2. 纯"分析/解释/审查/找出"且不要求改代码 → readonly
 3. 涉及多文件/重构/架构 → complex
-4. 其余 → simple"""
+4. 含编号步骤（1./2./3.）+"加 X 字段"+"加 N 个单测"+"CLI 加参数"+"raise 异常" → 一定不是 readonly
+5. 其余 → simple"""
 
 
 def _llm_classify_task(requirement: str) -> str:
@@ -345,10 +355,12 @@ def _classify_task(requirement: str) -> str:
        any(k in req_low for k in _COMPLEX_KEYWORDS_EN):
         return "complex"
 
-    # 2. 检测写入否定词
+    # 2. 检测写入否定词（含强写入信号，优先于 LLM 兜底）
     has_write = (
         any(k in requirement for k in _WRITE_NEGATION_KEYWORDS_ZH) or
-        any(k in req_low for k in _WRITE_NEGATION_KEYWORDS_EN)
+        any(k in req_low for k in _WRITE_NEGATION_KEYWORDS_EN) or
+        any(k in requirement for k in _HARD_WRITE_SIGNALS_ZH) or
+        any(k in req_low for k in _HARD_WRITE_SIGNALS_EN)
     )
 
     # 3. readonly（无否定词时）
@@ -2308,8 +2320,9 @@ Available operations:
 
 Rules:
 - **Pre-flight check (MANDATORY first step)**: Your FIRST tool call MUST be search_in_files for the exact identifier/string the intent introduces (e.g. the new function name, new param, new key). Then decide by the result:
-  - **Found (total >= 1)**: the change is ALREADY applied. Call task_complete(success=True, summary="No changes needed — already implemented") IMMEDIATELY. Do NOT read_file to "double-check" — search_in_files matching is sufficient and reading the full file wastes the round budget.
-  - **Not found (total == 0)**: the change is missing. Proceed to read_file / get_symbol_definition on the targeted region (not necessarily the whole file) and apply the edit.
+  - **Found (total >= 1) — NEW code task**: if the intent is to ADD something new (new function, new param, new key), the change is ALREADY applied → task_complete(success=True, "No changes needed") IMMEDIATELY.
+  - **Found (total >= 1) — FIX/MODIFY task**: if the intent is to FIX a bug or MODIFY existing code, the match is the code that needs fixing (NOT proof it's done) → MUST read_file and apply the fix.
+  - **Not found (total == 0)**: the change is missing → proceed to read_file and apply the edit.
 - Never read_file before the pre-flight search. Never re-read a file you have already read this task (results are cached).
 - **Read first**: if the pre-flight check is inconclusive or changes are needed, call read_file (or get_symbol_definition / search_in_files for targeted lookup) on `{filename}` to see the current content. The user message NO LONGER inlines the file body — you must fetch it via tools.
 {_write_rule}
@@ -2435,22 +2448,29 @@ Note: you must use write_file to write the file; the filename must be exactly `{
                     allow_hil=True, allow_confirm=True, snap=_CURRENT_SNAPSHOT,
                     messages=msgs, console_label="",
                 )
-                # P0b: search_in_files 命中后注入强制早退引导
-                for out in outs:
-                    if out.get("name") == "search_in_files":
-                        _sif_res = out.get("result", {})
-                        if isinstance(_sif_res, dict) and _sif_res.get("total", 0) >= 1:
-                            msgs.append({
-                                "role": "user",
-                                "content": "[pre-flight] search_in_files 已确认目标存在。"
-                                           "若该匹配即 intent 描述的改动，请立即 task_complete"
-                                           "(success=True, summary='No changes needed — already implemented')，禁止再 read_file 确认。",
-                            })
-                            console.print(
-                                "[P0b pre-flight] search_in_files 命中，注入早退引导",
-                                style="cyan", highlight=False,
-                            )
-                            break
+                # P0b: search_in_files 命中后注入判断引导
+                # fix/修复类任务禁用：命中代表 bug 仍在，不是已完成
+                _req_lc = (requirement or "").lower()
+                _is_fix_task = any(k in (requirement or "") for k in (
+                    "修复", "修改", "崩溃", "bug", "错误", "问题", "失败",
+                )) or any(k in _req_lc for k in ("fix", "crash", "bug", "error", "broken"))
+                if not _is_fix_task:
+                    for out in outs:
+                        if out.get("name") == "search_in_files":
+                            _sif_res = out.get("result", {})
+                            if isinstance(_sif_res, dict) and _sif_res.get("total", 0) >= 1:
+                                msgs.append({
+                                    "role": "user",
+                                    "content": "[pre-flight] search_in_files 命中已有匹配。"
+                                               "请判断：命中的是 intent 要新增的代码（→ 可 task_complete 完成）"
+                                               "还是 intent 要修改的现有代码（→ 必须继续读文件并修改）。"
+                                               "只有确认是新增代码已存在时才 task_complete。",
+                                })
+                                console.print(
+                                    "[P0b pre-flight] search_in_files 命中，注入判断引导",
+                                    style="cyan", highlight=False,
+                                )
+                                break
 
                 _early_exit_inner = False  # 收到 task_complete sentinel 时用来跳出 inner while
                 for out in outs:
