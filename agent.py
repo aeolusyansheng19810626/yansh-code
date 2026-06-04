@@ -1922,7 +1922,14 @@ Task pattern recognition (identify which category before acting, follow the matc
    - **Same applies to linter errors (ruff/flake8/pyright/mypy)**: unused import (F401), unused variable,
      formatting issues — if they're **outside the scope of this plan** (e.g. you changed tools.py but ruff complains about agent.py
      F401), treat them as pre-existing — record but don't tidy up; only fix linter errors inside this plan's files
-5. **Writing tests with numeric / range assertions on a function you just implemented or modified**
+5. **Benchmark / profile-then-optimize tasks**
+   - "先 benchmark 再优化 X" 中，benchmark 是一次性度量手段，**不消耗目标文件 X 的编辑预算**。
+   - 流程：一轮内完成度量（跑 timeit / 写临时脚本），立即把剩余所有轮次用于 `replace_in_file` 改 X。
+   - `python -c` 被安全策略拦截属预期，**不要绕道反复写临时脚本**——确认是瓶颈后直接优化。
+   - ❌ 反模式：为 search.py 这个目标文件花光 5 轮在写/跑 benchmark 脚本上，一次 replace_in_file 都不发。
+   - 若目标文件一次未改，必须 `task_complete(success=False, summary="未完成 X 的优化")`，不能静默退出。
+
+6. **Writing tests with numeric / range assertions on a function you just implemented or modified**
    - Do NOT guess what the output will be. The function's exact behavior (floating-point formulas, regex, rounding) is hard to predict mentally.
    - Before hardcoding any numeric bound in an assertion (e.g. `assert 50.0 <= score < 70.0`), use execute_command to run the function on the candidate input and capture the real output:
      ```
@@ -3513,6 +3520,21 @@ def _run(requirement, mode):
         except Exception as _e:
             console.print(f"[simple-fast] test_command 回填失败（跳过）：{_e}",
                           style="yellow", highlight=False)
+
+    # 质量门：plan 里 expected_edits>0 的文件必须出现在 files_modified，否则 coder 未真正完成
+    _planned_files = {
+        f.get("filename") for f in plan_result.get("files", [])
+        if isinstance(f, dict) and int(f.get("expected_edits") or 0) > 0
+    }
+    _actual_files = set(_task_log_mod.snapshot_files_modified())
+    _missing_files = {f for f in _planned_files if f and not any(
+        (f in a or a.endswith("/" + f) or a.endswith("\\" + f)) for a in _actual_files
+    )}
+    if _missing_files:
+        _missing_msg = f"计划文件未被修改：{', '.join(sorted(_missing_files))}（coder 轮次耗尽未落地编辑）"
+        console.print(f"[质量门] {_missing_msg}", style="yellow", highlight=False)
+        _gate_tr = {"returncode": -1, "stdout": "", "stderr": _missing_msg}
+        fix(_gate_tr, plan_result)
 
     console.print("\n阶段3：测试与修复")
     attempts = 0
