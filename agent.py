@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 import threading
 from datetime import datetime
@@ -368,6 +369,55 @@ def _classify_task(requirement: str) -> str:
             pass  # 失败降级为 simple
 
     return "simple"
+
+
+# ── simple-fast 路径：从 requirement 提取文件名 + 资格判断 ─────────────────────
+
+_FILENAME_RE = re.compile(
+    r'`([^`]+\.(?:py|md|txt|json|yaml|yml|toml|cfg|ini|sh))`'  # 反引号包裹优先
+    r'|(?<!\w)([\w/\\.-]+\.(?:py|md|txt|json|yaml|yml|toml|cfg|ini|sh))(?![\w.])',  # 裸文件名（m2修复：排除.bak等后缀）
+    re.IGNORECASE,
+)
+
+
+def _extract_filename_from_requirement(requirement: str) -> str | None:
+    """从 requirement 中提取第一个目标文件名（相对路径）。找不到返回 None。"""
+    for m in _FILENAME_RE.finditer(requirement):
+        fname = (m.group(1) or m.group(2)).replace("\\", "/").strip("./")
+        if not fname:
+            continue
+        # m1 修复：跳过 URL（匹配起点前有 :// 或 / 说明是 URL 路径的一部分）
+        start = m.start(2) if m.group(2) else -1
+        if start > 0 and requirement[max(0, start - 3):start] in ("://", "//"):
+            continue
+        if "://" in requirement[max(0, start - 10):start + len(fname)]:
+            continue
+        return fname
+    return None
+
+
+def _simple_fast_eligible(requirement: str) -> bool:
+    """simple-fast 路径资格检查：requirement 明确点名文件 + 无 complex/exploration 信号。
+
+    False → 回退现有 hint 注入路径（仍走完整 plan）。
+    """
+    if not _extract_filename_from_requirement(requirement):
+        return False
+    # m5 修复：多文件 → 不走 fast，回退 plan
+    all_matches = [
+        (m.group(1) or m.group(2)).replace("\\", "/").strip("./")
+        for m in _FILENAME_RE.finditer(requirement)
+        if (m.group(1) or m.group(2)) and "://" not in (m.group(1) or m.group(2))
+    ]
+    if len(all_matches) > 1:
+        return False
+    req_low = requirement.lower()
+    if any(k in requirement for k in _COMPLEX_KEYWORDS_ZH) or \
+       any(k in req_low for k in _COMPLEX_KEYWORDS_EN):
+        return False
+    if _plan_needs_exploration(requirement):
+        return False
+    return True
 
 
 def _cfg(key):
@@ -3248,6 +3298,7 @@ def _run(requirement, mode):
 
     # [路由] code/auto 模式：按复杂度路由，减少简单/只读任务的 pipeline 开销
     # --mode audit 已在上方 early return，本块不影响显式 audit 模式
+    plan_result = None  # 哨兵：未赋值时统一走 plan()，保证 plan/code/auto 模式都能赋值
     if mode in ("code", "auto"):
         _task_class = _classify_task(original_requirement)
         console.print(f"[路由] 任务分类：{_task_class}", highlight=False)
@@ -3262,17 +3313,36 @@ def _run(requirement, mode):
                     "test_result": {"returncode": 0 if res["success"] else 1,
                                     "stdout": res.get("report", ""), "stderr": ""}}
 
-        if _task_class == "simple":
-            # 简单任务：注入尺度 hint，让 plan() 产出更小的 expected_edits
+        if _task_class == "simple" and _simple_fast_eligible(original_requirement):
+            # simple-fast：合成 plan_result，跳过 plan() LLM 调用
+            _sf_fname = _extract_filename_from_requirement(original_requirement)
+            # M2 修复：提前推断 test_command，让 baseline 捕获有效
+            try:
+                from linter import _detect_python_test_cmd
+                _sf_scope = _infer_test_scope([{"filename": _sf_fname}])
+                _sf_test_cmd = _detect_python_test_cmd(_get_workspace(), scope=_sf_scope) or ""
+            except Exception:
+                _sf_test_cmd = ""
+            plan_result = {
+                "files": [{"filename": _sf_fname, "intent": original_requirement,
+                           "description": original_requirement, "expected_edits": 5}],
+                "test_command": _sf_test_cmd,
+                "_simple_fast": True,
+            }
+            console.print(f"[路由] simple-fast → 跳过 plan，目标文件：{_sf_fname}", highlight=False)
+        elif _task_class == "simple":
+            # 简单任务但无明确文件名：注入尺度 hint，仍走 plan()
             requirement = original_requirement + (
                 "\n\n[任务规模提示] SIMPLE 任务（单文件/少量改动）。"
                 "expected_edits ≤5，不需要 explorer 扫全局依赖。"
             )
         # complex → requirement 不变，走完整 pipeline
 
-    # 阶段1：制定计划
-    console.print("阶段1：制定计划")
-    plan_result = plan(requirement)
+    # plan_result 为 None 时（plan/complex/simple-hint/plan 模式）统一调 plan()
+    if plan_result is None:
+        # 阶段1：制定计划
+        console.print("阶段1：制定计划")
+        plan_result = plan(requirement)
     _apply_test_scope_override(plan_result)
     _task_log_mod._current_task_log["plan"] = plan_result.get("files", [])
     _task_log_mod._current_task_log["test_command"] = plan_result.get("test_command", "")
@@ -3356,6 +3426,22 @@ def _run(requirement, mode):
     # 砍掉独立的 reviewer agent 循环：对标 Claude Code 单 agent 设计——
     # coder 自己负责"做+验证"，由后面的"测试与修复"循环承担质量把关。
     # review() 函数保留为独立可调用工具（如未来加 /review skill 时复用）。
+
+    # simple-fast：进 test loop 前，用实际修改文件补全 test_command（M3 修复：在 early_exit 之后）
+    if plan_result.get("_simple_fast") and not plan_result.get("test_command"):
+        try:
+            _sf_modified = _task_log_mod.get_current_log().get("files_modified", [])
+            if _sf_modified:
+                from linter import _detect_python_test_cmd
+                _sf_scope = _infer_test_scope([{"filename": f} for f in _sf_modified])
+                _sf_cmd = _detect_python_test_cmd(_get_workspace(), scope=_sf_scope)
+                if _sf_cmd:
+                    plan_result["test_command"] = _sf_cmd
+                    _task_log_mod._current_task_log["test_command"] = _sf_cmd
+                    console.print(f"[simple-fast] 回填 test_command：{_sf_cmd}", highlight=False)
+        except Exception as _e:
+            console.print(f"[simple-fast] test_command 回填失败（跳过）：{_e}",
+                          style="yellow", highlight=False)
 
     console.print("\n阶段3：测试与修复")
     attempts = 0
