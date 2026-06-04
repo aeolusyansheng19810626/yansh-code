@@ -1922,6 +1922,15 @@ Task pattern recognition (identify which category before acting, follow the matc
    - **Same applies to linter errors (ruff/flake8/pyright/mypy)**: unused import (F401), unused variable,
      formatting issues — if they're **outside the scope of this plan** (e.g. you changed tools.py but ruff complains about agent.py
      F401), treat them as pre-existing — record but don't tidy up; only fix linter errors inside this plan's files
+5. **Writing tests with numeric / range assertions on a function you just implemented or modified**
+   - Do NOT guess what the output will be. The function's exact behavior (floating-point formulas, regex, rounding) is hard to predict mentally.
+   - Before hardcoding any numeric bound in an assertion (e.g. `assert 50.0 <= score < 70.0`), use execute_command to run the function on the candidate input and capture the real output:
+     ```
+     execute_command("python -c \"from module import fn; print(fn(input))\"")
+     ```
+   - Only write the assertion after you have confirmed the actual value falls in the intended range.
+   - If the value doesn't land where intended, pick a different input — never adjust the implementation just to make a test pass.
+
 Test file rule: a test file (test_*.py / *_test.py) located in a subdirectory (e.g. tests/) must include these two lines at the very top to import parent modules:
 import sys
 import os
