@@ -2104,14 +2104,15 @@ def plan(requirement):
         explorer_task = (
             f"用户任务：\n{requirement}\n\n"
             "你的任务（只读探索，不修改任何文件）：\n"
-            "1. 用 search_in_files / read_file / get_symbol_definition / list_files 工具扫描代码\n"
-            "2. 定位用户需求涉及的关键文件、函数、类、变量及其行号\n"
-            "3. 总结现有实现结构和调用关系\n"
-            "4. 通过 task_complete(success=True, summary=<报告>) 返回完整探索报告，"
-            "summary 必须包含 file:line 引用，让后续 plan agent 能据此写出准确的代码细节文档。"
+            "1. 用 search_in_files / get_symbol_definition 精准定位涉及的关键文件、函数、行号\n"
+            "2. 优先用 search_in_files 搜符号/关键词确认调用点数量，避免整文件逐行读取\n"
+            "3. 总结：涉及哪些文件、每个文件大致需要多少处修改（用于 expected_edits 估算）\n"
+            "4. 通过 task_complete(success=True, summary=<报告>) 返回结果，"
+            "summary 必须含 file:line 引用和每文件预估修改次数。"
         )
         try:
-            sub_result = _run_subagent(explorer_task, role="explorer", max_steps=10)
+            sub_result = _run_subagent(explorer_task, role="explorer",
+                                       max_steps=6, token_budget=50_000)
             sub_summary = (sub_result or {}).get("summary", "").strip()
             if sub_summary:
                 exploration_block = (

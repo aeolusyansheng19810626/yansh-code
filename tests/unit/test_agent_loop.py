@@ -296,7 +296,7 @@ def test_plan_dispatches_explorer_when_keywords_match(tmp_path, monkeypatch):
     (tmp_path / "x.py").write_text("def foo(): pass\n", encoding="utf-8")
 
     explorer_called = {"n": 0}
-    def mock_run_subagent(task, role="explorer", max_steps=8):
+    def mock_run_subagent(task, role="explorer", max_steps=8, **kwargs):
         explorer_called["n"] += 1
         explorer_called["task"] = task
         explorer_called["role"] = role
@@ -363,7 +363,7 @@ def test_plan_skips_explorer_when_no_keywords(tmp_path, monkeypatch):
     tools._reinit_paths()
 
     explorer_called = {"n": 0}
-    def mock_run_subagent(task, role="explorer", max_steps=8):
+    def mock_run_subagent(task, role="explorer", max_steps=8, **kwargs):
         explorer_called["n"] += 1
         return {"success": True, "summary": "x", "steps": 0, "role": role}
 

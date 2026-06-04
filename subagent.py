@@ -170,12 +170,14 @@ def _subagent_model_for_role(role: str) -> str | None:
     return None
 
 
-def _run_subagent(task: str, role: str = "explorer", max_steps: int = 8) -> dict:
+def _run_subagent(task: str, role: str = "explorer", max_steps: int = 8,
+                  token_budget: int | None = None) -> dict:
     """跑一个子 agent，返回 {"success": bool, "summary": str, "steps": int, "role": str}.
 
     上下文完全隔离：独立 messages list，独立 sentinel 检测；不污染父 agent。
     防递归：进入时设 thread-local in_subagent=True，子 agent 看不到 dispatch_subagent 工具（双重保险）。
     并发：多个线程同时跑 _run_subagent 互不干扰（threading.local + stats 锁）。
+    token_budget: 可选 token 上限（基于本次 subagent 增量）。超限时注入收尾提示，仅警告一次。
     """
     # lazy import 避免循环 (agent 顶部 import subagent)
     import agent as _a
@@ -210,11 +212,29 @@ def _run_subagent(task: str, role: str = "explorer", max_steps: int = 8) -> dict
 
     _set_in_subagent(True)
     try:
+        from llm_client import get_session_total_tokens
+        _budget_start = get_session_total_tokens()
+        _budget_warned = False
+
         while steps < max_steps_clamped:
             steps += 1
             if interrupt.is_interrupted():
                 summary = summary or "（被中断）"
                 break
+
+            # token 预算检查：超限时注入收尾提示，仅一次
+            if token_budget and not _budget_warned:
+                _used = get_session_total_tokens() - _budget_start
+                if _used > token_budget:
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            f"[预算提示] 探索已消耗约 {_used:,} tokens（上限 {token_budget:,}）。"
+                            "请立即用 task_complete(success=True, summary=<你目前掌握的完整信息>) 收尾，"
+                            "不要再发起新的工具调用。"
+                        ),
+                    })
+                    _budget_warned = True
 
             response = call_llm(messages, tools=tools_subset, tool_choice="auto",
                                 stream=False, model_override=_subagent_model_for_role(role))
