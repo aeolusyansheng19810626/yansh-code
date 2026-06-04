@@ -303,17 +303,18 @@ _COMPLEX_KEYWORDS_EN: list[str] = [
 ]
 
 _CLASSIFY_SYSTEM = """\
-判断编码任务的复杂度档，只回复以下三个单词之一，不要任何解释：
-  readonly  —— 纯分析/审查/解释，不需要修改任何代码
-  simple    —— 单文件/少量改动，改动范围明确
-  complex   —— 多文件/架构级/全局影响
+Classify the coding task into exactly one of three categories. Reply with only the single word — no explanation.
 
-规则：
-1. 含"修改/修复/实现/创建/添加/fix/add/implement"等写入动作 → 不能是 readonly
-2. 纯"分析/解释/审查/找出"且不要求改代码 → readonly
-3. 涉及多文件/重构/架构 → complex
-4. 含具体增改动作（加字段/加测试/加参数/加分支/抛异常/raise/新增接口等），即使被分析性动词包装也不是 readonly
-5. 其余 → simple"""
+  readonly  — pure analysis/review/explanation, no code changes required
+  simple    — single-file or small change, scope is clear
+  complex   — multi-file, architectural, or large-scale change
+
+Rules:
+1. Contains write actions (modify/fix/implement/create/add/remove/raise/fix bug) → never readonly
+2. Pure analysis/explanation/review/investigation with no code change required → readonly
+3. Multi-file or architectural change → complex
+4. Contains concrete add/modify actions (add field, add test, add param, add branch, raise exception, new interface) even if phrased analytically → never readonly
+5. Otherwise → simple"""
 
 
 def _llm_classify_task(requirement: str) -> str:
