@@ -223,11 +223,13 @@ def _run_subagent(task: str, role: str = "explorer", max_steps: int = 8,
                 break
 
             # token 预算检查：超限时注入收尾提示，仅一次
-            if token_budget and not _budget_warned:
+            # 注：get_session_total_tokens() 是全局累计，并发 subagent 时 _used 可能包含
+            # 其他线程的消耗（偏大），属于软上限，设置时应留足余量
+            if token_budget is not None and not _budget_warned:
                 _used = get_session_total_tokens() - _budget_start
                 if _used > token_budget:
                     messages.append({
-                        "role": "user",
+                        "role": "system",  # m3：与 audit/fix 及同模块沉默兜底保持一致
                         "content": (
                             f"[预算提示] 探索已消耗约 {_used:,} tokens（上限 {token_budget:,}）。"
                             "请立即用 task_complete(success=True, summary=<你目前掌握的完整信息>) 收尾，"

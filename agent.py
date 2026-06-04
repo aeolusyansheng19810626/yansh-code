@@ -2112,7 +2112,7 @@ def plan(requirement):
         )
         try:
             sub_result = _run_subagent(explorer_task, role="explorer",
-                                       max_steps=6, token_budget=50_000)
+                                       max_steps=8, token_budget=60_000)
             sub_summary = (sub_result or {}).get("summary", "").strip()
             if sub_summary:
                 exploration_block = (

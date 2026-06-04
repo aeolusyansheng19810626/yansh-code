@@ -26,6 +26,7 @@ _ica_client = None
 
 # Token 统计：按 model 分桶，便于按各自价格计费
 _session_tokens_by_model: dict = {}
+_session_tokens_lock = threading.Lock()  # M2 修复：并发写保护
 _last_request_tokens = {"prompt": 0, "completion": 0, "model": ""}
 
 # response_format 支持探测：探测过且失败的 model 加进来，后续请求自动跳过传参
@@ -67,7 +68,8 @@ def set_quality_cascade(cascade):
 
 def get_session_total_tokens() -> int:
     """累计 prompt+completion token 数，跨模型求和。供 fix/audit 计算 token 预算用。"""
-    return sum(b["prompt"] + b["completion"] for b in _session_tokens_by_model.values())
+    with _session_tokens_lock:
+        return sum(b["prompt"] + b["completion"] for b in _session_tokens_by_model.values())
 
 
 def get_session_token_breakdown() -> dict:
@@ -77,10 +79,11 @@ def get_session_token_breakdown() -> dict:
     从空开始累计，finish_task_log 直接读就是单任务总数；多任务场景需配 baseline
     diff（task_log 内部已处理）。
     """
-    by_model = {
-        m: {"input": b["prompt"], "output": b["completion"]}
-        for m, b in _session_tokens_by_model.items()
-    }
+    with _session_tokens_lock:
+        by_model = {
+            m: {"input": b["prompt"], "output": b["completion"]}
+            for m, b in _session_tokens_by_model.items()
+        }
     return {
         "input": sum(v["input"] for v in by_model.values()),
         "output": sum(v["output"] for v in by_model.values()),
@@ -269,9 +272,10 @@ def call_llm(messages, tools=None, tool_choice=None, response_format=None,
         _last_request_tokens["prompt"] = p
         _last_request_tokens["completion"] = c
         _last_request_tokens["model"] = used_model
-        bucket = _session_tokens_by_model.setdefault(used_model, {"prompt": 0, "completion": 0})
-        bucket["prompt"] += p
-        bucket["completion"] += c
+        with _session_tokens_lock:
+            bucket = _session_tokens_by_model.setdefault(used_model, {"prompt": 0, "completion": 0})
+            bucket["prompt"] += p
+            bucket["completion"] += c
 
     return res
 
