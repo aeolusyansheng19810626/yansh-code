@@ -1940,6 +1940,12 @@ Task pattern recognition (identify which category before acting, follow the matc
    - Only write the assertion after you have confirmed the actual value falls in the intended range.
    - If the value doesn't land where intended, pick a different input — never adjust the implementation just to make a test pass.
 
+7. **"Only add tests" tasks — add to existing test file, not a new standalone file**
+   - When the task says "只加测试" / "仅加测试" / "不修改 X.py", the tests belong in the **existing** test file (`tests/unit/test_X.py`), importing from the actual package.
+   - ❌ Anti-pattern: create a new file at workspace root (e.g. `retry.py`, `cache.py`) that copies the function and tests it — this tests your copy, not the installed package.
+   - ✅ Correct: append new `def test_...` functions to `tests/unit/test_X.py`, with `from packagename import func` at the top.
+   - If the plan says target file is the source module (e.g. `retrykit/retry.py`) but the task asks to "only add tests", the real target is `tests/unit/test_retry.py`. Adjust the plan accordingly.
+
 Test file rule: a test file (test_*.py / *_test.py) located in a subdirectory (e.g. tests/) must include these two lines at the very top to import parent modules:
 import sys
 import os
