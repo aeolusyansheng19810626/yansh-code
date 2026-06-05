@@ -3340,6 +3340,17 @@ def run(requirement, mode="auto"):
         _print_read_cache_summary()
 
 
+def _path_match(planned: str, actual: str) -> bool:
+    """按 / 边界比较路径后缀，避免无边界子串误判（如 add.py 匹配 myadd.py）。
+
+    F1 fix: 第三分支仅对裸文件名（不含 /）的 actual 生效，防止
+    plan="pkg/a.py" + actual="a.py" 因 p.endswith("/a.py") 造成假匹配。
+    """
+    p = planned.replace("\\", "/").strip("/")
+    a = actual.replace("\\", "/").strip("/")
+    return a == p or a.endswith("/" + p) or ("/" not in a and p.endswith("/" + a))
+
+
 def _run(requirement, mode):
     _hil_mod.reset_auto_accept()  # 每轮任务重置 HIL "全部接受"标志
     os.makedirs(_get_workspace(), exist_ok=True)  # 兜底：新目录首次运行时 workspace/ 可能不存在
@@ -3532,20 +3543,26 @@ def _run(requirement, mode):
     # 质量门：plan 里 expected_edits>0 的文件必须出现在 files_modified，否则 coder 未真正完成
     # fix() 不适合补做编码工作（它只修测试失败），所以这里只记录 missing，
     # 在 judge(test_result) 通过时拦截，防止假通过。
-    def _path_match(planned: str, actual: str) -> bool:
-        """按 / 边界比较路径后缀，避免无边界子串误判（如 add.py 匹配 myadd.py）。"""
-        p = planned.replace("\\", "/").strip("/")
-        a = actual.replace("\\", "/").strip("/")
-        return a == p or a.endswith("/" + p) or p.endswith("/" + a)
+    def _safe_edits(val):
+        try:
+            return int(val or 0)
+        except (TypeError, ValueError):
+            return 0
 
     _planned_files = {
         f.get("filename") for f in plan_result.get("files", [])
-        if isinstance(f, dict) and int(f.get("expected_edits") or 0) > 0
+        if isinstance(f, dict) and _safe_edits(f.get("expected_edits")) > 0
     }
     _actual_files = set(_task_log_mod.snapshot_files_modified())
     _missing_files = {f for f in _planned_files if f and not any(
         _path_match(f, a) for a in _actual_files
     )}
+
+    def _check_still_missing():
+        """重新采样已修改文件，返回仍未修改的计划文件集合（fix loop 可能已补改）。"""
+        _new_actual = set(_task_log_mod.snapshot_files_modified())
+        return {f for f in _missing_files if f and not any(_path_match(f, a) for a in _new_actual)}
+
     if _missing_files:
         _missing_msg = f"计划文件未被修改：{', '.join(sorted(_missing_files))}（coder 轮次耗尽未落地编辑）"
         console.print(f"[质量门] {_missing_msg}", style="yellow", highlight=False)
@@ -3602,10 +3619,7 @@ def _run(requirement, mode):
             # 质量门二次检查：测试虽通过，但 coder 若未改计划文件，仅警告（不强制失败）
             # architect 可能过度规划了与任务无关的文件，硬拦截会造成误判，先用 warning 积累数据
             if _missing_files:
-                _still_actual = set(_task_log_mod.snapshot_files_modified())
-                _still_missing = {f for f in _missing_files if f and not any(
-                    _path_match(f, a) for a in _still_actual
-                )}
+                _still_missing = _check_still_missing()
                 if _still_missing:
                     console.print(
                         f"[质量门⚠] 计划文件未修改（仅警告）：{', '.join(sorted(_still_missing))}",
@@ -3631,10 +3645,7 @@ def _run(requirement, mode):
             if _cur_fail and not _increment:
                 # 质量门：baseline-pass 旁路，同样仅警告
                 if _missing_files:
-                    _still_actual = set(_task_log_mod.snapshot_files_modified())
-                    _still_missing = {f for f in _missing_files if not any(
-                        _path_match(f, a) for a in _still_actual
-                    )}
+                    _still_missing = _check_still_missing()
                     if _still_missing:
                         console.print(
                             f"[质量门⚠] baseline-pass 旁路，计划文件未修改（仅警告）：{', '.join(sorted(_still_missing))}",
