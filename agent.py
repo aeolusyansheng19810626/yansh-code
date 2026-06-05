@@ -1925,6 +1925,8 @@ Task pattern recognition (identify which category before acting, follow the matc
 5. **Benchmark / profile-then-optimize tasks**
    - "先 benchmark 再优化 X" 中，benchmark 是一次性度量手段，**不消耗目标文件 X 的编辑预算**。
    - 流程：一轮内完成度量（跑 timeit / 写临时脚本），立即把剩余所有轮次用于 `replace_in_file` 改 X。
+   - 多目标文件时，每个目标文件独立使用自己的轮次；benchmark 只做一次，不重复跑。
+   - benchmark 临时脚本用完即弃，任务结束前删除，不留在 workspace（影响 files_modified 统计）。
    - `python -c` 被安全策略拦截属预期，**不要绕道反复写临时脚本**——确认是瓶颈后直接优化。
    - ❌ 反模式：为 search.py 这个目标文件花光 5 轮在写/跑 benchmark 脚本上，一次 replace_in_file 都不发。
    - 若目标文件一次未改，必须 `task_complete(success=False, summary="未完成 X 的优化")`，不能静默退出。
@@ -3524,13 +3526,19 @@ def _run(requirement, mode):
     # 质量门：plan 里 expected_edits>0 的文件必须出现在 files_modified，否则 coder 未真正完成
     # fix() 不适合补做编码工作（它只修测试失败），所以这里只记录 missing，
     # 在 judge(test_result) 通过时拦截，防止假通过。
+    def _path_match(planned: str, actual: str) -> bool:
+        """按 / 边界比较路径后缀，避免无边界子串误判（如 add.py 匹配 myadd.py）。"""
+        p = planned.replace("\\", "/").strip("/")
+        a = actual.replace("\\", "/").strip("/")
+        return a == p or a.endswith("/" + p) or p.endswith("/" + a)
+
     _planned_files = {
         f.get("filename") for f in plan_result.get("files", [])
         if isinstance(f, dict) and int(f.get("expected_edits") or 0) > 0
     }
     _actual_files = set(_task_log_mod.snapshot_files_modified())
     _missing_files = {f for f in _planned_files if f and not any(
-        (f in a or a.endswith("/" + f) or a.endswith("\\" + f)) for a in _actual_files
+        _path_match(f, a) for a in _actual_files
     )}
     if _missing_files:
         _missing_msg = f"计划文件未被修改：{', '.join(sorted(_missing_files))}（coder 轮次耗尽未落地编辑）"
@@ -3618,6 +3626,21 @@ def _run(requirement, mode):
             _cur_fail = _parse_pytest_failures(_cur_text)
             _increment = _cur_fail - _BASELINE_FAILURES
             if _cur_fail and not _increment:
+                # 质量门：baseline-pass 旁路同样需要检查计划文件是否落地
+                if _missing_files:
+                    _still_actual = set(_task_log_mod.snapshot_files_modified())
+                    _still_missing = {f for f in _missing_files if not any(
+                        _path_match(f, a) for a in _still_actual
+                    )}
+                    if _still_missing:
+                        console.print(
+                            f"[质量门] baseline-pass 旁路：计划文件仍未修改 {', '.join(sorted(_still_missing))}，强制标失败",
+                            style="red", highlight=False,
+                        )
+                        _gate_fail_tr = {"returncode": -1, "stdout": "",
+                                         "stderr": f"计划文件未落地：{', '.join(sorted(_still_missing))}"}
+                        finish_task_log(False, attempts, _gate_fail_tr)
+                        return report(False, _gate_fail_tr)
                 console.print(
                     f"[baseline] 当前 {len(_cur_fail)} 条失败全部在 baseline 内（{len(_BASELINE_FAILURES)} 条 pre-existing）→ 视为通过",
                     style="green", highlight=False,
