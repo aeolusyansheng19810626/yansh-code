@@ -3593,21 +3593,18 @@ def _run(requirement, mode):
     while attempts < max_attempts:
         test_result = test(plan_result.get("test_command", ""))
         if judge(test_result):
-            # 质量门二次检查：测试虽通过，但 coder 若未改计划文件，仍视为失败
+            # 质量门二次检查：测试虽通过，但 coder 若未改计划文件，仅警告（不强制失败）
+            # architect 可能过度规划了与任务无关的文件，硬拦截会造成误判，先用 warning 积累数据
             if _missing_files:
                 _still_actual = set(_task_log_mod.snapshot_files_modified())
                 _still_missing = {f for f in _missing_files if f and not any(
-                    (f in a or a.endswith("/" + f) or a.endswith("\\" + f)) for a in _still_actual
+                    _path_match(f, a) for a in _still_actual
                 )}
                 if _still_missing:
                     console.print(
-                        f"[质量门] 测试通过但计划文件仍未修改：{', '.join(sorted(_still_missing))}，强制标失败",
-                        style="red", highlight=False,
+                        f"[质量门⚠] 计划文件未修改（仅警告）：{', '.join(sorted(_still_missing))}",
+                        style="yellow", highlight=False,
                     )
-                    _gate_fail_tr = {"returncode": -1, "stdout": "",
-                                     "stderr": f"计划文件未落地：{', '.join(sorted(_still_missing))}"}
-                    finish_task_log(False, attempts, _gate_fail_tr)
-                    return report(False, _gate_fail_tr)
             console.print("测试通过！")
             # 保留快照供 /revert（旧快照由下次任务的 _gc_old_snapshots 自动清理）
             files = plan_result.get("files", [])
@@ -3626,7 +3623,7 @@ def _run(requirement, mode):
             _cur_fail = _parse_pytest_failures(_cur_text)
             _increment = _cur_fail - _BASELINE_FAILURES
             if _cur_fail and not _increment:
-                # 质量门：baseline-pass 旁路同样需要检查计划文件是否落地
+                # 质量门：baseline-pass 旁路，同样仅警告
                 if _missing_files:
                     _still_actual = set(_task_log_mod.snapshot_files_modified())
                     _still_missing = {f for f in _missing_files if not any(
@@ -3634,13 +3631,9 @@ def _run(requirement, mode):
                     )}
                     if _still_missing:
                         console.print(
-                            f"[质量门] baseline-pass 旁路：计划文件仍未修改 {', '.join(sorted(_still_missing))}，强制标失败",
-                            style="red", highlight=False,
+                            f"[质量门⚠] baseline-pass 旁路，计划文件未修改（仅警告）：{', '.join(sorted(_still_missing))}",
+                            style="yellow", highlight=False,
                         )
-                        _gate_fail_tr = {"returncode": -1, "stdout": "",
-                                         "stderr": f"计划文件未落地：{', '.join(sorted(_still_missing))}"}
-                        finish_task_log(False, attempts, _gate_fail_tr)
-                        return report(False, _gate_fail_tr)
                 console.print(
                     f"[baseline] 当前 {len(_cur_fail)} 条失败全部在 baseline 内（{len(_BASELINE_FAILURES)} 条 pre-existing）→ 视为通过",
                     style="green", highlight=False,
