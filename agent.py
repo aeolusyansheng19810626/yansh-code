@@ -43,7 +43,7 @@ from llm_client import (
     _is_gemini, _is_claude, _client_for, _call_single_model,
     _is_transient_error, call_llm, _StreamToolCall, _handle_stream,
     show_stats, LLM_TIMEOUT_SEC, LLM_MAX_RETRIES_PER_MODEL,
-    get_session_total_tokens,
+    get_session_total_tokens, CostExceededError,
 )
 
 
@@ -271,7 +271,7 @@ _READONLY_KEYWORDS_EN: list[str] = [
 
 # 命中否定词 → 不走 readonly（用户明确要改代码）
 _WRITE_NEGATION_KEYWORDS_ZH: list[str] = [
-    "修改", "修复", "改一下", "改掉", "更新", "重构",
+    "修改", "修复", "改一下", "改掉", "更新", "重构", "重命名",
     "创建", "新建", "添加", "增加", "删除", "移除",
     "生成", "补充", "加上", "加一个", "加个",
     "帮我实现", "帮你实现", "来实现", "去实现",
@@ -280,7 +280,7 @@ _WRITE_NEGATION_KEYWORDS_ZH: list[str] = [
     "新增", "字段", "单测", "单元测试", "子命令",
 ]
 _WRITE_NEGATION_KEYWORDS_EN: list[str] = [
-    "fix", "modify", "change", "update",
+    "fix", "modify", "change", "update", "rename",
     "implement", "create", "add", "remove", "delete",
     "generate", "build", "make",
     # "write" 不加：会误匹配函数名 write_file 等
@@ -351,13 +351,35 @@ def _classify_task(requirement: str) -> str:
        any(k in req_low for k in _COMPLEX_KEYWORDS_EN):
         return "complex"
 
-    # 2. 检测写入否定词（含强写入信号，优先于 LLM 兜底）
+    # 2. 写入否定词检测——先剥离"不要修改X"这类否定短语，
+    #    否则其中的"修改"会被 _WRITE_NEGATION 误判为写入信号（原设计正因此把
+    #    禁止修改判断前置；改为剥离后即可让两者正确共存）。
+    _NO_MODIFY_ZH = ["不要修改", "不修改", "不能修改", "禁止修改", "不要改代码",
+                     "不要动代码", "不要编辑", "请勿修改", "勿改"]
+    _NO_MODIFY_EN = ["do not modify", "don't modify", "do not change", "don't change",
+                     "no modifications", "read only", "read-only"]
+    _stripped = requirement
+    for _neg in _NO_MODIFY_ZH:
+        _stripped = _stripped.replace(_neg, "")
+    _stripped_low = _stripped.lower()
+    for _neg in _NO_MODIFY_EN:
+        _stripped_low = _stripped_low.replace(_neg, "")
     has_write = (
-        any(k in requirement for k in _WRITE_NEGATION_KEYWORDS_ZH) or
-        any(k in req_low for k in _WRITE_NEGATION_KEYWORDS_EN)
+        any(k in _stripped for k in _WRITE_NEGATION_KEYWORDS_ZH) or
+        any(k in _stripped_low for k in _WRITE_NEGATION_KEYWORDS_EN)
     )
 
-    # 3. readonly（无否定词时）
+    # 2.5 明确禁止修改 → readonly，但仅当（剥离否定短语后）没有任何写入动词时。
+    #   "分析X，不要修改任何代码"（剥离后无写入动词）→ readonly
+    #   "修复bug，但不要修改函数签名"（剥离后仍含"修复"）→ 编辑任务，不算 readonly
+    _has_no_modify = (
+        any(k in requirement for k in _NO_MODIFY_ZH) or
+        any(k in req_low for k in _NO_MODIFY_EN)
+    )
+    if _has_no_modify and not has_write:
+        return "readonly"
+
+    # 3. readonly 关键词（无写入信号时）
     if not has_write:
         if any(k in requirement for k in _READONLY_KEYWORDS_ZH) or \
            any(k in req_low for k in _READONLY_KEYWORDS_EN):
@@ -422,6 +444,10 @@ def _simple_fast_eligible(requirement: str) -> bool:
        any(k in req_low for k in _COMPLEX_KEYWORDS_EN):
         return False
     if _plan_needs_exploration(requirement):
+        return False
+    # 只读/探索信号 → 不走 fast（task51 实测：含"不要修改"被写入否定词误匹配绕过了 readonly 路由）
+    _READONLY_SIGNALS = ["不要修改", "不修改", "不能修改", "禁止修改", "不要改代码", "不要动代码"]
+    if any(k in requirement for k in _READONLY_SIGNALS):
         return False
     return True
 
@@ -1946,6 +1972,55 @@ Task pattern recognition (identify which category before acting, follow the matc
    - ✅ Correct: append new `def test_...` functions to `tests/unit/test_X.py`, with `from packagename import func` at the top.
    - If the plan says target file is the source module (e.g. `retrykit/retry.py`) but the task asks to "only add tests", the real target is `tests/unit/test_retry.py`. Adjust the plan accordingly.
 
+8. **Bug-fix tasks — fix ONLY the named defect, never touch adjacent code**
+   - Bug 修复的 diff 必须**只覆盖造成该缺陷的那几行**，连带、"顺手"、"既然在这儿了"的改动一律禁止。
+   - 真实翻车案例（务必规避）：
+     - ❌ 修 `frontmatter.py` 的 `meta[key]=_strip_quotes(val)` 时，顺手给 `tools.py` 的 `_err` 加了强制 `tool` 参数 → 5 个 test_tools.py 回归失败。
+     - ❌ 修 `search_in_files` 的 `re.error` 崩溃时，顺手重构了路径安全逻辑 → 无关测试回归失败。
+   - 判断标准：**"不改这行，原 bug 就修不好"？** 是 → 改；否（哪怕看起来有问题）→ **不准碰**。
+   - 函数签名（增删参数）、错误处理/安全校验逻辑、被多处调用的辅助函数（如 `_err`、路径校验函数）属于**高危外溢区**：改这类代码前先确认"任务有没有点名要改它"，没点名就停手。
+   - 在 task_complete 的 summary 里记录"发现了 X 问题但未改，建议人工处理"。
+
+9. **只读 / 探索 / 评估类任务 — 禁止任何写操作**
+   - 当任务出现"不要修改任何代码"/"只读"/"探索"/"评估可行性"/"给出分析"/"不写代码、不改 repo、不跑测试"这类措辞时，
+     **绝对不允许** 调用 write_file / replace_in_file / replace_symbol / execute_command 改动任何文件（含源码、配置、临时脚本）。
+   - 只准用 read_file / search_in_files / list_symbols / get_symbol_definition 收集信息，然后把结论写进 task_complete 的 summary。
+   - ❌ 真实翻车案例：任务说"在 agent.py 里找到 X 函数，告诉我它的行为，不要修改任何代码"，结果却 replace_in_file 改了 agent.py → 违反只读约束，任务判负。
+   - 唯一例外：任务**明确要求**产出一个文档文件（如"输出 markdown 文档到 notes/xxx.md"）——此时只写那一个指定的产物文件，绝不碰任何源码或测试。
+   - **任务没有点名要产出文件时，写任何文件（含 .md 笔记、分析文档、临时脚本）都算违规。**
+   - 判断标准：**"任务有没有让我改/产出文件"？** 没有 → 一律只读，结论进 summary；有且仅指定某产物文件 → 只写那个文件。
+
+10. **禁止用 write_file 整体重写已有大文件（critical，会造成灾难性回归）**
+   - **永远不要** 对已有的大文件（>100 行）使用 write_file 整体替换——它会静默丢失你没有看到的代码（re-export、辅助函数、常量）。
+   - ❌ 真实翻车：用 write_file 重写 agent.py 时，丢失了 `from subagent import _is_in_subagent, _SUBAGENT_CONCURRENCY_CAP` 等 re-export 语句 → 58 个测试全部 NameError 崩溃。文件里的注释"这里保留 re-export"还在，对应的 import 却被删了。
+   - ✅ 正确做法：**只用 replace_in_file** 做精确的局部替换（要加的函数/参数/导入，找准锚点替换）。
+   - 新增功能到已有文件时，用 `replace_in_file` 在正确位置插入，不要整文件重写。
+   - 如果文件不存在，才可以用 write_file 创建新文件。
+
+11. **新增 API 前必须用精确名称验证是否已存在**
+   - 当 search_in_files 命中了"相近"内容，**不能**认为目标 API 已存在——必须搜索**精确**的 API 名称。
+   - 判断标准：命中的符号名与 requirement 要求新增的名称**完全一致**（含大小写、下划线前缀）？
+     - 完全一致 → 继续 read_file 确认函数体是否已实现。
+     - 仅相似 → **目标 API 不存在**，必须继续新增实现。
+   - ❌ 错误：requirement 要加 `LOG_DIR`，search 命中 `_LOG_DIR`，就认为"已完成"跳过。
+   - ❌ 错误：requirement 要加 `get_recent_logs()`，search 命中 `show_recent_logs()`，就认为"已完成"跳过。
+   - ✅ 正确：明确搜索 `"def get_recent_logs"` 或 `"^LOG_DIR "` 验证精确名称是否存在，不存在则实现它。
+
+12. **修改 requirement 声称"已有"的目标前，必须验证它真实存在**
+   - 当 requirement 说"X 里有一个 foo() 函数，给它加 Y"或"修改现有的 foo"时，**先用精确名称搜索 foo 是否真的存在**（search_in_files / get_symbol_definition）。
+   - 若 get_symbol_definition / search 返回"未找到" → 说明 **requirement 的前提是错的**（目标根本不存在）。此时：
+     - **必须** 调用 task_complete(success=False, summary="目标 `foo` 在仓库中不存在，需求前提有误，无法对其修改") 如实报告。
+     - **绝对禁止**用 write_file / append_to_file 凭空造一个新的 foo 来冒充"修改"——这是幻觉，等于偷换任务。
+   - ❌ 真实翻车：requirement 说"tools.py 有个 batch_read_files()，给它加并发"，实际该函数不存在，coder 直接 append 新建了一个 → 把"修改已有"偷换成"凭空新增"。
+   - ✅ 正确：验证 batch_read_files 不存在 → task_complete(success=False, "该函数不存在") ，不硬造。
+
+13. **rename / 删除 / 替换类任务：task_complete(success=True) 前必须验证目标串已消失**
+   - 当 requirement 要求"把 A 改名为 B"/"删除 X"/"移除 Y"时，在 task_complete(success=True) 之前，**必须用 search_in_files 精确搜索旧名 A / 目标串 X**，确认在所有应改文件中已 0 命中。
+   - replace_in_file 返回 error（如"未找到要替换的字符串"）时：**绝不允许**当成功，**绝不允许**据此 task_complete(success=True) 或谎称"已在文档中完成 / 无需修改"。
+   - replace_in_file 报"未找到"时，**不要**用同一个 old_str 反复重试——先 read_file 读取目标行附近的**精确原文**（连空格、引号、转义都按文件里的真实字节），再用读到的原文作为 old_str 重试。
+   - ❌ 真实翻车：rename directory_summary→summarize_directory，agent.py / subagent.py 的 prompt 文本里残留 `directory_summary(path=...)`，replace 因多写转义一直失败，coder 却 task_complete(success=True) 谎称"只在文档、无需改"。
+   - ✅ 正确：search_in_files("directory_summary") 仍有命中 → 说明没改完 → 继续修，直到 0 命中才能 success=True。
+
 Test file rule: a test file (test_*.py / *_test.py) located in a subdirectory (e.g. tests/) must include these two lines at the very top to import parent modules:
 import sys
 import os
@@ -2386,21 +2461,21 @@ Note: you must use write_file to write the file; the filename must be exactly `{
         ]
 
         # 多轮工具调用循环；新文件第一轮强制调用 write_file
-        # plan-driven 调度：基线 N 轮 + ceil(expected_edits / edits_per_round) 余量
-        # 大改动文件不再被 5 轮硬切碎；undercount expected_edits 仍走基线
-        import math as _math
+        # plan-driven 调度：基线 N 轮 与 expected_edits + 4 取大（不再除以 edits_per_round）
+        # 每个 edit 前需先 read（Pattern 要求），现实约 1 edit/round；按 expected_edits + buffer 给轮次。
+        # 上限放宽到 _hard_cap(40)，真正的浪费兜底交给「无进展熔断」+「费用熔断」。
         _base_rounds = int(_cfg("coder_rounds_per_file") or 5)
-        _edits_per_round = max(1, int(_cfg("coder_edits_per_round") or 3))
-        _expected_rounds = _math.ceil(expected_edits / _edits_per_round) if expected_edits > 0 else 0
-        # 留 +3 buffer 给 read/grep/test 等非-edit 工具调用
-        # （P2 #4-A1 后 LLM 必须先 read_file 再 edit，多 1 轮探索；从 +2 升到 +3）
+        _expected_rounds = expected_edits if expected_edits > 0 else 0
         _hard_cap = int(_cfg("coder_max_rounds_per_file") or 12)
-        attempts_left = max(_base_rounds, _expected_rounds + 3)
-        attempts_left = min(attempts_left, _hard_cap)  # P2: 硬上限收紧
+        attempts_left = max(_base_rounds, _expected_rounds + 4)
+        attempts_left = min(attempts_left, _hard_cap)
         attempts_left = max(attempts_left, min(_base_rounds, _hard_cap))  # 防 hard_cap < base_rounds 饿死小任务
         _round_budget = attempts_left  # 警告打印时显示真实上限
         first_call = True
         _signaled_complete_this_file = False  # [P1 #2] 本文件是否已 task_complete(success=True)
+        _no_progress = 0
+        _no_progress_cap = int(_cfg("coder_no_progress_rounds") or 4)
+        _edit_tool_names = ("write_file", "replace_in_file", "append_to_file", "replace_symbol")
 
         # P2 #4-B2: auto-compact 配置
         _compact_threshold = int(_cfg("compact_threshold_tokens") or 60_000)
@@ -2482,7 +2557,10 @@ Note: you must use write_file to write the file; the filename must be exactly `{
                                     "content": "[pre-flight] search_in_files 命中已有匹配。"
                                                "请判断：命中的是 intent 要新增的代码（→ 可 task_complete 完成）"
                                                "还是 intent 要修改的现有代码（→ 必须继续读文件并修改）。"
-                                               "只有确认是新增代码已存在时才 task_complete。",
+                                               "重要：只有命中的符号名与 requirement 要求新增的名称**完全一致**时才能认为已存在。"
+                                               "私有变量（如 `_LOG_DIR`）≠ 公开常量（`LOG_DIR`）；"
+                                               "相似函数名（如 `show_recent_logs`）≠ 目标函数（`get_recent_logs`）。"
+                                               "只有确认是新增代码已存在（精确名称匹配）时才 task_complete。",
                                 })
                                 console.print(
                                     "[P0b pre-flight] search_in_files 命中，注入判断引导",
@@ -2515,6 +2593,21 @@ Note: you must use write_file to write the file; the filename must be exactly `{
                         break
                 if _early_exit_inner:
                     break
+                # 无进展熔断：本轮无任何成功编辑则累计，连续 N 轮停止本文件
+                _did_edit = any(
+                    o.get("name") in _edit_tool_names
+                    and isinstance(o.get("result"), dict) and "success" in o["result"]
+                    for o in outs
+                )
+                if _did_edit:
+                    _no_progress = 0
+                else:
+                    _no_progress += 1
+                    if _no_progress >= _no_progress_cap:
+                        _w = f"[无进展熔断] {filename} 连续 {_no_progress_cap} 轮无有效编辑，停止本文件"
+                        console.print(_w, style="yellow", highlight=False)
+                        _task_log_mod._current_task_log.setdefault("warnings", []).append(_w)
+                        break
             else:
                 break
 
@@ -3331,6 +3424,14 @@ def run(requirement, mode="auto"):
         return res
     except interrupt.Interrupted:
         return _interrupted_result()
+    except CostExceededError as e:
+        console.print(f"[费用熔断] {e}，保留已完成改动并停止。", style="yellow", highlight=False)
+        try:
+            finish_task_log(False, 0, {"returncode": -1, "stdout": "", "stderr": str(e)})
+        except Exception:
+            pass
+        return {"success": False, "report": str(e),
+                "test_result": {"returncode": -1, "stdout": "", "stderr": str(e)}}
     except Exception as e:
         # 异常退出也保存回放
         create_replay_package(str(e))

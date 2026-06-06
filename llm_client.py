@@ -36,6 +36,33 @@ LLM_TIMEOUT_SEC = 120
 LLM_MAX_RETRIES_PER_MODEL = 3  # 每个模型对 429/5xx 的退避重试次数
 
 
+class CostExceededError(Exception):
+    """会话累计预估费用达到 --max-cost 上限，优雅终止。"""
+    def __init__(self, cost: float, max_cost: float):
+        self.cost = cost
+        self.max_cost = max_cost
+        super().__init__(f"会话费用 ${cost:.4f} 已达上限 ${max_cost:.2f}")
+
+
+_max_session_cost = None  # None=不限制；main.py 解析 --max-cost 后 set
+
+
+def set_max_session_cost(v):
+    global _max_session_cost
+    _max_session_cost = v
+
+
+def get_session_cost() -> float:
+    """按各模型价格累计的会话预估费用(USD)。"""
+    with _session_tokens_lock:
+        cost = 0.0
+        for model, b in _session_tokens_by_model.items():
+            price = get_model_price(model)
+            cost += b["prompt"] / 1_000_000 * price["input"]
+            cost += b["completion"] / 1_000_000 * price["output"]
+        return cost
+
+
 def _looks_like_rf_rejection(exc) -> bool:
     """探测后端是否因 response_format 不支持而 400。
     匹配常见错误描述：response_format、json_object、Unknown parameter 等。"""
@@ -276,6 +303,11 @@ def call_llm(messages, tools=None, tool_choice=None, response_format=None,
             bucket = _session_tokens_by_model.setdefault(used_model, {"prompt": 0, "completion": 0})
             bucket["prompt"] += p
             bucket["completion"] += c
+
+    if _max_session_cost is not None:
+        _cost = get_session_cost()
+        if _cost >= _max_session_cost:
+            raise CostExceededError(_cost, _max_session_cost)
 
     return res
 

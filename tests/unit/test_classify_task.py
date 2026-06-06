@@ -69,6 +69,36 @@ def test_simple_fallback(req):
     assert _classify_task(req) == "simple", f"应分到 simple：{req!r}"
 
 
+# ── "不要修改X" 编辑任务不应被误判 readonly（本次修复的回归防护）──────────────
+
+@pytest.mark.parametrize("req", [
+    "修复这个 bug，但不要修改函数签名",
+    "给 X 新增一个函数，但不要修改现有接口",
+    "将 directory_summary 重命名为 summarize_directory，同步更新所有引用点，功能保持不变",
+])
+def test_no_modify_edit_task_not_readonly(req):
+    result = _classify_task(req)
+    assert result != "readonly", f"含写入动作，不应是 readonly：{req!r}，得到 {result!r}"
+
+
+@pytest.mark.parametrize("req", [
+    "分析 agent.py 的并发逻辑，不要修改任何代码",
+])
+def test_no_modify_pure_analysis_is_readonly(req):
+    assert _classify_task(req) == "readonly", f"纯分析且禁止修改，应分到 readonly：{req!r}"
+
+
+# ── 重命名任务不应被误判 readonly（rename 关键词补丁回归防护）────────────────────
+
+@pytest.mark.parametrize("req", [
+    "不修改逻辑，只是重命名变量",
+    "rename foo to bar, do not change behavior",
+])
+def test_rename_edit_task_not_readonly(req):
+    result = _classify_task(req)
+    assert result != "readonly", f"重命名是编辑任务，不应是 readonly：{req!r}，得到 {result!r}"
+
+
 # ── LLM 兜底失败不崩溃 ──────────────────────────────────────────────────────
 
 def test_llm_fallback_exception_does_not_raise():

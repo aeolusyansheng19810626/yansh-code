@@ -269,6 +269,8 @@ def main():
     parser.add_argument("--cwd", metavar="DIR", help="指定工作目录（workspace），默认为 ./workspace")
     parser.add_argument("--sandbox", metavar="BACKEND",
                         help="execute_command 沙箱：none(默认) | docker | docker:<image>")
+    parser.add_argument("--max-cost", type=float, default=50.0,
+                        help="会话累计预估费用上限(USD)，达到即优雅停止（默认 50）")
     args = parser.parse_args()
 
     # --cwd：在一切初始化之前设置 workspace 路径
@@ -296,7 +298,10 @@ def main():
         import llm_client as _llm_mod
         _cascade = [args.model] if args.model == CLAUDE_HAIKU else [args.model, CLAUDE_HAIKU]
         _llm_mod.set_quality_cascade(_cascade)
-    
+
+    import llm_client as _llm_cost_mod
+    _llm_cost_mod.set_max_session_cost(args.max_cost)
+
     # 检测项目类型
     global _PROJECT_TYPE, _PROJECT_TEST_CMD
     ptype, tcmd = detect_project_type()
