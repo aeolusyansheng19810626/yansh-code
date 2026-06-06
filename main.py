@@ -271,6 +271,8 @@ def main():
                         help="execute_command 沙箱：none(默认) | docker | docker:<image>")
     parser.add_argument("--max-cost", type=float, default=50.0,
                         help="会话累计预估费用上限(USD)，达到即优雅停止（默认 50）")
+    parser.add_argument("--parallel", metavar="TASKSFILE",
+                        help="并行编排：读 JSON 任务列表，为每个子任务建 git worktree 并各起一个 yansh 进程并行跑")
     args = parser.parse_args()
 
     # --cwd：在一切初始化之前设置 workspace 路径
@@ -323,7 +325,22 @@ def main():
     current_mode = get_config()["mode"]
     if args.mode:
         current_mode = args.mode
-    
+
+    if args.parallel:
+        import json as _json
+        from pathlib import Path as _P
+        try:
+            _tasks = _json.loads(_P(args.parallel).read_text(encoding="utf-8"))
+        except Exception as _e:
+            console.print(f"读取任务文件失败：{_e}", style="red", highlight=False)
+            sys.exit(2)
+        import parallel_orchestrator as _po
+        import config as _cfg_parallel
+        import os as _os
+        _workers = int(get_config().get("parallel_max_workers", 4))
+        _base = _os.path.abspath(_cfg_parallel.WORKSPACE_DIR)
+        sys.exit(_po.run_parallel(_tasks, _workers, _base))
+
     # 批处理模式处理
     if args.requirement or args.json:
         agent.set_batch_mode(True, json_output=args.json, strict=args.strict)

@@ -114,6 +114,7 @@ _DEFAULTS = {
     "coder_max_rounds_per_file": 40,       # 单文件轮次硬上限（已放宽；真正兜底交给无进展熔断+费用熔断）
     "coder_edits_per_round": 3,            # 假设 LLM 平均一轮发的 edit 数（保留兼容，调度已改为按 expected_edits 计）
     "coder_no_progress_rounds": 4,         # 连续 N 轮无有效编辑则熔断本文件
+    "parallel_max_workers": 4,             # worktree 并行编排最大并发子进程数（防 ICA 限速）
     "fix_soft_limit": 12,                  # fix loop 单次 attempt 工具轮次上限（基线）
     "fix_mechanical_error_bonus": 12,      # 检测到机械错（同类 TypeError 缺参等）时再追加的轮次
 }

@@ -54,7 +54,7 @@ def create_snapshot(file_list):
             shutil.copy2(str(src), str(dst))
             backed.append(filename)
     (snap_dir / "meta.json").write_text(
-        json.dumps({"files": backed, "workspace_files": workspace_files, "timestamp": timestamp},
+        json.dumps({"files": backed, "workspace_files": workspace_files, "timestamp": timestamp, "created": []},
                    ensure_ascii=False), encoding="utf-8"
     )
     console.print(f"[快照] {snap_dir.name} (baseline {len(backed)} 文件)", highlight=False)
@@ -85,6 +85,11 @@ def _backup_file_if_needed(snap_info, filename):
         if filename not in meta.get("files", []):
             meta.setdefault("files", []).append(filename)
             meta_file.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+    else:
+        # src 不存在：即将新建的文件，记入 created 以便回滚时删除
+        if filename not in meta.get("created", []):
+            meta.setdefault("created", []).append(filename)
+            meta_file.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
 
 
 def restore_snapshot(snap_info):
@@ -112,23 +117,15 @@ def _restore_file_snapshot(snap_dir: Path) -> int:
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(str(src), str(dst))
             restored += 1
-    workspace_files_then = set(meta.get("workspace_files", []))
-    current_files = []
-    for root, dirs, files in os.walk(ws):
-        if _should_skip_dir(root):
-            dirs.clear()
-            continue
-        for filename in files:
-            rel_path = os.path.relpath(os.path.join(root, filename), ws)
-            current_files.append(rel_path.replace("\\", "/"))
-    for f in current_files:
-        if f not in workspace_files_then:
-            path = Path(ws) / f
-            try:
-                if path.exists():
-                    path.unlink()
-            except Exception as e:
-                console.print(f"[警告] 回滚时无法删除 {f}: {e}", style="yellow", highlight=False)
+    # 只删本任务真正新建的文件（meta["created"]），不全量 diff 以免误删外部文件
+    # workspace_files 字段保留在 meta 里供调试，但不再据此删除
+    for f in meta.get("created", []):
+        path = Path(ws) / f
+        try:
+            if path.exists():
+                path.unlink()
+        except Exception as e:
+            console.print(f"[警告] 回滚时无法删除 {f}: {e}", style="yellow", highlight=False)
     return restored
 
 
