@@ -1370,12 +1370,10 @@ def test_scan_import_mismatches_parse_error_safe(tmp_path):
 
 
 def test_contract_block_empty_when_no_contract():
-    """Fix 2b: symbol_contract 为空时 _contract_block 为空字符串（通过源码注入点断言）"""
+    """Fix 2b: symbol_contract 为空时 _render_contract 返回空字符串（行为断言）"""
     import agent as _a
-    import inspect
-    src = inspect.getsource(_a.code)
-    # 确认空 contract 分支 → ""
-    assert "if _contract else" in src or ") if _contract else" in src
+    assert _a._render_contract({}) == ""
+    assert _a._render_contract(None) == ""
 
 
 def test_scan_import_mismatches_reexport_no_false_positive(tmp_path):
@@ -1429,6 +1427,146 @@ def test_scan_import_mismatches_try_conditional_def_no_false_positive(tmp_path):
     ]}
     result = _a._scan_import_mismatches(plan, str(tmp_path))
     assert result == [], f"try/if 块内定义应被识别为合法导出，但报了误报: {result}"
+
+
+def test_render_contract_member_level_format():
+    """P0-B: _render_contract 行为测试 — 成员级 dict 格式渲染出 fields/members"""
+    import agent as _a
+    contract = {
+        "mini/token.py": {"TokenType": {"members": ["IDENTIFIER", "INT"]}},
+        "mini/ast_nodes.py": {"LetDecl": {"fields": ["name", "value"]}, "Program": {}},
+    }
+    result = _a._render_contract(contract)
+    assert "GLOBAL SYMBOL CONTRACT" in result
+    assert "members=IDENTIFIER, INT" in result or "members=INT, IDENTIFIER" in result
+    assert "fields=name, value" in result
+    assert "Program" in result
+
+
+def test_render_contract_flat_list_format():
+    """P0-B: _render_contract 向后兼容旧扁平 list 格式"""
+    import agent as _a
+    contract = {"mini/errors.py": ["MiniSyntaxError", "MiniRuntimeError"]}
+    result = _a._render_contract(contract)
+    assert "MiniSyntaxError" in result
+    assert "exports:" in result
+
+
+def test_render_contract_empty_returns_empty():
+    """P0-B: 空 contract 返回空字符串"""
+    import agent as _a
+    assert _a._render_contract({}) == ""
+    assert _a._render_contract(None) == ""  # None 也安全
+
+
+def test_scan_member_mismatches_enum_member(tmp_path):
+    """P0-C: _scan_member_mismatches 能找出枚举成员名不匹配"""
+    import agent as _a
+
+    (tmp_path / "token.py").write_text(
+        "from enum import Enum\n"
+        "class TokenType(Enum):\n"
+        "    IDENTIFIER = 'IDENTIFIER'\n"
+        "    INT = 'INT'\n"
+    )
+    (tmp_path / "parser.py").write_text(
+        "from .token import TokenType\n"
+        "x = TokenType.IDENT\n"      # 错：应是 IDENTIFIER
+        "y = TokenType.IDENTIFIER\n" # 正确
+    )
+    plan = {
+        "symbol_contract": {
+            "token.py": {"TokenType": {"members": ["IDENTIFIER", "INT"]}}
+        },
+        "files": [{"filename": "token.py"}, {"filename": "parser.py"}],
+    }
+    result = _a._scan_member_mismatches(plan, str(tmp_path))
+    names = [r[2] for r in result]
+    assert any("TokenType.IDENT" in n for n in names), f"应报 TokenType.IDENT，但结果: {result}"
+    assert not any("TokenType.IDENTIFIER" in n for n in names), "不应误报正确的 IDENTIFIER"
+
+
+def test_scan_member_mismatches_dataclass_field(tmp_path):
+    """P0-C: _scan_member_mismatches 能找出 dataclass 字段名同义词（保守档）"""
+    import agent as _a
+
+    (tmp_path / "ast_nodes.py").write_text(
+        "from dataclasses import dataclass\n"
+        "@dataclass\nclass LetDecl:\n    name: str\n    value: object\n"
+    )
+    (tmp_path / "interpreter.py").write_text(
+        "from .ast_nodes import LetDecl\n"
+        "def visit(node): return node.initializer\n"  # 错：应是 value
+    )
+    plan = {
+        "symbol_contract": {
+            "ast_nodes.py": {"LetDecl": {"fields": ["name", "value"]}}
+        },
+        "files": [{"filename": "ast_nodes.py"}, {"filename": "interpreter.py"}],
+    }
+    # 必须在 error_info 里含 AttributeError 'initializer' 才触发同义词检查
+    error_info = "AttributeError: 'LetDecl' object has no attribute 'initializer'"
+    result = _a._scan_member_mismatches(plan, str(tmp_path), error_info=error_info)
+    # 应报 <obj>.initializer，权威名 value
+    assert any(r[2] == "<obj>.initializer" and r[3] == "value" for r in result), \
+        f"应报 initializer→value，但结果: {result}"
+
+
+def test_scan_member_mismatches_no_false_positive(tmp_path):
+    """P0-C: 枚举成员名正确时不误报"""
+    import agent as _a
+
+    (tmp_path / "token.py").write_text(
+        "from enum import Enum\nclass TokenType(Enum):\n    IDENTIFIER='ID'\n"
+    )
+    (tmp_path / "parser.py").write_text(
+        "from .token import TokenType\nx = TokenType.IDENTIFIER\n"
+    )
+    plan = {
+        "symbol_contract": {"token.py": {"TokenType": {"members": ["IDENTIFIER"]}}},
+        "files": [{"filename": "token.py"}, {"filename": "parser.py"}],
+    }
+    result = _a._scan_member_mismatches(plan, str(tmp_path))
+    assert result == [], f"正确引用不应报错: {result}"
+
+
+def test_scan_member_mismatches_no_contract_returns_empty(tmp_path):
+    """P0-C: 无 symbol_contract 时直接返回空列表（不扫描）"""
+    import agent as _a
+    plan = {"files": [{"filename": "parser.py"}]}
+    result = _a._scan_member_mismatches(plan, str(tmp_path))
+    assert result == []
+
+
+def test_scan_member_mismatches_synonym_requires_attr_error_in_error_info(tmp_path):
+    """C1 修复: dataclass 同义词检查只在 error_info 出现 AttributeError 该属性名时才激活，
+    否则无条件跳过，避免误报 request.test / lexer.token 等正常代码"""
+    import agent as _a
+
+    (tmp_path / "ast_nodes.py").write_text(
+        "from dataclasses import dataclass\n@dataclass\nclass IfStmt:\n    cond: object\n    then_block: object\n"
+    )
+    # 文件里有 self.test / lexer.token / request.condition 等常见属性访问
+    (tmp_path / "app.py").write_text(
+        "class Foo:\n"
+        "    def run(self, req):\n"
+        "        return req.test and self.token and req.condition\n"
+    )
+    plan = {
+        "symbol_contract": {"ast_nodes.py": {"IfStmt": {"fields": ["cond", "then_block"]}}},
+        "files": [{"filename": "ast_nodes.py"}, {"filename": "app.py"}],
+    }
+    # 无 AttributeError → 同义词检查不激活 → 不误报
+    result = _a._scan_member_mismatches(plan, str(tmp_path), error_info="AssertionError: 1 != 2")
+    assert result == [], f"无 AttributeError 时不应误报: {result}"
+
+    # 有 AttributeError 'condition' → 才激活 condition → cond 检查
+    result2 = _a._scan_member_mismatches(
+        plan, str(tmp_path),
+        error_info="AttributeError: 'IfStmt' object has no attribute 'condition'"
+    )
+    assert any(r[2] == "<obj>.condition" for r in result2), \
+        f"error_info 含 condition 时应报缺口: {result2}"
 
 
 def test_scan_import_mismatches_level2_relative_import(tmp_path):

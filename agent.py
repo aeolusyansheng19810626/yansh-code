@@ -1890,7 +1890,10 @@ Principles:
   dispatch) need updating too — otherwise the new parameter is silently swallowed. **Files the user didn't
   list aren't necessarily out of scope** — your job is to surface these hidden dependencies.
 
-- **Multi-file new projects (≥3 new files, critical)**: before listing files, FIRST establish a cross-file symbol contract — every class name, function name, or module-level variable shared across files (AST node names, builtin registries, base classes, error classes) must be decided once and referenced consistently. Record the exact spelling in the `symbol_contract` output field. Inconsistent names (e.g. one file imports `LetStmt` while another defines `LetDecl`) cause cascading ImportError at runtime — this is the #1 failure mode for multi-file generated packages.
+- **Multi-file new projects (≥3 new files, critical)**: before listing files, FIRST establish a cross-file symbol contract. Use the **member-level dict format** for the `symbol_contract` field. Two layers MUST both be covered:
+  1. **Export names** (class/function/variable names imported by other modules) — prevents ImportError
+  2. **Class-internal member names** (enum members like `TokenType.IDENTIFIER`, dataclass fields like `node.cond`, `node.then_block`) — prevents AttributeError at runtime. Import works fine but execution crashes silently if these are misnamed. For every Enum class and every dataclass whose fields are accessed by another file, enumerate ALL accessed member/field names in the contract.
+  Real failure example: `token.py` defined `TokenType.IDENTIFIER` but `parser.py` wrote `TokenType.IDENT` — import succeeded, runtime crashed. This is the #1 failure mode for multi-file generated packages.
 
 Always respond in Chinese (用户的项目规则要求中文回复).
 """
@@ -2258,20 +2261,35 @@ def plan(requirement):
 You are a code-planning assistant. Given the user requirement, return a plan strictly conforming to the JSON schema below:
 
 {{
-  "symbol_contract": {{"<module_filename>": ["<ExportedClassName>", "<exported_func>", ...]}},
+  "symbol_contract": {{
+    "<module_filename>": {{
+      "<ClassName>": {{"fields": ["<field1>", "<field2>"], "members": ["<MEMBER1>", "<MEMBER2>"]}},
+      "<func_or_var>": {{}}
+    }}
+  }},
   "files": [
     {{"filename": "<relative path>", "description": "<change intent>", "expected_edits": <int>}}
   ],
   "test_command": "<command to run tests>"
 }}
 
-Full example:
-{{"symbol_contract": {{"mini/ast_nodes.py": ["LetDecl", "BinaryOp", "Block"], "mini/errors.py": ["MiniSyntaxError", "MiniRuntimeError"]}}, "files": [{{"filename": "add.py", "description": "implement add(a,b)", "expected_edits": 1}}, {{"filename": "tests/test_add.py", "description": "cover normal and boundary cases", "expected_edits": 3}}], "test_command": "python tests/test_add.py"}}
+symbol_contract value 支持两种格式（向后兼容）：
+- 扁平列表：`["Foo", "bar"]`（仅记录导出名，适合无内部成员引用的简单场景）
+- 成员级 dict（推荐，≥3 文件的新建项目必须用此格式）：`{{"ClassName": {{"fields": [...], "members": [...]}}}}`
+  - `fields`：其他文件会以 `obj.field` 访问的 dataclass/类实例属性名
+  - `members`：其他文件会以 `EnumType.MEMBER` 访问的枚举成员名
+  - 纯函数/变量用 `{{}}` 作为占位值
+
+Full example（多文件语言解释器）：
+{{"symbol_contract": {{"mini/ast_nodes.py": {{"LetDecl": {{"fields": ["name", "value"]}}, "IfStmt": {{"fields": ["cond", "then_block", "else_block"]}}, "BinaryOp": {{"fields": ["left", "op", "right"]}}}}, "mini/token.py": {{"TokenType": {{"members": ["IDENTIFIER", "INT", "FLOAT", "STRING", "PLUS", "MINUS", "STAR", "SLASH", "EOF"]}}}}}}, "files": [{{"filename": "mini/parser.py", "description": "recursive descent parser", "expected_edits": 8}}], "test_command": "pytest tests/"}}
 
 Field constraints:
 - Each files entry requires filename; description describes the change intent (no full code)
 - For existing files, only describe what to append/modify — do not recreate
-- **symbol_contract** (MANDATORY when ≥3 new files are being created): maps each module filename to the list of class/function/variable names it exports for use by other modules. Every name shared across files MUST appear here with its exact spelling. Coder will use these exact names — never inventing synonyms. Single-file or pure-modification tasks may omit this field.
+- **symbol_contract** (MANDATORY when ≥3 new files are being created): authoritative source of truth for all cross-file symbol names.
+  - **Must include class-internal members** when another file accesses them: enum members (`TokenType.IDENTIFIER`) and dataclass fields (`node.value`, `node.cond`). Omitting these causes AttributeError at runtime — import works but execution crashes.
+  - Coder and fixer MUST use exact names from this contract — never inventing synonyms (e.g. if contract says `value`, never write `initializer`; if contract says `IDENTIFIER`, never write `IDENT`).
+  - Single-file or pure-modification tasks may omit this field.
 - **expected_edits**: estimated number of edit/replace operations this file needs (1 for new file write, 1-3 for tweaks, 5-20 for medium refactor, 30+ for sweeping signature changes). Used by the coder loop to allocate per-file round budget — undercount → coder hits round limit and task fails halfway. When in doubt, **overestimate by 50%**.
 
 Directory layout: implementation files at workspace/ root (e.g. add.py); test files must go in workspace/tests/ (e.g. tests/test_add.py).
@@ -2368,14 +2386,8 @@ def code(plan, mode="auto", requirement=""):
     _exploration = plan.get("_exploration", "") if isinstance(plan, dict) else ""
     # 多文件符号契约：architect 在 plan 里钉死的跨模块符号名，注入每个文件的 sys_prompt 防命名分叉
     _contract = plan.get("symbol_contract", {}) if isinstance(plan, dict) else {}
-    _contract_block = (
-        "\n\n# GLOBAL SYMBOL CONTRACT (authoritative — use EXACT names below, no synonyms)\n"
-        + "\n".join(
-            f"- {m} exports: {', '.join(sorted(names))}"
-            for m, names in _contract.items() if names
-        )
-        + "\n使用跨模块符号时必须严格引用上表中的名字；禁止发明同义词（如契约写 LetDecl 则不能写 LetStmt）。"
-    ) if _contract else ""
+
+    _contract_block = _render_contract(_contract)  # 调用模块级 _render_contract
     console.print("[Agent: Coder]", highlight=False)
     console.print(f"计划处理 {len(files)} 个文件...")
     coder_signal = None  # 多文件循环结束时上送给 run()
@@ -3223,6 +3235,134 @@ def _scan_import_mismatches(plan, workspace):
     return missing
 
 
+def _render_contract(contract):
+    """渲染 symbol_contract 为人类可读的 sys_prompt 注入块（模块级，便于测试）。
+    兼容旧扁平列表格式和新成员级 dict 格式。"""
+    if not contract:
+        return ""
+    lines = ["", "# GLOBAL SYMBOL CONTRACT (authoritative — use EXACT names below, NO synonyms)"]
+    for mod, value in contract.items():
+        if isinstance(value, list):
+            lines.append(f"- {mod} exports: {', '.join(sorted(str(n) for n in value))}")
+        elif isinstance(value, dict):
+            lines.append(f"- {mod}:")
+            for cls_name, details in value.items():
+                if not isinstance(details, dict) or (not details.get("fields") and not details.get("members")):
+                    lines.append(f"    exports: {cls_name}")
+                else:
+                    parts = []
+                    if details.get("fields"):
+                        parts.append(f"fields={', '.join(details['fields'])}")
+                    if details.get("members"):
+                        parts.append(f"members={', '.join(details['members'])}")
+                    lines.append(f"    {cls_name}({'; '.join(parts)})")
+    lines.append("使用跨模块符号时必须严格引用上表名字；禁止同义词（如契约写 value 则不能写 initializer，写 IDENTIFIER 则不能写 IDENT）。")
+    return "\n".join(lines)
+
+
+def _scan_member_mismatches(plan, workspace, error_info=""):
+    """扫描 plan 中各文件对枚举成员/dataclass 字段的引用，与 symbol_contract 对比，
+    返回不匹配列表：[(file, lineno, access_expr, authority_name), ...]
+    authority_name 是契约里的正确名字（有即返回，无则为 None）。
+    解析失败安全返回空列表。
+
+    检查两类引用：
+    1. 枚举成员（精确）：`TokenType.IDENT` 且 IDENT 不在契约 members 里 → 报缺口
+       绑定到具体 Enum 类型名（node.value.id），不会跨对象误报。
+    2. dataclass 字段（严格保守）：只在 error_info 中已出现该属性名的 AttributeError 时才激活。
+       不做类型绑定，通过 error_info 过滤把误报范围压到"已确认在错误日志里出现过"。
+    """
+    import ast as _ast_mod
+
+    contract = plan.get("symbol_contract", {}) if isinstance(plan, dict) else {}
+    if not contract:
+        return []
+
+    # 从契约中提取：枚举类名 → 合法成员集；所有 dataclass 合法字段集 + 同义词映射
+    enum_members: dict = {}    # class_name → set of valid member names
+    field_names: set = set()   # 所有契约 dataclass 字段的合法名字集合（跨类合并）
+    # 已知同义对（错误名 → 权威名），用于 dataclass 字段保守检查
+    _KNOWN_SYNONYMS = {
+        "initializer": "value", "condition": "cond",
+        "then_branch": "then_block", "else_branch": "else_block",
+        "consequent": "then_block", "alternate": "else_block",
+        "body": "then_block", "test": "cond", "init": "value",
+        "identifier": "name", "token": "name", "expression": "value",
+        "left_operand": "left", "right_operand": "right", "operator": "op",
+    }
+
+    for mod_val in contract.values():
+        if not isinstance(mod_val, dict):
+            continue
+        for cls_name, details in mod_val.items():
+            if not isinstance(details, dict):
+                continue
+            if details.get("members"):
+                enum_members[cls_name] = set(details["members"])
+            if details.get("fields"):
+                field_names.update(details["fields"])
+
+    if not enum_members and not field_names:
+        return []
+
+    # dataclass 字段检查的触发集合：只含在 error_info AttributeError 中出现过的属性名
+    # 这样保守同义词检查只对「已确认出现在错误日志里」的属性名生效，避免误报无关代码
+    import re as _re
+    _active_synonyms: set = set()
+    # 从 traceback "has no attribute 'xxx'" 格式精确提取属性名
+    for _m in _re.finditer(r"has no attribute '(\w+)'", error_info):
+        _active_synonyms.add(_m.group(1))
+
+    plan_items = plan.get("files", []) if isinstance(plan, dict) else (plan or [])
+    plan_files = [
+        os.path.normpath(p.get("filename", ""))
+        for p in plan_items
+        if isinstance(p, dict) and p.get("filename", "").endswith(".py")
+    ]
+
+    missing = []
+    for fname in plan_files:
+        fpath = os.path.join(workspace, fname)
+        if not os.path.exists(fpath):
+            continue
+        try:
+            with open(fpath, encoding="utf-8", errors="replace") as _fh:
+                src = _fh.read()
+            tree = _ast_mod.parse(src)
+        except Exception:
+            continue
+
+        for node in _ast_mod.walk(tree):
+            if not isinstance(node, _ast_mod.Attribute):
+                continue
+            attr = node.attr
+            lineno = getattr(node, "lineno", 0)
+
+            # 1. 枚举成员检查：`EnumClass.MEMBER`
+            if isinstance(node.value, _ast_mod.Name):
+                cls_name = node.value.id
+                if cls_name in enum_members:
+                    valid = enum_members[cls_name]
+                    if attr not in valid:
+                        # 找最近的权威名（精确匹配或大小写不敏感）
+                        authority = next(
+                            (v for v in valid if v.upper() == attr.upper()), None
+                        )
+                        missing.append((fname, lineno, f"{cls_name}.{attr}", authority))
+
+            # 2. dataclass 字段检查（严格保守：仅在 error_info 中出现该属性名的 AttributeError 时激活）
+            # 不绑定对象类型无法可靠判断字段归属，全文件扫描会大量误报无关对象上的常见属性名。
+            # 只在测试报错已确认出现了该属性名才将其列为缺口，其余情况一律跳过。
+            if attr in _KNOWN_SYNONYMS and field_names and _active_synonyms and attr in _active_synonyms:
+                authority = _KNOWN_SYNONYMS[attr]
+                if authority in field_names:
+                    # 额外守卫：只报 Load 上下文（不报赋值左值）
+                    if isinstance(node.ctx, _ast_mod.Load):
+                        missing.append((fname, lineno, f"<obj>.{attr}", authority))
+
+    return missing
+
+
 def fix(test_result, plan, reason="test_failure", baseline_failures=None,
         disable_baseline_skip=False):
     """根据测试错误或审查意见修复代码（多轮工具调用）
@@ -3254,6 +3394,23 @@ def fix(test_result, plan, reason="test_failure", baseline_failures=None,
         )
     else:
         error_info = raw
+
+    # 成员引用缺口专项：枚举成员名/dataclass 字段名不对齐，一次性暴露 + 方向约束
+    if reason == "test_failure" and isinstance(plan, dict) and plan.get("symbol_contract"):
+        try:
+            _mem_issues = _scan_member_mismatches(plan, _get_workspace(), error_info=error_info)
+            if _mem_issues:
+                _mem_block = (
+                    "\n\n**[成员引用错误 — 以下全部引用名与 symbol_contract 不符，本轮一次性全部修正]**\n"
+                    "⚠ 契约是唯一真值源：**只允许把引用端改成契约名，严禁修改定义端**（如 token.py 的枚举定义、ast_nodes.py 的 dataclass 字段）去迁就引用端。\n"
+                    "本轮内一次性全部 replace_in_file 修完：\n"
+                )
+                for _f, _ln, _expr, _auth in _mem_issues:
+                    _auth_str = f"→ 契约权威名：`{_auth}`" if _auth else "→ 请查 symbol_contract 确认正确名称"
+                    _mem_block += f"  - {_f}:{_ln}  `{_expr}`  {_auth_str}\n"
+                error_info += _mem_block
+        except Exception as _mem_err:
+            console.print(f"[debug] _scan_member_mismatches 失败（不影响修复）：{_mem_err}", style="dim", highlight=False)
 
     # 级联 import 错误专项：一次性暴露所有未定义导入名，让 LLM 单轮修完
     if reason == "test_failure" and ("cannot import name" in error_info or "ImportError" in error_info):
