@@ -1589,6 +1589,245 @@ def test_scan_import_mismatches_level2_relative_import(tmp_path):
     assert result == [], f"level=2 相对 import 应正确解析，但报了误报: {result}"
 
 
+# ---------------------------------------------------------------------------
+# Debt 3：否定约束 + 越权测试文件排除
+# ---------------------------------------------------------------------------
+
+def test_infer_test_scope_excludes_unsanctioned(tmp_path):
+    """_infer_test_scope exclude 参数排除指定测试文件"""
+    import agent as _a
+    import config, tools
+    config.set_workspace_dir(str(tmp_path))
+    tools._reinit_paths()
+
+    ws = tmp_path
+    tests = ws / "tests"
+    tests.mkdir()
+    (ws / "calc.py").write_text("def add(a, b): return a + b\n")
+    (tests / "test_calc.py").write_text("from calc import add\ndef test_add(): assert add(1,2)==3\n")
+    (tests / "test_other.py").write_text("def test_other(): pass\n")
+
+    plan_files = [{"filename": "calc.py"}]
+    # 不排除：两个测试都找到 test_calc.py
+    scope = _a._infer_test_scope(plan_files)
+    assert any("test_calc.py" in f for f in scope), f"应找到 test_calc.py: {scope}"
+
+    # 排除 test_calc.py：scope 应为空（plan 里只有 calc.py 对应 test_calc.py）
+    excluded = {"tests/test_calc.py"}
+    scope_excl = _a._infer_test_scope(plan_files, exclude=excluded)
+    assert not any("test_calc.py" in f for f in scope_excl), \
+        f"exclude 后不应包含 test_calc.py: {scope_excl}"
+
+
+def test_infer_test_scope_keeps_plan_test_file(tmp_path):
+    """plan_files 里的测试文件不受 exclude 影响（plan 明确要求创建，不是越权）"""
+    import agent as _a
+    import config, tools
+    config.set_workspace_dir(str(tmp_path))
+    tools._reinit_paths()
+
+    ws = tmp_path
+    tests = ws / "tests"
+    tests.mkdir()
+    (tests / "test_calc.py").write_text("def test_add(): pass\n")
+
+    # plan_files 直接包含 test_calc.py（architect 规划了它）
+    plan_files = [{"filename": "tests/test_calc.py"}]
+    excluded = {"tests/test_calc.py"}  # 即使在 exclude 里
+    scope = _a._infer_test_scope(plan_files, exclude=excluded)
+    # test_calc.py 是 plan_files 里的测试文件，直接加，不受 exclude 影响
+    assert any("test_calc.py" in f for f in scope), \
+        f"plan_files 里的测试文件不应被 exclude 过滤: {scope}"
+
+
+# ---------------------------------------------------------------------------
+# Debt 1：symbol_contract 覆盖方法名
+# ---------------------------------------------------------------------------
+
+def test_render_contract_methods(tmp_path):
+    """contract 含 methods 字段 → 渲染出 methods=... 文本"""
+    import agent as _a
+    contract = {
+        "expression.py": {
+            "ExprEvaluator": {"methods": ["evaluate", "__call__"]}
+        }
+    }
+    rendered = _a._render_contract(contract)
+    assert "methods=" in rendered, f"应含 methods=: {rendered}"
+    assert "evaluate" in rendered
+    assert "__call__" in rendered
+
+
+def test_scan_member_methods_active_on_attributeerror(tmp_path):
+    """executor.py 调用 evaluator.eval()，契约 ExprEvaluator.methods=evaluate，
+    error_info 含 has no attribute 'eval' → 报一条缺口"""
+    import agent as _a
+    import os
+
+    (tmp_path / "executor.py").write_text(
+        "from expression import ExprEvaluator\n"
+        "def run(ev):\n"
+        "    return ev.eval(1+2)\n"
+    )
+    (tmp_path / "expression.py").write_text(
+        "class ExprEvaluator:\n"
+        "    def evaluate(self, expr): return expr\n"
+    )
+
+    plan = {
+        "files": [
+            {"filename": "executor.py"},
+            {"filename": "expression.py"},
+        ],
+        "symbol_contract": {
+            "expression.py": {
+                "ExprEvaluator": {"methods": ["evaluate"]}
+            }
+        }
+    }
+    error_info = "AttributeError: 'ExprEvaluator' object has no attribute 'eval'"
+    result = _a._scan_member_mismatches(plan, str(tmp_path), error_info=error_info)
+    assert len(result) >= 1, f"应报 eval 方法缺口: {result}"
+    assert any("eval" in r[2] for r in result), f"应提及 eval: {result}"
+    assert any("evaluate" in (r[3] or "") for r in result), f"权威名应为 evaluate: {result}"
+
+
+def test_scan_member_methods_no_false_positive_without_error(tmp_path):
+    """error_info 为空时不应报方法缺口（严格保守，避免 .eval 等常见方法名误报）"""
+    import agent as _a
+
+    (tmp_path / "executor.py").write_text(
+        "def run(ev):\n"
+        "    return ev.eval(1+2)\n"
+    )
+    plan = {
+        "files": [{"filename": "executor.py"}],
+        "symbol_contract": {
+            "expression.py": {
+                "ExprEvaluator": {"methods": ["evaluate"]}
+            }
+        }
+    }
+    result = _a._scan_member_mismatches(plan, str(tmp_path), error_info="")
+    method_hits = [r for r in result if "eval" in r[2] and "()" in r[2]]
+    assert len(method_hits) == 0, f"error_info 为空时不应报方法缺口: {method_hits}"
+
+
+# ---------------------------------------------------------------------------
+# Debt 2：fix loop 震荡修复
+# ---------------------------------------------------------------------------
+
+def test_fix_injects_regression_warning_when_fail_count_rises(tmp_path):
+    """cur_fail > prev_fail + prev_changed 非空 → user content 含震荡警告"""
+    import config, tools
+    import json
+    config.set_workspace_dir(str(tmp_path))
+    tools._reinit_paths()
+
+    # Mock call_llm to return immediate task_complete
+    import agent as _a
+    captured_content = {}
+    orig_call = _a.call_llm
+
+    def mock_call_llm(msgs, *args, **kwargs):
+        if msgs and msgs[-1]["role"] == "user":
+            captured_content["user"] = msgs[-1]["content"]
+        return _make_response(
+            tool_calls=[("id1", "task_complete", {"success": False, "summary": "test"})]
+        )
+
+    _a.call_llm = mock_call_llm
+    try:
+        test_result = {"returncode": 1, "stdout": "", "stderr": "1 failed"}
+        plan = {"files": [{"filename": "calc.py", "expected_edits": 1}]}
+        _a.fix(
+            test_result, plan,
+            prev_changed=["calc.py", "utils.py"],
+            prev_fail_count=1,
+            cur_fail_count=10,
+        )
+    finally:
+        _a.call_llm = orig_call
+
+    assert "prev_changed" not in str(captured_content)  # field name not leaked
+    user_msg = captured_content.get("user", "")
+    assert "震荡警告" in user_msg or "regression" in user_msg.lower(), \
+        f"应含震荡警告: {user_msg[:300]}"
+    assert "calc.py" in user_msg, "应提及上一轮改过的文件"
+
+
+def test_fix_no_regression_warning_when_fail_count_drops(tmp_path):
+    """cur_fail < prev_fail → 不注入震荡警告"""
+    import config, tools
+    config.set_workspace_dir(str(tmp_path))
+    tools._reinit_paths()
+
+    import agent as _a
+    captured_content = {}
+    orig_call = _a.call_llm
+
+    def mock_call_llm(msgs, *args, **kwargs):
+        if msgs and msgs[-1]["role"] == "user":
+            captured_content["user"] = msgs[-1]["content"]
+        return _make_response(
+            tool_calls=[("id1", "task_complete", {"success": False, "summary": "test"})]
+        )
+
+    _a.call_llm = mock_call_llm
+    try:
+        test_result = {"returncode": 1, "stdout": "", "stderr": "1 failed"}
+        plan = {"files": [{"filename": "calc.py", "expected_edits": 1}]}
+        _a.fix(
+            test_result, plan,
+            prev_changed=["calc.py"],
+            prev_fail_count=10,
+            cur_fail_count=1,  # 收敛，不是震荡
+        )
+    finally:
+        _a.call_llm = orig_call
+
+    user_msg = captured_content.get("user", "")
+    assert "震荡警告" not in user_msg, f"收敛时不应注入震荡警告: {user_msg[:200]}"
+
+
+def test_scan_import_always_active_without_import_error(tmp_path):
+    """_scan_import_mismatches 无论 error_info 是否含 ImportError 都应在 fix 中被调用（主动扫描）"""
+    import agent as _a
+    import config, tools
+    config.set_workspace_dir(str(tmp_path))
+    tools._reinit_paths()
+
+    # 构造一个有 import 缺口的 plan
+    (tmp_path / "a.py").write_text("class A:\n    pass\n")
+    (tmp_path / "b.py").write_text("from .a import MissingName\n")
+
+    plan = {"files": [
+        {"filename": "a.py", "expected_edits": 1},
+        {"filename": "b.py", "expected_edits": 1},
+    ]}
+    captured_content = {}
+    orig_call = _a.call_llm
+
+    def mock_call_llm(msgs, *args, **kwargs):
+        if msgs and msgs[-1]["role"] == "user":
+            captured_content["user"] = msgs[-1]["content"]
+        return _make_response(
+            tool_calls=[("id1", "task_complete", {"success": False, "summary": "test"})]
+        )
+
+    _a.call_llm = mock_call_llm
+    try:
+        # error_info 不含 ImportError，只含普通 AttributeError
+        test_result = {"returncode": 1, "stdout": "", "stderr": "AttributeError: something"}
+        _a.fix(test_result, plan)
+    finally:
+        _a.call_llm = orig_call
+
+    user_msg = captured_content.get("user", "")
+    assert "MissingName" in user_msg, \
+        f"主动扫描应发现 MissingName 缺口（不依赖 ImportError 触发）: {user_msg[:400]}"
+
+
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, "-v"])

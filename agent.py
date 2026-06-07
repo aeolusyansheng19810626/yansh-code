@@ -137,6 +137,9 @@ _AUDIT_TOKEN_BUDGET = 120_000  # audit loop token 增量预算
 # test+fix 循环里 returncode!=0 但 current\baseline 为空时视为通过
 _BASELINE_FAILURES: set = set()
 
+# [Debt 3] 任务开始前（code() 运行前）的 tests/ 快照，用于检测 coder 越权新建的测试文件
+_PRE_TASK_TEST_FILES: set = set()
+
 # [P1 #3] 机械错 detector：fix loop 触发追加预算的错误模式
 # 三类共用同一 bonus（signature 改 / 重命名 / 改属性时常批量出现）
 _MECH_ERROR_PATTERNS: list = [
@@ -176,6 +179,8 @@ def _prompt_requests_test_fix(prompt: str) -> bool:
         return True
     p_low = prompt.lower()
     return any(k in p_low for k in _TEST_FIX_KEYWORDS_EN)
+
+
 
 
 # [P1 #4] coder summary 是否在说"本任务无需改动"
@@ -1404,13 +1409,14 @@ def _compact_messages(msgs, keep_recent_pairs: int = 2):
     return new_msgs
 
 
-def _infer_test_scope(plan_files) -> list[str]:
+def _infer_test_scope(plan_files, exclude: set | None = None) -> list[str]:
     """P1.3：根据 plan 列出的修改文件推断本次任务相关的测试文件路径列表。
 
     规则：
       - 修改的源文件 X.py（非 test_*.py）→ 找 tests/ 全树下同名 test_<basename>.py
       - 修改的文件本身就是 test_*.py / *_test.py → 直接加进 scope
       - 找不到任何对应测试 → 返回 []（调用方应回退到全套）
+      - exclude：越权新建的测试文件集合（posix 相对路径），从 scope 中排除
 
     返回的路径相对 workspace（pytest 原样接受）。
     """
@@ -1448,24 +1454,28 @@ def _infer_test_scope(plan_files) -> list[str]:
                 scope.append(rel)
                 seen.add(rel)
             continue
-        # 2. 源文件 → 找同名 test_<stem>.py
+        # 2. 源文件 → 找同名 test_<stem>.py（越权新建的测试文件在此处排除）
         target_stem = f"test_{stem}"
         for rel in test_files_by_stem.get(target_stem, []):
+            if exclude and rel in exclude:
+                continue  # 越权新建，跳过
             if rel not in seen:
                 scope.append(rel)
                 seen.add(rel)
     return scope
 
 
-def _apply_test_scope_override(plan_result: dict) -> None:
+def _apply_test_scope_override(plan_result: dict, exclude: set | None = None) -> None:
     """P1.3：原地重写 plan_result['test_command']——基于 plan_result['files'] 推断
     相关测试 scope，命中后用 _detect_python_test_cmd(scope=...) 重新构造命令。
+
+    exclude：越权新建的测试文件集合，传入后从 scope 中排除。
 
     跳过覆盖的情况：
       - LLM 给的 test_command 不是 pytest 系（如 make test / tox / 自定义脚本）
       - scope 推断为空（找不到任何对应测试 → 保留 LLM 原命令以免误删）
     """
-    scope = _infer_test_scope(plan_result.get("files", []))
+    scope = _infer_test_scope(plan_result.get("files", []), exclude=exclude)
     orig_cmd = (plan_result.get("test_command") or "").strip()
     if not scope or not orig_cmd or "pytest" not in orig_cmd:
         return
@@ -1893,6 +1903,7 @@ Principles:
 - **Multi-file new projects (≥3 new files, critical)**: before listing files, FIRST establish a cross-file symbol contract. Use the **member-level dict format** for the `symbol_contract` field. Two layers MUST both be covered:
   1. **Export names** (class/function/variable names imported by other modules) — prevents ImportError
   2. **Class-internal member names** (enum members like `TokenType.IDENTIFIER`, dataclass fields like `node.cond`, `node.then_block`) — prevents AttributeError at runtime. Import works fine but execution crashes silently if these are misnamed. For every Enum class and every dataclass whose fields are accessed by another file, enumerate ALL accessed member/field names in the contract.
+  3. **Cross-file method names** — for any class whose methods are *called from another file* (e.g. `executor.py` calls `evaluator.evaluate()`), enumerate the exact public method name(s) under `methods`. Real failure: `expression.py` defined `ExprEvaluator.evaluate()` but `executor.py` called `.eval()` — import succeeded, runtime AttributeError. List every method name that will be called across file boundaries.
   Real failure example: `token.py` defined `TokenType.IDENTIFIER` but `parser.py` wrote `TokenType.IDENT` — import succeeded, runtime crashed. This is the #1 failure mode for multi-file generated packages.
 
 Always respond in Chinese (用户的项目规则要求中文回复).
@@ -2027,6 +2038,12 @@ Task pattern recognition (identify which category before acting, follow the matc
    - ❌ 真实翻车：rename directory_summary→summarize_directory，agent.py / subagent.py 的 prompt 文本里残留 `directory_summary(path=...)`，replace 因多写转义一直失败，coder 却 task_complete(success=True) 谎称"只在文档、无需改"。
    - ✅ 正确：search_in_files("directory_summary") 仍有命中 → 说明没改完 → 继续修，直到 0 命中才能 success=True。
 
+14. **否定约束识别——"不要做 X"/"不得修改 Y"/"不要新建 Z"：执行前提取，全程遵守**
+   - 动手前先扫一遍 requirement，把所有否定约束提取成清单（如"不要新建测试文件"/"不得修改 config.py"/"只改 X 不碰 Y"）。
+   - 否定约束**优先级高于一切默认习惯**：你默认会顺手补测试，但若 prompt 写"不要新建测试文件"，则**绝不** write_file 任何 `test_*.py` / `*_test.py`。
+   - ❌ 真实翻车：prompt 写"在 calc.py 新增 sub(a,b)，不要新建测试文件"，coder 仍建了 `tests/test_calc.py` → 违反否定约束，且自建测试失败会拖累整体 success 判定。
+   - task_complete 的 summary 里复述你遵守了哪些否定约束。
+
 Test file rule: a test file (test_*.py / *_test.py) located in a subdirectory (e.g. tests/) must include these two lines at the very top to import parent modules:
 import sys
 import os
@@ -2087,6 +2104,11 @@ Error-info usage rules:
 - The `error_kind` field is only an error **classification tag** (so you can decide retry vs give up),
   **not a reason to change a test expectation** — when a pre-existing test expected "超时" but the tool returned security,
   apply the attribution rule (item 1) and skip it; **do not edit the test assert to match error_kind**.
+
+Oscillation guard:
+- 若本轮失败数比上一轮**上升**，说明你的修改引入了 regression。**先复查你上一轮改的文件**，不要直接在当前报错方向继续改。
+- 同一处代码若连续两轮被你反向改动（A→B→A），这是震荡——立即 task_complete(success=false, summary="X 与 Y 存在约束冲突，单方向修复会引入对方回归，需人工裁决")。
+- **契约是唯一真值源**：只改引用端，不改定义端（枚举定义、dataclass 字段定义）去迁就引用端。
 
 Always respond in Chinese (用户的项目规则要求中文回复); 工具调用 task_complete 的 summary 字段必须中文.
 """
@@ -2275,9 +2297,10 @@ You are a code-planning assistant. Given the user requirement, return a plan str
 
 symbol_contract value 支持两种格式（向后兼容）：
 - 扁平列表：`["Foo", "bar"]`（仅记录导出名，适合无内部成员引用的简单场景）
-- 成员级 dict（推荐，≥3 文件的新建项目必须用此格式）：`{{"ClassName": {{"fields": [...], "members": [...]}}}}`
+- 成员级 dict（推荐，≥3 文件的新建项目必须用此格式）：`{{"ClassName": {{"fields": [...], "members": [...], "methods": [...]}}}}`
   - `fields`：其他文件会以 `obj.field` 访问的 dataclass/类实例属性名
   - `members`：其他文件会以 `EnumType.MEMBER` 访问的枚举成员名
+  - `methods`：其他文件会以 `obj.method(...)` 调用的跨文件方法名（如 `ExprEvaluator.evaluate`）
   - 纯函数/变量用 `{{}}` 作为占位值
 
 Full example（多文件语言解释器）：
@@ -2287,7 +2310,7 @@ Field constraints:
 - Each files entry requires filename; description describes the change intent (no full code)
 - For existing files, only describe what to append/modify — do not recreate
 - **symbol_contract** (MANDATORY when ≥3 new files are being created): authoritative source of truth for all cross-file symbol names.
-  - **Must include class-internal members** when another file accesses them: enum members (`TokenType.IDENTIFIER`) and dataclass fields (`node.value`, `node.cond`). Omitting these causes AttributeError at runtime — import works but execution crashes.
+  - **Must include class-internal members** when another file accesses them: enum members (`TokenType.IDENTIFIER`), dataclass fields (`node.value`, `node.cond`), and **cross-file method calls** (`ExprEvaluator.evaluate`). Omitting these causes AttributeError at runtime — import works but execution crashes.
   - Coder and fixer MUST use exact names from this contract — never inventing synonyms (e.g. if contract says `value`, never write `initializer`; if contract says `IDENTIFIER`, never write `IDENT`).
   - Single-file or pure-modification tasks may omit this field.
 - **expected_edits**: estimated number of edit/replace operations this file needs (1 for new file write, 1-3 for tweaks, 5-20 for medium refactor, 30+ for sweeping signature changes). Used by the coder loop to allocate per-file round budget — undercount → coder hits round limit and task fails halfway. When in doubt, **overestimate by 50%**.
@@ -3247,7 +3270,7 @@ def _render_contract(contract):
         elif isinstance(value, dict):
             lines.append(f"- {mod}:")
             for cls_name, details in value.items():
-                if not isinstance(details, dict) or (not details.get("fields") and not details.get("members")):
+                if not isinstance(details, dict) or (not details.get("fields") and not details.get("members") and not details.get("methods")):
                     lines.append(f"    exports: {cls_name}")
                 else:
                     parts = []
@@ -3255,8 +3278,10 @@ def _render_contract(contract):
                         parts.append(f"fields={', '.join(details['fields'])}")
                     if details.get("members"):
                         parts.append(f"members={', '.join(details['members'])}")
+                    if details.get("methods"):
+                        parts.append(f"methods={', '.join(details['methods'])}")
                     lines.append(f"    {cls_name}({'; '.join(parts)})")
-    lines.append("使用跨模块符号时必须严格引用上表名字；禁止同义词（如契约写 value 则不能写 initializer，写 IDENTIFIER 则不能写 IDENT）。")
+    lines.append("使用跨模块符号时必须严格引用上表名字；禁止同义词（如契约写 value 则不能写 initializer，写 IDENTIFIER 则不能写 IDENT，写 evaluate 则不能写 eval）。")
     return "\n".join(lines)
 
 
@@ -3291,6 +3316,7 @@ def _scan_member_mismatches(plan, workspace, error_info=""):
         "left_operand": "left", "right_operand": "right", "operator": "op",
     }
 
+    method_pool: set = set()   # 所有契约 methods 名集合（跨类合并），用于 error_info 激活
     for mod_val in contract.values():
         if not isinstance(mod_val, dict):
             continue
@@ -3301,8 +3327,10 @@ def _scan_member_mismatches(plan, workspace, error_info=""):
                 enum_members[cls_name] = set(details["members"])
             if details.get("fields"):
                 field_names.update(details["fields"])
+            if details.get("methods"):
+                method_pool.update(details["methods"])
 
-    if not enum_members and not field_names:
+    if not enum_members and not field_names and not method_pool:
         return []
 
     # dataclass 字段检查的触发集合：只含在 error_info AttributeError 中出现过的属性名
@@ -3360,11 +3388,37 @@ def _scan_member_mismatches(plan, workspace, error_info=""):
                     if isinstance(node.ctx, _ast_mod.Load):
                         missing.append((fname, lineno, f"<obj>.{attr}", authority))
 
+        # 3. 方法调用检查（严格保守：仅在 error_info AttributeError 中出现且不在 method_pool 时报）
+        # 不绑定对象类型（`evaluator.eval()` 里不知道 evaluator 的类型），全局扫描会大量误报。
+        # error_info 触发机制：只检查「运行时已报了 has no attribute 'xxx'」且 xxx 不在 method_pool 的方法名。
+        if method_pool and _active_synonyms:
+            for node in _ast_mod.walk(tree):
+                if not isinstance(node, _ast_mod.Call):
+                    continue
+                if not isinstance(node.func, _ast_mod.Attribute):
+                    continue
+                attr = node.func.attr
+                if attr not in _active_synonyms:
+                    continue  # error_info 未报此属性，跳过
+                if attr in method_pool:
+                    continue  # 已是契约正确方法名，无问题
+                # attr 不在 method_pool，说明是错误方法名，找最接近的契约方法名作为权威
+                authority = next(
+                    (m for m in method_pool if m.lower() == attr.lower()), None
+                ) or next(
+                    (m for m in method_pool if m.startswith(attr[:3]) or attr.startswith(m[:3])), None
+                )
+                if authority is None and method_pool:
+                    authority = f"（候选：{', '.join(sorted(method_pool))}）"  # 兜底：列全部候选
+                lineno = getattr(node.func, "lineno", 0)
+                missing.append((fname, lineno, f"<obj>.{attr}()", f"[疑似] → 契约方法名：{authority}"))
+
     return missing
 
 
 def fix(test_result, plan, reason="test_failure", baseline_failures=None,
-        disable_baseline_skip=False):
+        disable_baseline_skip=False,
+        prev_changed=None, prev_fail_count=None, cur_fail_count=None):
     """根据测试错误或审查意见修复代码（多轮工具调用）
     reason: "test_failure" | "review_rejection"
     baseline_failures: backlog #1，进入任务前已存在的失败 test id 集合。
@@ -3373,6 +3427,9 @@ def fix(test_result, plan, reason="test_failure", baseline_failures=None,
       除了不传 baseline_failures（已在调用方处理），还需在 user content 里反向覆盖
       _TESTER_ROLE 的"归属判断 → 跳过 pre-existing"引导，禁止 LLM 主动按归属规则
       task_complete(success=true) 跳过失败。
+    prev_changed: [Debt 2] 上一轮 fix 修改的文件列表，用于 regression 警告。
+    prev_fail_count: [Debt 2] 上一轮失败数，用于检测失败数上升（震荡信号）。
+    cur_fail_count: [Debt 2] 本轮失败数。
 
     返回 dict: {"early_exit": bool, "success": bool, "summary": str}
       - early_exit=True：LLM 主动调了 task_complete，外层应立即按 success 决定终止/标记
@@ -3412,8 +3469,9 @@ def fix(test_result, plan, reason="test_failure", baseline_failures=None,
         except Exception as _mem_err:
             console.print(f"[debug] _scan_member_mismatches 失败（不影响修复）：{_mem_err}", style="dim", highlight=False)
 
-    # 级联 import 错误专项：一次性暴露所有未定义导入名，让 LLM 单轮修完
-    if reason == "test_failure" and ("cannot import name" in error_info or "ImportError" in error_info):
+    # 级联 import 错误专项：每轮无条件主动扫描（不再依赖 error_info 含 ImportError），
+    # 一次性暴露所有未定义导入名，让 LLM 单轮修完
+    if reason == "test_failure":
         try:
             _imp_issues = _scan_import_mismatches(plan, _get_workspace())
             if _imp_issues:
@@ -3473,6 +3531,20 @@ def fix(test_result, plan, reason="test_failure", baseline_failures=None,
                 "由用户判断是否单独立项；不要读测试文件再去揣摩，归属规则已足够定性。\n\n"
                 "**严禁通过弱化测试断言（加 `or` 子句、改字面量、删除关键字）来让失败「过」** —— 这是把 bug 藏起来，不是修。"
             )
+        # [Debt 2] 跨轮 regression 警告：上一轮修改后失败数上升 → 注入震荡提示
+        if (prev_fail_count is not None and cur_fail_count is not None
+                and cur_fail_count > prev_fail_count and prev_changed):
+            _reg_block = (
+                f"\n\n**[⚠ 震荡警告 — 上一轮修改引入了 regression]**\n"
+                f"上一轮你修改了：{', '.join(prev_changed)}\n"
+                f"失败数从 {prev_fail_count} 变为 {cur_fail_count}（**上升了 {cur_fail_count - prev_fail_count}**）。\n"
+                "这说明你的修改破坏了别处的逻辑。**先 read_file 仔细复查你上轮改过的这几个文件**，"
+                "确认是否把其他代码依赖的接口或逻辑改坏了，再动手修。\n"
+                "⚠ 同一处代码来回反复改（A→B→A）是震荡——一旦发现，"
+                "task_complete(success=false, summary='X 与 Y 约束冲突，单方向修复会引入对方回归，需人工裁决') 结束，不要烧完剩余轮次。"
+            )
+            content += _reg_block
+
         sys_role = f"{_TESTER_ROLE}\n{_get_project_rules()}You are a code-fix assistant. Fix the code precisely based on the error output — prefer replace_in_file for minimal changes, only use write_file to rewrite a whole file when necessary."
         sys_role = _append_active_prompts(sys_role)
 
@@ -3916,6 +3988,15 @@ def _run(requirement, mode):
     global _CURRENT_SNAPSHOT
     _CURRENT_SNAPSHOT = current_snapshot
 
+    # [Debt 3] code() 运行前，记录 tests/ 现有测试文件，用于检测越权新建
+    global _PRE_TASK_TEST_FILES
+    _ws_pre = Path(_get_workspace())
+    _tests_dir_pre = _ws_pre / "tests"
+    _PRE_TASK_TEST_FILES = set()
+    if _tests_dir_pre.is_dir():
+        for _tp in _tests_dir_pre.rglob("test_*.py"):
+            _PRE_TASK_TEST_FILES.add(_tp.relative_to(_ws_pre).as_posix())
+
     # code / auto（确认后）：生成代码 + 测试
     console.print("\n阶段2：生成代码")
     coder_signal = code(plan_result, mode=mode, requirement=original_requirement)
@@ -3935,6 +4016,39 @@ def _run(requirement, mode):
     # 砍掉独立的 reviewer agent 循环：对标 Claude Code 单 agent 设计——
     # coder 自己负责"做+验证"，由后面的"测试与修复"循环承担质量把关。
     # review() 函数保留为独立可调用工具（如未来加 /review skill 时复用）。
+
+    # [Debt 3] 检测 coder 越权新建的测试文件，无条件从 test_command scope 排除。
+    # 设计意图：test scope 以 plan_files 为准，coder 在 plan 外新建的测试文件（哪怕质量高）
+    # 不应影响本任务的 success 判定，避免"coder 自建测试失败 → 任务被误判 success=False"。
+    # 注意：此逻辑不依赖 prompt 是否含否定约束，对所有任务生效。
+    _unsanctioned_tests: set[str] = set()
+    _ws_post = Path(_get_workspace())
+    _tests_dir_post = _ws_post / "tests"
+    if _tests_dir_post.is_dir() and _PRE_TASK_TEST_FILES is not None:
+        _current_tests_post = {
+            _tp.relative_to(_ws_post).as_posix()
+            for _tp in _tests_dir_post.rglob("test_*.py")
+        }
+        _plan_test_fnames = {
+            (f.get("filename") if isinstance(f, dict) else f)
+            for f in plan_result.get("files", [])
+        }
+        _plan_test_fnames = {
+            Path(fn).as_posix() for fn in _plan_test_fnames
+            if fn and Path(fn).name.startswith("test_")
+        }
+        _new_tests = _current_tests_post - _PRE_TASK_TEST_FILES
+        _unsanctioned_tests = {
+            f for f in _new_tests
+            if not any(_path_match(pf, f) for pf in _plan_test_fnames)
+        }
+        if _unsanctioned_tests:
+            console.print(
+                f"[test_scope] coder 越权新建了 {len(_unsanctioned_tests)} 个未计划测试文件："
+                f"{', '.join(sorted(_unsanctioned_tests))}，从 test_command scope 排除",
+                style="yellow", highlight=False,
+            )
+            _apply_test_scope_override(plan_result, exclude=_unsanctioned_tests)
 
     # simple-fast：进 test loop 前，用实际修改文件补全 test_command（M3 修复：在 early_exit 之后）
     if plan_result.get("_simple_fast") and not plan_result.get("test_command"):
@@ -4025,6 +4139,11 @@ def _run(requirement, mode):
             style="yellow", highlight=False,
         )
 
+    # [Debt 2] 跨轮失败数和 changed files 追踪（oscillation detection）
+    _prev_fail_count: int | None = None
+    _prev_changed: list | None = None
+    _last_snapshot_set: set | None = None  # 上一轮结束时的文件集，用于计算本轮差集
+
     while attempts < max_attempts:
         test_result = test(plan_result.get("test_command", ""))
         if judge(test_result):
@@ -4084,6 +4203,15 @@ def _run(requirement, mode):
                 f"[baseline] 增量 failures: {len(_increment)} 条（baseline {len(_BASELINE_FAILURES)} 条已忽略）",
                 style="cyan", highlight=False,
             )
+        # [Debt 2] 计算本轮失败数（用于震荡检测）
+        _cur_fail_count_raw: int | None = None
+        try:
+            _cur_text_raw = (test_result.get("stdout") or "") + "\n" + (test_result.get("stderr") or "")
+            _cur_fail_raw = _parse_pytest_failures(_cur_text_raw)
+            _cur_fail_count_raw = len(_cur_fail_raw)
+        except Exception:
+            pass
+
         if attempts < max_attempts - 1:
             # [P1 #6] _user_wants_fix=True 时：
             # 1) 不传 baseline_failures（user content 没有 baseline_block）
@@ -4091,7 +4219,10 @@ def _run(requirement, mode):
             _baseline_for_fix = None if _user_wants_fix else _BASELINE_FAILURES
             fix_signal = fix(test_result, plan_result,
                              baseline_failures=_baseline_for_fix,
-                             disable_baseline_skip=_user_wants_fix)
+                             disable_baseline_skip=_user_wants_fix,
+                             prev_changed=_prev_changed,
+                             prev_fail_count=_prev_fail_count,
+                             cur_fail_count=_cur_fail_count_raw)
             # P0 #3 第二波：识别 fix() 的主动声明，避免无谓 retry
             if fix_signal.get("early_exit"):
                 _summary = fix_signal.get("summary", "")
@@ -4110,6 +4241,14 @@ def _run(requirement, mode):
                     add_to_history(original_requirement, f"任务被 LLM 主动放弃：{_summary}")
                     finish_task_log(False, attempts, test_result, task_complete_signal=fix_signal)
                     return report(False, test_result, task_complete_signal=fix_signal)
+            # [Debt 2] 更新跨轮追踪状态（只取本轮新增文件差集，不累积）
+            _prev_fail_count = _cur_fail_count_raw
+            try:
+                _cur_snapshot_set = set(_task_log_mod.snapshot_files_modified())
+                _prev_changed = list(_cur_snapshot_set - (_last_snapshot_set or set()))
+                _last_snapshot_set = _cur_snapshot_set
+            except Exception:
+                _prev_changed = None
         attempts += 1
 
     console.print("达到最大尝试次数，任务失败")
