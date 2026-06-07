@@ -2195,6 +2195,95 @@ def test_scan_member_method_pool_from_dict_methods(tmp_path):
     assert name_issues, f"错误方法名 queryx 应被检出（回归测试）: {result}"
 
 
+# ---------------------------------------------------------------------------
+# R6: 端到端 smoke test —— scope 保险丝 + baseline 排除
+# ---------------------------------------------------------------------------
+
+def test_apply_scope_override_force_includes_smoke(tmp_path):
+    """B 保险丝：ws 有 tests/test_smoke.py 但 architect 未列入 plan → scope 仍强制并入。"""
+    import agent as _a
+    import config, tools
+    config.set_workspace_dir(str(tmp_path))
+    tools._reinit_paths()
+
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tmp_path / "calc.py").write_text("def add(a, b): return a + b\n")
+    (tests / "test_calc.py").write_text("from calc import add\ndef test_add(): assert add(1,2)==3\n")
+    # smoke 文件存在于 ws，但 plan_files 没列它
+    (tests / "test_smoke.py").write_text("def test_smoke(): pass\n")
+
+    plan_result = {
+        "files": [{"filename": "calc.py"}],
+        "test_command": "pytest tests/",
+    }
+    _a._apply_test_scope_override(plan_result)
+    assert "test_smoke.py" in plan_result["test_command"], \
+        f"smoke test 应被强制并入 test_command: {plan_result['test_command']}"
+
+
+def test_apply_scope_override_no_smoke_file_unchanged(tmp_path):
+    """无 smoke 文件时行为不变（不凭空注入）。"""
+    import agent as _a
+    import config, tools
+    config.set_workspace_dir(str(tmp_path))
+    tools._reinit_paths()
+
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tmp_path / "calc.py").write_text("def add(a, b): return a + b\n")
+    (tests / "test_calc.py").write_text("from calc import add\ndef test_add(): assert add(1,2)==3\n")
+
+    plan_result = {
+        "files": [{"filename": "calc.py"}],
+        "test_command": "pytest tests/",
+    }
+    _a._apply_test_scope_override(plan_result)
+    assert "test_smoke.py" not in plan_result["test_command"], \
+        f"无 smoke 文件不应注入: {plan_result['test_command']}"
+
+
+def test_apply_scope_override_smoke_only(tmp_path):
+    """B 边界：scope 原本为空（无源文件对应测试）但有 smoke → 不走空 scope return，生成仅含 smoke 的命令。"""
+    import agent as _a
+    import config, tools
+    config.set_workspace_dir(str(tmp_path))
+    tools._reinit_paths()
+
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    # plan 只改一个无对应测试的源文件 → _infer_test_scope 本会返回空
+    (tmp_path / "lonely.py").write_text("x = 1\n")
+    (tests / "test_smoke.py").write_text("def test_smoke(): pass\n")
+
+    plan_result = {
+        "files": [{"filename": "lonely.py"}],
+        "test_command": "pytest tests/",
+    }
+    _a._apply_test_scope_override(plan_result)
+    assert "test_smoke.py" in plan_result["test_command"], \
+        f"scope 仅含 smoke 时也应生成命令而非保留原命令: {plan_result['test_command']}"
+
+
+def test_capture_baseline_excludes_smoke(tmp_path, monkeypatch):
+    """C 必改：smoke test 的失败 nodeid 不计入 baseline。"""
+    import agent as _a
+
+    fake_output = (
+        "FAILED tests/test_smoke.py::test_cli - AssertionError\n"
+        "FAILED tests/test_parser.py::test_parse - AssertionError\n"
+        "===== 2 failed in 0.5s ====="
+    )
+    monkeypatch.setattr(_a, "execute_command",
+                        lambda *a, **k: {"stdout": fake_output, "stderr": ""})
+
+    failures = _a._capture_baseline_failures("pytest tests/")
+    assert not any("test_smoke.py" in f for f in failures), \
+        f"smoke nodeid 不应进 baseline: {failures}"
+    assert any("test_parser.py" in f for f in failures), \
+        f"非 smoke 失败应正常记入 baseline: {failures}"
+
+
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, "-v"])

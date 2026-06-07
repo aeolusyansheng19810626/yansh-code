@@ -1477,6 +1477,11 @@ def _apply_test_scope_override(plan_result: dict, exclude: set | None = None) ->
     """
     scope = _infer_test_scope(plan_result.get("files", []), exclude=exclude)
     orig_cmd = (plan_result.get("test_command") or "").strip()
+    # R6 保险丝：端到端 smoke test 是发现 CLI 调用链断裂的唯一信号，必须每轮运行。
+    # 若 ws 存在 tests/test_smoke.py 但 scope 未含（architect 漏列 / scope 收窄），强制并入。
+    smoke_rel = "tests/test_smoke.py"
+    if (Path(_get_workspace()) / "tests" / "test_smoke.py").is_file() and smoke_rel not in scope:
+        scope.append(smoke_rel)
     if not scope or not orig_cmd or "pytest" not in orig_cmd:
         return
     scoped_cmd = _detect_python_test_cmd(Path(_get_workspace()), scope=scope)
@@ -1906,6 +1911,10 @@ Principles:
   3. **Cross-file method names** — for any class whose methods are *called from another file* (e.g. `executor.py` calls `evaluator.evaluate()`), enumerate the exact public method name(s) under `methods`. Use `{"name": "method_name", "params": ["arg1", "arg2"]}` dict format (params excludes self) to also fix parameter-count mismatches. Real failures: (a) `expression.py` defined `ExprEvaluator.evaluate()` but `executor.py` called `.eval()` — AttributeError; (b) `catalog.py` defined `register_csv(self, path)` (1 param) but `__main__.py` called `register_csv(table_name, csv_path)` (2 params) — TypeError. Both failures are prevented by listing the exact method signature in the contract.
   Real failure examples: (a) `token.py` defined `TokenType.IDENTIFIER` but `parser.py` wrote `TokenType.IDENT` — import succeeded, runtime crashed. (b) `analyzer.py` defined `class Analyzer` but `main.py` wrote `from analyzer import analyze` — ImportError. These are the #1 and #2 failure modes for multi-file generated packages.
 
+- **End-to-end smoke test (MANDATORY when the requirement specifies a real entry point + expected output)**: if the requirement gives BOTH (1) an explicit end-to-end run command (e.g. `python -m <pkg> --flag ...`, `python <entry>.py ...`, a CLI invocation) AND (2) expected output or error-format examples (a table, `(N rows)`, `Error[CATEGORY]:`, exit codes), the plan **MUST** include a `tests/test_smoke.py` file that drives the REAL entry point via `subprocess.run([sys.executable, "-m", "<pkg>", ...], capture_output=True, text=True)` and asserts on stdout/exit code — and `test_command` MUST include it.
+  - **Why this is critical**: internal unit tests and the modules they test share the SAME (possibly wrong) signature assumptions, so they pass together while the real entry point (`__main__.py`) can independently drift to a wrong signature/call — unit tests stay green but `python -m pkg` crashes on every invocation. The smoke test is the ONLY signal that catches a broken CLI call chain. Real failure: every unit test green (200 passed) but `python -m miniql` crashed 9/10 because `__main__.py` called `build_logical_plan(resolved)` while the function needed `(resolved, catalog)` — no test ever executed the CLI path.
+  - The smoke test MUST go through `python -m` (subprocess), NEVER by importing internal functions — importing internals reproduces the same blind spot.
+
 Always respond in Chinese (用户的项目规则要求中文回复).
 """
 
@@ -2314,6 +2323,8 @@ Field constraints:
   - Coder and fixer MUST use exact names from this contract — never inventing synonyms (e.g. if contract says `value`, never write `initializer`; if contract says `IDENTIFIER`, never write `IDENT`).
   - Single-file or pure-modification tasks may omit this field.
 - **expected_edits**: estimated number of edit/replace operations this file needs (1 for new file write, 1-3 for tweaks, 5-20 for medium refactor, 30+ for sweeping signature changes). Used by the coder loop to allocate per-file round budget — undercount → coder hits round limit and task fails halfway. When in doubt, **overestimate by 50%**.
+- **End-to-end smoke test** (MANDATORY when the requirement gives a real run command + expected output, see Architect role above): add a `tests/test_smoke.py` entry (`expected_edits: 1`) that drives the real entry point via subprocess, and make sure `test_command` includes it. Skeleton:
+  `import subprocess, sys` → `r = subprocess.run([sys.executable, "-m", "<pkg>", "--data", d, "--sql", q], capture_output=True, text=True)` → `assert r.returncode == 0` + `assert "<expected stdout fragment>" in r.stdout`, plus one error case asserting the `Error[` prefix on stderr with exit code 1. NEVER import internal functions in the smoke test — it must go through `python -m`.
 
 Directory layout: implementation files at workspace/ root (e.g. add.py); test files must go in workspace/tests/ (e.g. tests/test_add.py).
 filename takes a relative path only; do NOT prepend "workspace/". Correct: hello.py, tests/test_hello.py. Wrong: workspace/hello.py.
@@ -3857,6 +3868,9 @@ def _capture_baseline_failures(test_command: str) -> set:
         r = execute_command(test_command, _timeout_sec=120)
         text = (r.get("stdout") or "") + "\n" + (r.get("stderr") or "")
         failures = _parse_pytest_failures(text)
+        # R6 必改：smoke test 永不进 baseline。否则 CLI 起始就崩 → smoke 红被记入 baseline，
+        # run() 的 "current ⊆ baseline → 视为通过" 旁路会把假绿放行，治本方案被吞掉。
+        failures = {f for f in failures if "test_smoke.py" not in f}
         if failures:
             console.print(f"[baseline] 记录 {len(failures)} 条 pre-existing failures（fix 阶段会忽略）",
                           style="cyan", highlight=False)
