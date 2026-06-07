@@ -2284,6 +2284,82 @@ def test_capture_baseline_excludes_smoke(tmp_path, monkeypatch):
         f"非 smoke 失败应正常记入 baseline: {failures}"
 
 
+# ---------------------------------------------------------------------------
+# _maybe_compact_messages / _make_compact_state（fix loop compact 复用 helper）
+# ---------------------------------------------------------------------------
+
+def test_fix_loop_invokes_compact(tmp_path, monkeypatch):
+    """集成防回归：fix() 的 while loop 每轮必须经过 _maybe_compact_messages 检测点
+    （R6 根因正是 fix 漏了 compact，messages O(N²) 膨胀烧 $51）。"""
+    import config, tools
+    config.set_workspace_dir(str(tmp_path))
+    tools._reinit_paths()
+
+    spy = {"n": 0}
+    real = agent._maybe_compact_messages
+
+    def _spy(msgs, state, label="auto-compact"):
+        spy["n"] += 1
+        return real(msgs, state, label)
+
+    monkeypatch.setattr(agent, "_maybe_compact_messages", _spy)
+    # 第一轮就 task_complete 收尾，保证测试快速结束
+    monkeypatch.setattr(agent, "call_llm", lambda msgs, **kw: _make_response(
+        tool_calls=[("c1", "task_complete", {"success": True, "summary": "done"})]
+    ))
+    agent.fix({"returncode": 1, "stderr": "FAILED x", "stdout": ""},
+              {"files": [], "test_command": ""})
+    assert spy["n"] >= 1, "fix() 每轮必须调用 _maybe_compact_messages（防 R6 漏 compact 回归）"
+
+
+def test_maybe_compact_under_threshold_noop(monkeypatch):
+    """低于阈值 → 原样返回，state 不变。"""
+    state = agent._make_compact_state()
+    state["threshold"] = 10_000
+    msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
+    monkeypatch.setattr(agent, "_estimate_messages_tokens", lambda m: 5000)
+    out = agent._maybe_compact_messages(msgs, state)
+    assert out is msgs
+    assert state["consecutive_over"] == 0
+    assert not state["disabled"]
+
+
+def test_maybe_compact_over_threshold_compresses(monkeypatch):
+    """超阈值 → 调 _compact_messages 并返回压缩结果。"""
+    state = agent._make_compact_state()
+    state["threshold"] = 10_000
+    msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"},
+            {"role": "assistant", "content": "a"}]
+    compacted = [{"role": "system", "content": "compacted"}]
+    # est: 第一次大、压缩后小
+    ests = iter([50_000, 5_000])
+    monkeypatch.setattr(agent, "_estimate_messages_tokens", lambda m: next(ests))
+    monkeypatch.setattr(agent, "_compact_messages", lambda m, keep_recent_pairs: compacted)
+    out = agent._maybe_compact_messages(msgs, state)
+    assert out is compacted
+    assert state["consecutive_over"] == 0  # 降幅 90% ≥ 15%，重置
+
+
+def test_maybe_compact_thrashing_disables(monkeypatch):
+    """连续压缩无效（未降低）→ 累计 thrash，达上限后 disabled。"""
+    state = agent._make_compact_state()
+    state["threshold"] = 10_000
+    state["max_consecutive"] = 2
+    msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
+    # 估值恒定（压缩无效），_compact_messages 原样返回
+    monkeypatch.setattr(agent, "_estimate_messages_tokens", lambda m: 50_000)
+    monkeypatch.setattr(agent, "_compact_messages", lambda m, keep_recent_pairs: m)
+    agent._maybe_compact_messages(msgs, state)
+    assert state["consecutive_over"] == 1
+    agent._maybe_compact_messages(msgs, state)
+    assert state["disabled"], "连续 2 次无效应触发 thrashing 禁用"
+    # disabled 后直接 noop
+    monkeypatch.setattr(agent, "_estimate_messages_tokens",
+                        lambda m: (_ for _ in ()).throw(AssertionError("disabled 后不应再估算")))
+    out = agent._maybe_compact_messages(msgs, state)
+    assert out is msgs
+
+
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, "-v"])

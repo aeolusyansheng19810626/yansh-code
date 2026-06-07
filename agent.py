@@ -1409,6 +1409,54 @@ def _compact_messages(msgs, keep_recent_pairs: int = 2):
     return new_msgs
 
 
+def _make_compact_state() -> dict:
+    """auto-compact 跨轮状态（threshold/keep/thrashing 计数/disabled）。
+    code() 与 fix() 各自的 LLM loop 共用，避免重复内联逻辑。"""
+    return {
+        "threshold": int(_cfg("compact_threshold_tokens") or 60_000),
+        "keep_pairs": int(_cfg("compact_keep_recent_pairs") or 2),
+        "consecutive_over": 0,
+        "max_consecutive": int(_cfg("compact_max_consecutive_over") or 4),
+        "disabled": False,
+    }
+
+
+def _maybe_compact_messages(msgs, state: dict, label: str = "auto-compact"):
+    """每轮 call_llm 前检测并压缩 messages。原地更新 state（thrashing 计数/disabled）。
+    返回压缩后的 msgs（可能原样返回）。含 thrashing 保护：连续 N 次压缩无效则禁用本任务后续 compact。"""
+    if state.get("disabled"):
+        return msgs
+    _est = _estimate_messages_tokens(msgs)
+    if _est <= state["threshold"]:
+        return msgs
+    console.print(f"[{label}] msgs ~{_est} tokens > {state['threshold']}，触发压缩...", style="cyan")
+    _new_msgs = _compact_messages(msgs, keep_recent_pairs=state["keep_pairs"])
+    _new_est = _estimate_messages_tokens(_new_msgs)
+    if _new_est < _est:
+        msgs = _new_msgs
+        console.print(f"[{label}] 已压缩 {_est} → {_new_est} tokens", style="green")
+        if (_est - _new_est) / _est < 0.15:
+            state["consecutive_over"] += 1
+        else:
+            state["consecutive_over"] = 0
+    else:
+        # 估值未降低/反增 —— 计入 thrash 连续计数（不写回较大的 _new_msgs）
+        state["consecutive_over"] += 1
+        console.print(
+            f"[{label}] 未降低（{_est} → {_new_est}），计入 thrash "
+            f"({state['consecutive_over']}/{state['max_consecutive']})",
+            style="yellow",
+        )
+    if state["consecutive_over"] >= state["max_consecutive"]:
+        console.print(
+            f"[{label}] thrashing 保护：连续 {state['max_consecutive']} 次压缩无效，"
+            f"禁用后续 compact 继续执行（est={_est}）",
+            style="yellow",
+        )
+        state["disabled"] = True
+    return msgs
+
+
 def _infer_test_scope(plan_files, exclude: set | None = None) -> list[str]:
     """P1.3：根据 plan 列出的修改文件推断本次任务相关的测试文件路径列表。
 
@@ -2568,54 +2616,14 @@ Note: you must use write_file to write the file; the filename must be exactly `{
         _no_progress_cap = int(_cfg("coder_no_progress_rounds") or 4)
         _edit_tool_names = ("write_file", "replace_in_file", "append_to_file", "replace_symbol")
 
-        # P2 #4-B2: auto-compact 配置
-        _compact_threshold = int(_cfg("compact_threshold_tokens") or 60_000)
-        _compact_keep_pairs = int(_cfg("compact_keep_recent_pairs") or 2)
-        _compact_consecutive_over = 0
-        _compact_max_consecutive = int(_cfg("compact_max_consecutive_over") or 4)
-        _compact_disabled = False  # M1: thrashing 保护触发后禁用本任务后续 compact
+        # P2 #4-B2: auto-compact 跨轮状态
+        _compact_state = _make_compact_state()
 
         while attempts_left > 0:
             attempts_left -= 1
 
             # P2 #4-B2: 每轮 call_llm 前检测是否需 compact
-            _est = _estimate_messages_tokens(msgs)
-            if _est > _compact_threshold and not _compact_disabled:
-                console.print(
-                    f"[auto-compact] msgs ~{_est} tokens > {_compact_threshold}，触发压缩...",
-                    style="cyan",
-                )
-                _new_msgs = _compact_messages(msgs, keep_recent_pairs=_compact_keep_pairs)
-                _new_est = _estimate_messages_tokens(_new_msgs)
-                if _new_est < _est:
-                    msgs = _new_msgs
-                    console.print(
-                        f"[auto-compact] 已压缩 {_est} → {_new_est} tokens",
-                        style="green",
-                    )
-                    _reduction_ratio = (_est - _new_est) / _est
-                    if _reduction_ratio < 0.15:
-                        _compact_consecutive_over += 1
-                    else:
-                        _compact_consecutive_over = 0
-                else:
-                    # P0a: 估值未降低/反增 —— 计入 thrash 连续计数（不再"放过"白触发）
-                    # 不写回 _new_msgs（保留较小的原 msgs），但必须累加计数以触发保护
-                    _compact_consecutive_over += 1
-                    console.print(
-                        f"[auto-compact] 未降低（{_est} → {_new_est}），计入 thrash "
-                        f"({_compact_consecutive_over}/{_compact_max_consecutive})",
-                        style="yellow",
-                    )
-
-                # 统一在两分支后判定保护触发
-                if _compact_consecutive_over >= _compact_max_consecutive:
-                    console.print(
-                        f"[auto-compact] thrashing 保护：连续 {_compact_max_consecutive} 次压缩无效，"
-                        f"禁用后续 compact 继续执行（est={_est}）",
-                        style="yellow",
-                    )
-                    _compact_disabled = True
+            msgs = _maybe_compact_messages(msgs, _compact_state)
 
             if first_call and not file_exists:
                 tc = {"type": "function", "function": {"name": "write_file"}}
@@ -3738,6 +3746,7 @@ def fix(test_result, plan, reason="test_failure", baseline_failures=None,
     start_tokens = get_session_total_tokens()
     budget_warned = False
     silent_prompted = False  # 沉默退出兜底：LLM 没调工具时追问一次
+    _compact_state = _make_compact_state()  # 费用诊断：fix loop 也需 auto-compact，否则 messages O(N²) 膨胀
 
     # 软上限可配置 + 机械错检测：测试失败如果是同一类 missing argument / TypeError
     # 这种"批量改完之前都过不了"的机械错，把 fix 上限再放一档预算
@@ -3766,6 +3775,9 @@ def fix(test_result, plan, reason="test_failure", baseline_failures=None,
         rounds_used += 1
         if interrupt.is_interrupted():
             raise interrupt.Interrupted()
+
+        # 费用诊断修复：每轮 call_llm 前 auto-compact，防 messages 线性累积全量重发
+        messages = _maybe_compact_messages(messages, _compact_state)
 
         # token 预算检查（每轮开头）
         if not budget_warned:
