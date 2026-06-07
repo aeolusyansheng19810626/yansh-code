@@ -6,6 +6,7 @@ import threading
 from datetime import datetime
 from console_shared import console, set_json_mode as _set_json_mode
 from pathlib import Path
+import config as _config_mod
 from config import (
     WORKSPACE_DIR, get_config,
     get_model_price,
@@ -1889,6 +1890,8 @@ Principles:
   dispatch) need updating too — otherwise the new parameter is silently swallowed. **Files the user didn't
   list aren't necessarily out of scope** — your job is to surface these hidden dependencies.
 
+- **Multi-file new projects (≥3 new files, critical)**: before listing files, FIRST establish a cross-file symbol contract — every class name, function name, or module-level variable shared across files (AST node names, builtin registries, base classes, error classes) must be decided once and referenced consistently. Record the exact spelling in the `symbol_contract` output field. Inconsistent names (e.g. one file imports `LetStmt` while another defines `LetDecl`) cause cascading ImportError at runtime — this is the #1 failure mode for multi-file generated packages.
+
 Always respond in Chinese (用户的项目规则要求中文回复).
 """
 
@@ -2255,6 +2258,7 @@ def plan(requirement):
 You are a code-planning assistant. Given the user requirement, return a plan strictly conforming to the JSON schema below:
 
 {{
+  "symbol_contract": {{"<module_filename>": ["<ExportedClassName>", "<exported_func>", ...]}},
   "files": [
     {{"filename": "<relative path>", "description": "<change intent>", "expected_edits": <int>}}
   ],
@@ -2262,11 +2266,12 @@ You are a code-planning assistant. Given the user requirement, return a plan str
 }}
 
 Full example:
-{{"files": [{{"filename": "add.py", "description": "implement add(a,b)", "expected_edits": 1}}, {{"filename": "tests/test_add.py", "description": "cover normal and boundary cases", "expected_edits": 3}}], "test_command": "python tests/test_add.py"}}
+{{"symbol_contract": {{"mini/ast_nodes.py": ["LetDecl", "BinaryOp", "Block"], "mini/errors.py": ["MiniSyntaxError", "MiniRuntimeError"]}}, "files": [{{"filename": "add.py", "description": "implement add(a,b)", "expected_edits": 1}}, {{"filename": "tests/test_add.py", "description": "cover normal and boundary cases", "expected_edits": 3}}], "test_command": "python tests/test_add.py"}}
 
 Field constraints:
 - Each files entry requires filename; description describes the change intent (no full code)
 - For existing files, only describe what to append/modify — do not recreate
+- **symbol_contract** (MANDATORY when ≥3 new files are being created): maps each module filename to the list of class/function/variable names it exports for use by other modules. Every name shared across files MUST appear here with its exact spelling. Coder will use these exact names — never inventing synonyms. Single-file or pure-modification tasks may omit this field.
 - **expected_edits**: estimated number of edit/replace operations this file needs (1 for new file write, 1-3 for tweaks, 5-20 for medium refactor, 30+ for sweeping signature changes). Used by the coder loop to allocate per-file round budget — undercount → coder hits round limit and task fails halfway. When in doubt, **overestimate by 50%**.
 
 Directory layout: implementation files at workspace/ root (e.g. add.py); test files must go in workspace/tests/ (e.g. tests/test_add.py).
@@ -2333,7 +2338,11 @@ def _parse_plan_with_status(content: str):
             files_out.append(d)
         else:
             files_out.append(f)
-    return True, {"files": files_out, "test_command": validated.test_command}, None
+    out = {"files": files_out, "test_command": validated.test_command}
+    sc = getattr(validated, "symbol_contract", None) or raw.get("symbol_contract")
+    if isinstance(sc, dict):
+        out["symbol_contract"] = sc
+    return True, out, None
 
 
 def _parse_plan_response(content: str) -> dict:
@@ -2357,6 +2366,16 @@ def code(plan, mode="auto", requirement=""):
     files = plan.get("files", [])
     # [P1 #5] plan() 派 explorer 时存的代码事实——coder 写文档/重构时拼到 system_prompt
     _exploration = plan.get("_exploration", "") if isinstance(plan, dict) else ""
+    # 多文件符号契约：architect 在 plan 里钉死的跨模块符号名，注入每个文件的 sys_prompt 防命名分叉
+    _contract = plan.get("symbol_contract", {}) if isinstance(plan, dict) else {}
+    _contract_block = (
+        "\n\n# GLOBAL SYMBOL CONTRACT (authoritative — use EXACT names below, no synonyms)\n"
+        + "\n".join(
+            f"- {m} exports: {', '.join(sorted(names))}"
+            for m, names in _contract.items() if names
+        )
+        + "\n使用跨模块符号时必须严格引用上表中的名字；禁止发明同义词（如契约写 LetDecl 则不能写 LetStmt）。"
+    ) if _contract else ""
     console.print("[Agent: Coder]", highlight=False)
     console.print(f"计划处理 {len(files)} 个文件...")
     coder_signal = None  # 多文件循环结束时上送给 run()
@@ -2419,7 +2438,7 @@ Rules:
 - Never read_file before the pre-flight search. Never re-read a file you have already read this task (results are cached).
 - **Read first**: if the pre-flight check is inconclusive or changes are needed, call read_file (or get_symbol_definition / search_in_files for targeted lookup) on `{filename}` to see the current content. The user message NO LONGER inlines the file body — you must fetch it via tools.
 {_write_rule}
-- Each replace_in_file call modifies one place; for multiple changes call it multiple times{_exploration}"""
+- Each replace_in_file call modifies one place; for multiple changes call it multiple times{_exploration}{_contract_block}"""
             sys_prompt = _append_active_prompts(sys_prompt)
         else:
             console.print(f"{filename} 是新建文件...")
@@ -2432,7 +2451,7 @@ Available operations:
 
 Requirement / change intent: {intent}
 
-Note: you must use write_file to write the file; the filename must be exactly `{filename}` — do not change the path or add a directory prefix.{_exploration}"""
+Note: you must use write_file to write the file; the filename must be exactly `{filename}` — do not change the path or add a directory prefix.{_exploration}{_contract_block}"""
             sys_prompt = _append_active_prompts(sys_prompt)
 
         # 构建消息：expected_edits 显式告诉 LLM 本文件改动规模 → 选合适策略
@@ -3085,6 +3104,125 @@ def _parse_review_response(content: str) -> dict:
         _log_json_failure("review", content, err)
     return data
 
+def _scan_import_mismatches(plan, workspace):
+    """扫描 plan 中各 .py 文件的相对 import，返回目标模块中不存在的导入名列表。
+    结果格式：[(importer_file, target_rel_path, missing_name, asname_or_none), ...]
+    解析失败时安全返回空列表，不影响主流程。
+
+    模块解析策略：用相对路径推导目标文件（而非 basename），避免子目录/同名模块碰撞。
+    保守策略：含 star-import 的模块标记为 exports_unknown，不对其发起缺失判定（宁可漏报不误报）。
+    """
+    import ast as _ast_mod
+    plan_items = plan.get("files", []) if isinstance(plan, dict) else (plan or [])
+    plan_files = [
+        os.path.normpath(p.get("filename", ""))
+        for p in plan_items
+        if isinstance(p, dict) and p.get("filename", "").endswith(".py")
+    ]
+    plan_files_set = set(plan_files)
+
+    def _collect_exports(fpath):
+        """返回 (names: set, unknown: bool)。unknown=True 表示含 star-import，不可静态枚举。
+        收集范围：顶层 + if/try/with 块下一层（处理兜底实现、条件定义、re-export 聚合）。
+        不进入 Function/Class 体（避免把局部名当导出）。
+        """
+        try:
+            with open(fpath, encoding="utf-8", errors="replace") as _fh:
+                tree = _ast_mod.parse(_fh.read())
+        except Exception:
+            return set(), True  # 解析失败，保守标记 unknown
+        names: set = set()
+        unknown = False
+
+        def _scan_stmts(stmts):
+            nonlocal unknown
+            for node in stmts:
+                if isinstance(node, (_ast_mod.ClassDef, _ast_mod.FunctionDef, _ast_mod.AsyncFunctionDef)):
+                    names.add(node.name)
+                elif isinstance(node, _ast_mod.Assign):
+                    for t in node.targets:
+                        if isinstance(t, _ast_mod.Name):
+                            names.add(t.id)
+                        elif isinstance(t, (_ast_mod.Tuple, _ast_mod.List)):
+                            for elt in t.elts:
+                                if isinstance(elt, _ast_mod.Name):
+                                    names.add(elt.id)
+                elif isinstance(node, _ast_mod.AugAssign):
+                    if isinstance(node.target, _ast_mod.Name):
+                        names.add(node.target.id)
+                elif isinstance(node, _ast_mod.ImportFrom):
+                    if any(a.name == "*" for a in node.names):
+                        unknown = True  # star-import：导出集合不可静态确定
+                    else:
+                        # re-export：from .x import Foo / from .x import Foo as Bar
+                        for a in node.names:
+                            names.add(a.asname if a.asname else a.name)
+                elif isinstance(node, _ast_mod.Import):
+                    # import mod / import mod as alias
+                    for a in node.names:
+                        names.add(a.asname if a.asname else a.name.split(".")[0])
+                elif isinstance(node, (_ast_mod.If, _ast_mod.With)):
+                    # 下钻一层收集 if/with 体（条件定义、上下文管理器内的定义）
+                    _scan_stmts(getattr(node, "body", []))
+                    _scan_stmts(getattr(node, "orelse", []))
+                elif isinstance(node, _ast_mod.Try):
+                    # 下钻一层收集 try/except/else/finally（兜底实现）
+                    _scan_stmts(node.body)
+                    for handler in node.handlers:
+                        _scan_stmts(handler.body)
+                    _scan_stmts(getattr(node, "orelse", []))
+                    _scan_stmts(getattr(node, "finalbody", []))
+
+        _scan_stmts(tree.body)
+        return names, unknown
+
+    def _resolve_target(importer_fname, level, module):
+        """将相对 import 解析为相对于 workspace 的路径（含 .py 后缀）。"""
+        base_dir = os.path.dirname(importer_fname)
+        for _ in range(level - 1):
+            base_dir = os.path.dirname(base_dir) or ""
+        mod_path = module.replace(".", os.sep) if module else ""
+        target = os.path.normpath(os.path.join(base_dir, mod_path) + ".py") if mod_path else None
+        return target
+
+    # 收集各模块导出（key = normpath 相对路径）
+    module_exports: dict = {}      # path → set[str]
+    module_unknown: set = set()    # 含 star-import 的模块路径集合（exports 不可枚举）
+    for fname in plan_files:
+        fpath = os.path.join(workspace, fname)
+        if not os.path.exists(fpath):
+            continue
+        names, unknown = _collect_exports(fpath)
+        module_exports[fname] = names
+        if unknown:
+            module_unknown.add(fname)
+
+    # 扫描各文件的 from .x import Y 检查是否存在
+    missing = []
+    for fname in plan_files:
+        fpath = os.path.join(workspace, fname)
+        if not os.path.exists(fpath):
+            continue
+        try:
+            with open(fpath, encoding="utf-8", errors="replace") as _fh:
+                tree = _ast_mod.parse(_fh.read())
+        except Exception:
+            continue
+        for node in _ast_mod.walk(tree):
+            if not (isinstance(node, _ast_mod.ImportFrom) and node.level >= 1 and node.module):
+                continue
+            target = _resolve_target(fname, node.level, node.module)
+            if target is None or target not in plan_files_set:
+                continue  # 不在 plan 内的模块跳过
+            if target in module_unknown:
+                continue  # 含 star-import，保守跳过
+            exports = module_exports.get(target, set())
+            for alias in node.names:
+                if alias.name != "*" and alias.name not in exports:
+                    missing.append((fname, target, alias.name, alias.asname))
+    return missing
+
+
 def fix(test_result, plan, reason="test_failure", baseline_failures=None,
         disable_baseline_skip=False):
     """根据测试错误或审查意见修复代码（多轮工具调用）
@@ -3116,6 +3254,22 @@ def fix(test_result, plan, reason="test_failure", baseline_failures=None,
         )
     else:
         error_info = raw
+
+    # 级联 import 错误专项：一次性暴露所有未定义导入名，让 LLM 单轮修完
+    if reason == "test_failure" and ("cannot import name" in error_info or "ImportError" in error_info):
+        try:
+            _imp_issues = _scan_import_mismatches(plan, _get_workspace())
+            if _imp_issues:
+                _imp_block = (
+                    "\n\n**[级联导入错误 — 以下全部缺失导入名，本轮必须一次性全部修正]**\n"
+                    "Python 每次只报第一个 ImportError；下表已帮你找出 plan 内所有缺口，本轮内一次性全部 replace_in_file 修完：\n"
+                )
+                for _f, _tgt, _n, _asname in _imp_issues:
+                    _alias_str = f" as {_asname}" if _asname else ""
+                    _imp_block += f"  - {_f}: `from .{os.path.splitext(os.path.basename(_tgt))[0]} import {_n}{_alias_str}` — `{_n}` 在 {_tgt} 中不存在，请先 list_symbols({_tgt}) 确认正确名称\n"
+                error_info += _imp_block
+        except Exception as _scan_err:
+            console.print(f"[debug] _scan_import_mismatches 失败（不影响修复）：{_scan_err}", style="dim", highlight=False)
 
     if reason == "review_rejection":
         content = f"Code review failed. Fix the code item-by-item per the review comments below:\n\n{error_info}\n\nPlan: {json.dumps(plan)}"
@@ -3671,7 +3825,7 @@ def _run(requirement, mode):
     console.print("\n阶段3：测试与修复")
     attempts = 0
     test_result = None
-    max_attempts = _cfg("max_attempts") or 3
+    max_attempts = _cfg("max_attempts") or _config_mod.MAX_ATTEMPTS
 
     # #42 如果 workspace 中没有测试文件，自动生成
     ws = Path(_get_workspace())

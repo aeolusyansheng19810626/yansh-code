@@ -1178,6 +1178,279 @@ def test_compact_threshold_default_is_30k():
     assert val == 30_000
 
 
+# ─────────────────────────────────────────────
+# Fix 1a / 2a / 2b / 2c / 1b 单测
+# ─────────────────────────────────────────────
+
+def test_max_attempts_default_is_6():
+    """Fix 1a: MAX_ATTEMPTS 常量已从 3 提高到 6"""
+    import config as _cfg_mod
+    assert _cfg_mod.MAX_ATTEMPTS == 6
+
+
+def test_max_attempts_run_uses_config_constant():
+    """Fix C2: _run() 里 max_attempts 回退应引用 _config_mod.MAX_ATTEMPTS，不写死字面量 3"""
+    import pathlib
+    src = pathlib.Path(__file__).parent.parent.parent.joinpath("agent.py").read_text(encoding="utf-8")
+    # 回退值不再是字面量 3（`or 3` 已被移除）
+    import re
+    # 只看 max_attempts 那一行
+    lines_with_max = [l for l in src.splitlines() if "max_attempts" in l and "_cfg" in l]
+    assert lines_with_max, "未找到 max_attempts = _cfg(...) 行"
+    for line in lines_with_max:
+        assert "or 3" not in line, f"仍有字面量回退 3: {line}"
+    assert "_config_mod.MAX_ATTEMPTS" in src
+
+
+def test_architect_role_contains_symbol_contract_hint():
+    """Fix 2c: _ARCHITECT_ROLE 包含多文件符号契约提示"""
+    import agent as _a
+    assert "symbol_contract" in _a._ARCHITECT_ROLE
+    assert "Multi-file new projects" in _a._ARCHITECT_ROLE
+
+
+def test_plan_schema_contains_symbol_contract_field():
+    """Fix 2a: plan schema 文本包含 symbol_contract 字段说明"""
+    import agent as _a
+    import inspect
+    src = inspect.getsource(_a.plan)
+    assert "symbol_contract" in src
+
+
+def test_parse_plan_preserves_symbol_contract():
+    """Fix C1: _parse_plan_with_status 成功路径必须把 symbol_contract 透传出来"""
+    import agent as _a
+    plan_json = (
+        '{"symbol_contract": {"mini/ast_nodes.py": ["LetDecl", "BinaryOp"]},'
+        ' "files": [{"filename": "mini/parser.py", "description": "parse", "expected_edits": 1}],'
+        ' "test_command": "pytest"}'
+    )
+    ok, result, err = _a._parse_plan_with_status(plan_json)
+    assert ok, f"parse 应成功，错误：{err}"
+    assert "symbol_contract" in result, "symbol_contract 被丢弃，Fix C1 未生效"
+    assert result["symbol_contract"] == {"mini/ast_nodes.py": ["LetDecl", "BinaryOp"]}
+
+
+def test_code_sys_prompt_injects_contract(tmp_path, monkeypatch):
+    """Fix 2b: code() 从 plan.symbol_contract 生成 _contract_block 注入 sys_prompt（行为断言）"""
+    import agent as _a
+    captured_prompts = []
+
+    orig_call_llm = _a.call_llm
+
+    def fake_call_llm(msgs, *args, **kwargs):
+        for m in msgs:
+            if m.get("role") == "system":
+                captured_prompts.append(m["content"])
+        # 返回一个 task_complete 信号让 loop 停止
+        from types import SimpleNamespace
+        resp = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(
+                    content="done",
+                    tool_calls=[],
+                    role="assistant",
+                )
+            )],
+            usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5),
+        )
+        return resp
+
+    monkeypatch.setattr(_a, "call_llm", fake_call_llm, raising=True)
+    monkeypatch.setattr(_a, "_get_workspace", lambda: str(tmp_path), raising=False)
+    monkeypatch.setattr(_a, "_append_active_prompts", lambda x: x, raising=False)
+    monkeypatch.setattr(_a, "_get_project_rules", lambda: "", raising=False)
+    monkeypatch.setattr(_a, "_cfg", lambda k, **kw: None, raising=False)
+    import interrupt as _interrupt_mod
+    monkeypatch.setattr(_interrupt_mod, "is_interrupted", lambda: False, raising=False)
+
+    plan_with_contract = {
+        "symbol_contract": {
+            "mini/ast_nodes.py": ["LetDecl", "BinaryOp"],
+            "mini/errors.py": ["MiniSyntaxError"],
+        },
+        "files": [{"filename": "mini/parser.py", "description": "parse", "expected_edits": 1}],
+        "test_command": "pytest",
+    }
+
+    try:
+        _a.code(plan_with_contract, requirement="test")
+    except Exception:
+        pass  # LLM 未返回 task_complete，loop 可能抛异常，属预期
+
+    assert captured_prompts, "call_llm 未被调用，monkeypatch 路径有误"
+    sys_content = captured_prompts[0]
+    assert "GLOBAL SYMBOL CONTRACT" in sys_content, "sys_prompt 未注入契约"
+    assert "LetDecl" in sys_content
+    assert "MiniSyntaxError" in sys_content
+
+
+def test_scan_import_mismatches_finds_wrong_names(tmp_path):
+    """Fix 1b: 正确报告 basename 平铺场景下的名字不匹配"""
+    import agent as _a
+
+    (tmp_path / "ast_nodes.py").write_text("class LetDecl:\n    pass\nclass BinaryOp:\n    pass\n")
+    (tmp_path / "parser.py").write_text(
+        "from .ast_nodes import LetStmt\n"   # 错：应是 LetDecl
+        "from .ast_nodes import BinaryOp\n"  # 对
+    )
+    plan = {"files": [{"filename": "ast_nodes.py"}, {"filename": "parser.py"}]}
+    result = _a._scan_import_mismatches(plan, str(tmp_path))
+    assert len(result) == 1
+    f, tgt, name, _asname = result[0]
+    assert "parser.py" in f
+    assert "ast_nodes.py" in tgt
+    assert name == "LetStmt"
+
+
+def test_scan_import_mismatches_subdirectory(tmp_path):
+    """Fix M1: 子目录场景（mini/ 包）能正确解析相对路径，不按 basename 碰撞"""
+    import agent as _a
+    import os
+
+    pkg = tmp_path / "mini"
+    pkg.mkdir()
+    (pkg / "ast_nodes.py").write_text("class LetDecl:\n    pass\n")
+    (pkg / "parser.py").write_text("from .ast_nodes import LetStmt\n")  # 错
+
+    plan = {"files": [
+        {"filename": os.path.join("mini", "ast_nodes.py")},
+        {"filename": os.path.join("mini", "parser.py")},
+    ]}
+    result = _a._scan_import_mismatches(plan, str(tmp_path))
+    assert len(result) == 1
+    _, _, name, _ = result[0]
+    assert name == "LetStmt"
+
+
+def test_scan_import_mismatches_star_import_skipped(tmp_path):
+    """Fix M2: 含 star-import 的模块标记 unknown，不产生误报"""
+    import agent as _a
+
+    (tmp_path / "base.py").write_text("from .util import *\n")  # star-import → unknown
+    (tmp_path / "parser.py").write_text("from .base import SomeClass\n")
+
+    plan = {"files": [{"filename": "base.py"}, {"filename": "parser.py"}]}
+    result = _a._scan_import_mismatches(plan, str(tmp_path))
+    assert result == [], "star-import 模块应被标 unknown，不产生误报"
+
+
+def test_scan_import_mismatches_tuple_unpack(tmp_path):
+    """Fix M2: 元组解包赋值 A, B = ... 的名字应被收集到 exports"""
+    import agent as _a
+
+    (tmp_path / "config.py").write_text("A, B = 1, 2\n")
+    (tmp_path / "parser.py").write_text("from .config import A\nfrom .config import B\n")
+
+    plan = {"files": [{"filename": "config.py"}, {"filename": "parser.py"}]}
+    result = _a._scan_import_mismatches(plan, str(tmp_path))
+    assert result == [], f"元组解包的 A/B 应被识别为 exports，但报了误报: {result}"
+
+
+def test_scan_import_mismatches_no_false_positive(tmp_path):
+    """Fix 1b: 名字完全匹配时不报误报"""
+    import agent as _a
+
+    (tmp_path / "errors.py").write_text("class MiniSyntaxError(Exception): pass\n")
+    (tmp_path / "parser.py").write_text("from .errors import MiniSyntaxError\n")
+
+    plan = {"files": [{"filename": "errors.py"}, {"filename": "parser.py"}]}
+    result = _a._scan_import_mismatches(plan, str(tmp_path))
+    assert result == []
+
+
+def test_scan_import_mismatches_parse_error_safe(tmp_path):
+    """Fix 1b: 遇到语法错误的文件时安全返回，不抛异常"""
+    import agent as _a
+
+    (tmp_path / "broken.py").write_text("def foo(:\n    pass\n")
+    plan = {"files": [{"filename": "broken.py"}]}
+    result = _a._scan_import_mismatches(plan, str(tmp_path))
+    assert result == []
+
+
+def test_contract_block_empty_when_no_contract():
+    """Fix 2b: symbol_contract 为空时 _contract_block 为空字符串（通过源码注入点断言）"""
+    import agent as _a
+    import inspect
+    src = inspect.getsource(_a.code)
+    # 确认空 contract 分支 → ""
+    assert "if _contract else" in src or ") if _contract else" in src
+
+
+def test_scan_import_mismatches_reexport_no_false_positive(tmp_path):
+    """M-new-1: re-export（from .x import Foo）应被计入模块导出，不产生误报"""
+    import agent as _a
+
+    # base.py 通过 re-export 把 Foo 暴露给外部
+    (tmp_path / "util.py").write_text("class Foo:\n    pass\n")
+    (tmp_path / "base.py").write_text("from .util import Foo\n")   # re-export
+    (tmp_path / "parser.py").write_text("from .base import Foo\n")  # 应视为合法
+
+    plan = {"files": [
+        {"filename": "util.py"},
+        {"filename": "base.py"},
+        {"filename": "parser.py"},
+    ]}
+    result = _a._scan_import_mismatches(plan, str(tmp_path))
+    assert result == [], f"re-export 应被识别为合法导出，但报了误报: {result}"
+
+
+def test_scan_import_mismatches_try_conditional_def_no_false_positive(tmp_path):
+    """M-new-2: try/if 块内的模块级定义应被收集，不产生误报"""
+    import agent as _a
+
+    # try 块内定义（常见兜底实现模式）
+    (tmp_path / "compat.py").write_text(
+        "try:\n"
+        "    class FastParser:\n"
+        "        pass\n"
+        "except ImportError:\n"
+        "    class FastParser:\n"
+        "        pass\n"
+    )
+    # if 块内定义（条件平台实现）
+    (tmp_path / "platform_util.py").write_text(
+        "import sys\n"
+        "if sys.platform == 'win32':\n"
+        "    def get_path(): return 'C:\\\\'\n"
+        "else:\n"
+        "    def get_path(): return '/'\n"
+    )
+    (tmp_path / "parser.py").write_text(
+        "from .compat import FastParser\n"
+        "from .platform_util import get_path\n"
+    )
+
+    plan = {"files": [
+        {"filename": "compat.py"},
+        {"filename": "platform_util.py"},
+        {"filename": "parser.py"},
+    ]}
+    result = _a._scan_import_mismatches(plan, str(tmp_path))
+    assert result == [], f"try/if 块内定义应被识别为合法导出，但报了误报: {result}"
+
+
+def test_scan_import_mismatches_level2_relative_import(tmp_path):
+    """level=2 多级相对 import（from ..module import X）应正确解析"""
+    import agent as _a
+    import os
+
+    # 结构：pkg/sub/parser.py  从  pkg/errors.py  导入
+    pkg = tmp_path / "pkg"
+    sub = pkg / "sub"
+    sub.mkdir(parents=True)
+    (pkg / "errors.py").write_text("class MiniError(Exception): pass\n")
+    (sub / "parser.py").write_text("from ..errors import MiniError\n")  # level=2
+
+    plan = {"files": [
+        {"filename": os.path.join("pkg", "errors.py")},
+        {"filename": os.path.join("pkg", "sub", "parser.py")},
+    ]}
+    result = _a._scan_import_mismatches(plan, str(tmp_path))
+    assert result == [], f"level=2 相对 import 应正确解析，但报了误报: {result}"
+
+
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, "-v"])
