@@ -2053,6 +2053,148 @@ def test_parse_plan_windows_path_normalization():
     assert ok, f"路径归一化后仅 1 新文件，应 ok=True，err={err}"
 
 
+# ---------------------------------------------------------------------------
+# _render_contract — methods dict 格式（R5 新增）
+# ---------------------------------------------------------------------------
+
+def test_render_contract_methods_dict_format():
+    """dict 格式 methods 渲染为带参数的签名 register_csv(table_name, path)。"""
+    contract = {
+        "catalog.py": {
+            "Catalog": {
+                "methods": [{"name": "register_csv", "params": ["table_name", "path"]}]
+            }
+        }
+    }
+    result = agent._render_contract(contract)
+    assert "register_csv(table_name, path)" in result, f"应渲染完整签名: {result}"
+
+
+def test_render_contract_methods_str_backward_compat():
+    """字符串格式 methods 仍正常渲染（向后兼容）。"""
+    contract = {"mod.py": {"Foo": {"methods": ["query"]}}}
+    result = agent._render_contract(contract)
+    assert "query" in result, f"字符串 methods 应仍渲染: {result}"
+
+
+def test_render_contract_methods_mixed_list():
+    """混合列表（dict + string）正常渲染，不抛异常。"""
+    contract = {
+        "mod.py": {
+            "Bar": {
+                "methods": [
+                    {"name": "run", "params": ["x"]},
+                    "stop"
+                ]
+            }
+        }
+    }
+    result = agent._render_contract(contract)
+    assert "run(x)" in result
+    assert "stop" in result
+
+
+# ---------------------------------------------------------------------------
+# _scan_member_mismatches — arity 检测（R5 新增）
+# ---------------------------------------------------------------------------
+
+def _make_arity_plan(workspace, contract, caller_src, callee_src):
+    """辅助：写 catalog.py(定义) + main.py(调用) 到 tmp workspace。"""
+    import os
+    os.makedirs(os.path.join(workspace, "miniql"), exist_ok=True)
+    with open(os.path.join(workspace, "miniql", "catalog.py"), "w", encoding="utf-8") as f:
+        f.write(callee_src)
+    with open(os.path.join(workspace, "miniql", "main.py"), "w", encoding="utf-8") as f:
+        f.write(caller_src)
+    plan = {
+        "symbol_contract": contract,
+        "files": [
+            {"filename": os.path.join("miniql", "catalog.py")},
+            {"filename": os.path.join("miniql", "main.py")},
+        ]
+    }
+    return plan
+
+
+def test_scan_member_arity_detects_mismatch(tmp_path):
+    """契约声明 register_csv 2参，调用端传1参 → 报 arity 缺口。"""
+    contract = {
+        "miniql/catalog.py": {
+            "Catalog": {"methods": [{"name": "register_csv", "params": ["table_name", "path"]}]}
+        }
+    }
+    callee = "class Catalog:\n    def register_csv(self, table_name, path): pass\n"
+    caller = "from miniql.catalog import Catalog\ncatalog = Catalog()\ncatalog.register_csv(csv_path)\n"
+    plan = _make_arity_plan(str(tmp_path), contract, caller, callee)
+    result = agent._scan_member_mismatches(plan, str(tmp_path), error_info="")
+    arity_issues = [r for r in result if "arity" in str(r[3]).lower()]
+    assert arity_issues, f"应检出 arity 缺口，实际: {result}"
+
+
+def test_scan_member_arity_passes_correct(tmp_path):
+    """契约声明 register_csv 2参，调用端也传2参 → 不报。"""
+    contract = {
+        "miniql/catalog.py": {
+            "Catalog": {"methods": [{"name": "register_csv", "params": ["table_name", "path"]}]}
+        }
+    }
+    callee = "class Catalog:\n    def register_csv(self, table_name, path): pass\n"
+    caller = "catalog.register_csv(table_name, csv_path)\n"
+    plan = _make_arity_plan(str(tmp_path), contract, caller, callee)
+    result = agent._scan_member_mismatches(plan, str(tmp_path), error_info="")
+    arity_issues = [r for r in result if "arity" in str(r[3]).lower()]
+    assert not arity_issues, f"参数数量正确不应误报: {result}"
+
+
+def test_scan_member_arity_skips_starred_args(tmp_path):
+    """调用端含 *args 时跳过 arity 检测（避免误报）。"""
+    contract = {
+        "miniql/catalog.py": {
+            "Catalog": {"methods": [{"name": "register_csv", "params": ["table_name", "path"]}]}
+        }
+    }
+    callee = "class Catalog:\n    def register_csv(self, table_name, path): pass\n"
+    caller = "catalog.register_csv(*args)\n"
+    plan = _make_arity_plan(str(tmp_path), contract, caller, callee)
+    result = agent._scan_member_mismatches(plan, str(tmp_path), error_info="")
+    arity_issues = [r for r in result if "arity" in str(r[3]).lower()]
+    assert not arity_issues, f"*args 调用不应报 arity: {result}"
+
+
+def test_scan_member_arity_skips_double_starred_args(tmp_path):
+    """调用端含 **kwargs 时跳过 arity 检测（避免误报）。"""
+    contract = {
+        "miniql/catalog.py": {
+            "Catalog": {"methods": [{"name": "register_csv", "params": ["table_name", "path"]}]}
+        }
+    }
+    callee = "class Catalog:\n    def register_csv(self, table_name, path): pass\n"
+    caller = "catalog.register_csv(**opts)\n"
+    plan = _make_arity_plan(str(tmp_path), contract, caller, callee)
+    result = agent._scan_member_mismatches(plan, str(tmp_path), error_info="")
+    arity_issues = [r for r in result if "arity" in str(r[3]).lower()]
+    assert not arity_issues, f"**kwargs 调用不应报 arity: {result}"
+
+
+def test_scan_member_method_pool_from_dict_methods(tmp_path):
+    """dict 格式 methods 正确提取 name 到 method_pool，方法名检查不退化。"""
+    contract = {
+        "miniql/catalog.py": {
+            "Catalog": {"methods": [{"name": "query", "params": ["sql"]}]}
+        }
+    }
+    callee = "class Catalog:\n    def query(self, sql): pass\n"
+    # 调用错误方法名 queryx，且 error_info 有报
+    caller = "catalog.queryx(sql)\n"
+    plan = _make_arity_plan(str(tmp_path), contract, caller, callee)
+    result = agent._scan_member_mismatches(
+        plan, str(tmp_path),
+        error_info="has no attribute 'queryx'"
+    )
+    name_issues = [r for r in result if "query" in str(r[3])]
+    assert name_issues, f"错误方法名 queryx 应被检出（回归测试）: {result}"
+
+
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, "-v"])

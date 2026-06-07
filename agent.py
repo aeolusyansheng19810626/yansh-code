@@ -1903,7 +1903,7 @@ Principles:
 - **Multi-file new projects (≥3 new files, critical)**: before listing files, FIRST establish a cross-file symbol contract. Use the **member-level dict format** for the `symbol_contract` field. Two layers MUST both be covered:
   1. **Export names** (class/function/variable names imported by other modules) — prevents ImportError. **函数与类都必须列**：真实失败——`analyzer.py` 仅定义 `class Analyzer`，调用方写 `from analyzer import analyze`（函数），ImportError。凡被跨文件 import 的顶层函数，按确切函数名列入 exports；import 名须与实现端定义种类（函数/类）完全一致，不可 import 一个不存在的函数名。
   2. **Class-internal member names** (enum members like `TokenType.IDENTIFIER`, dataclass fields like `node.cond`, `node.then_block`) — prevents AttributeError at runtime. Import works fine but execution crashes silently if these are misnamed. For every Enum class and every dataclass whose fields are accessed by another file, enumerate ALL accessed member/field names in the contract.
-  3. **Cross-file method names** — for any class whose methods are *called from another file* (e.g. `executor.py` calls `evaluator.evaluate()`), enumerate the exact public method name(s) under `methods`. Real failure: `expression.py` defined `ExprEvaluator.evaluate()` but `executor.py` called `.eval()` — import succeeded, runtime AttributeError. List every method name that will be called across file boundaries.
+  3. **Cross-file method names** — for any class whose methods are *called from another file* (e.g. `executor.py` calls `evaluator.evaluate()`), enumerate the exact public method name(s) under `methods`. Use `{"name": "method_name", "params": ["arg1", "arg2"]}` dict format (params excludes self) to also fix parameter-count mismatches. Real failures: (a) `expression.py` defined `ExprEvaluator.evaluate()` but `executor.py` called `.eval()` — AttributeError; (b) `catalog.py` defined `register_csv(self, path)` (1 param) but `__main__.py` called `register_csv(table_name, csv_path)` (2 params) — TypeError. Both failures are prevented by listing the exact method signature in the contract.
   Real failure examples: (a) `token.py` defined `TokenType.IDENTIFIER` but `parser.py` wrote `TokenType.IDENT` — import succeeded, runtime crashed. (b) `analyzer.py` defined `class Analyzer` but `main.py` wrote `from analyzer import analyze` — ImportError. These are the #1 and #2 failure modes for multi-file generated packages.
 
 Always respond in Chinese (用户的项目规则要求中文回复).
@@ -2297,10 +2297,10 @@ You are a code-planning assistant. Given the user requirement, return a plan str
 
 symbol_contract value 支持两种格式（向后兼容）：
 - 扁平列表：`["Foo", "bar"]`（仅记录导出名，适合无内部成员引用的简单场景）
-- 成员级 dict（推荐，≥3 文件的新建项目必须用此格式）：`{{"ClassName": {{"fields": [...], "members": [...], "methods": [...]}}}}`
+- 成员级 dict（推荐，≥3 文件的新建项目必须用此格式）：`{{"ClassName": {{"fields": [...], "members": [...], "methods": [{{"name": "do", "params": ["x", "y"]}}]}}}}`（methods 项也可为纯字符串，向后兼容）
   - `fields`：其他文件会以 `obj.field` 访问的 dataclass/类实例属性名
   - `members`：其他文件会以 `EnumType.MEMBER` 访问的枚举成员名
-  - `methods`：其他文件会以 `obj.method(...)` 调用的跨文件方法名（如 `ExprEvaluator.evaluate`）
+  - `methods`：跨文件调用的方法。每项为 `{{"name": "register_csv", "params": ["table_name", "path"]}}` dict（推荐，params 不含 self）或纯字符串（向后兼容）。列出 params 可防止调用端参数数量不对齐。
   - 纯函数/变量用 `{{}}` 作为占位值，例：`{{"analyze": {{}}}}`（被其他文件 import 的顶层函数也必须作为 key 出现，否则易漏列函数型导出 → ImportError）
 
 Full example（多文件语言解释器）：
@@ -2406,7 +2406,7 @@ def _parse_plan_with_status(content: str, existing_files=None):
                 f"缺失 symbol_contract：本计划新建 {len(new_files)} 个文件（≥3），"
                 "symbol_contract 为 MANDATORY 字段，请重新输出包含 symbol_contract 的完整 plan。"
                 "用成员级 dict 格式列出所有跨文件 import 的类名、函数名、枚举成员、dataclass 字段、跨文件方法名。"
-                "示例：{\"analyzer.py\": {\"analyze\": {}, \"Analyzer\": {\"methods\": [\"run\"]}}}"
+                "示例：{\"analyzer.py\": {\"analyze\": {}, \"Analyzer\": {\"methods\": [{\"name\": \"run\", \"params\": [\"path\"]}]}}}"
             )
 
     return True, out, None
@@ -3381,6 +3381,13 @@ def _scan_contract_export_mismatches(plan, workspace):
     return mismatches
 
 
+def _method_entry(m):
+    """归一化 methods 列表项：dict 返回 (name, params|None)，字符串返回 (name, None)。"""
+    if isinstance(m, dict):
+        return m.get("name", ""), m.get("params") if isinstance(m.get("params"), list) else None
+    return str(m), None
+
+
 def _render_contract(contract):
     """渲染 symbol_contract 为人类可读的 sys_prompt 注入块（模块级，便于测试）。
     兼容旧扁平列表格式和新成员级 dict 格式。"""
@@ -3402,7 +3409,11 @@ def _render_contract(contract):
                     if details.get("members"):
                         parts.append(f"members={', '.join(details['members'])}")
                     if details.get("methods"):
-                        parts.append(f"methods={', '.join(details['methods'])}")
+                        rendered = []
+                        for m in details["methods"]:
+                            name, params = _method_entry(m)
+                            rendered.append(f"{name}({', '.join(params)})" if params is not None else name)
+                        parts.append(f"methods={', '.join(rendered)}")
                     lines.append(f"    {cls_name}({'; '.join(parts)})")
     lines.append("使用跨模块符号时必须严格引用上表名字；禁止同义词（如契约写 value 则不能写 initializer，写 IDENTIFIER 则不能写 IDENT，写 evaluate 则不能写 eval）。")
     return "\n".join(lines)
@@ -3439,7 +3450,8 @@ def _scan_member_mismatches(plan, workspace, error_info=""):
         "left_operand": "left", "right_operand": "right", "operator": "op",
     }
 
-    method_pool: set = set()   # 所有契约 methods 名集合（跨类合并），用于 error_info 激活
+    method_pool: set = set()    # 所有契约 methods 名集合（跨类合并），用于 error_info 激活
+    method_arity: dict = {}     # {method_name: param_count}（仅 dict 格式项有值）
     for mod_val in contract.values():
         if not isinstance(mod_val, dict):
             continue
@@ -3450,8 +3462,12 @@ def _scan_member_mismatches(plan, workspace, error_info=""):
                 enum_members[cls_name] = set(details["members"])
             if details.get("fields"):
                 field_names.update(details["fields"])
-            if details.get("methods"):
-                method_pool.update(details["methods"])
+            for m in details.get("methods", []):
+                name, params = _method_entry(m)
+                if name:
+                    method_pool.add(name)
+                    if params is not None:
+                        method_arity[name] = len(params)
 
     if not enum_members and not field_names and not method_pool:
         return []
@@ -3511,29 +3527,45 @@ def _scan_member_mismatches(plan, workspace, error_info=""):
                     if isinstance(node.ctx, _ast_mod.Load):
                         missing.append((fname, lineno, f"<obj>.{attr}", authority))
 
-        # 3. 方法调用检查（严格保守：仅在 error_info AttributeError 中出现且不在 method_pool 时报）
-        # 不绑定对象类型（`evaluator.eval()` 里不知道 evaluator 的类型），全局扫描会大量误报。
-        # error_info 触发机制：只检查「运行时已报了 has no attribute 'xxx'」且 xxx 不在 method_pool 的方法名。
-        if method_pool and _active_synonyms:
+        # 3. 方法调用检查
+        # 3a. 方法名错误：仅在 error_info AttributeError 中出现且不在 method_pool 时报（保守）
+        # 3b. 参数数量错误：契约有 arity 信息时主动扫描，不依赖 error_info（签名级问题不先抛 AttributeError）
+        if method_pool and (_active_synonyms or method_arity):
             for node in _ast_mod.walk(tree):
                 if not isinstance(node, _ast_mod.Call):
                     continue
                 if not isinstance(node.func, _ast_mod.Attribute):
                     continue
                 attr = node.func.attr
-                if attr not in _active_synonyms:
-                    continue  # error_info 未报此属性，跳过
+                lineno = getattr(node.func, "lineno", 0)
+
                 if attr in method_pool:
-                    continue  # 已是契约正确方法名，无问题
-                # attr 不在 method_pool，说明是错误方法名，找最接近的契约方法名作为权威
+                    # 3b. 参数数量检测：契约声明了 arity 且调用端实参数不符时报
+                    if attr in method_arity and not any(
+                        isinstance(a, _ast_mod.Starred) for a in node.args
+                    ) and not any(k.arg is None for k in node.keywords):
+                        # *args 守卫：Starred in node.args；**kwargs 守卫：keyword.arg is None
+                        n_call = len(node.args) + len(node.keywords)
+                        n_contract = method_arity[attr]
+                        if n_call != n_contract:
+                            params_str = f"{attr}({', '.join(['...'] * n_contract)})"
+                            missing.append((
+                                fname, lineno,
+                                f"<obj>.{attr}({n_call} args)",
+                                f"[arity] 契约声明 {n_contract} 参：{params_str}，调用端传了 {n_call} 个"
+                            ))
+                    continue  # 方法名正确，跳过名称检查
+
+                # 3a. 方法名错误（依赖 error_info 激活）
+                if attr not in _active_synonyms:
+                    continue
                 authority = next(
                     (m for m in method_pool if m.lower() == attr.lower()), None
                 ) or next(
                     (m for m in method_pool if m.startswith(attr[:3]) or attr.startswith(m[:3])), None
                 )
                 if authority is None and method_pool:
-                    authority = f"（候选：{', '.join(sorted(method_pool))}）"  # 兜底：列全部候选
-                lineno = getattr(node.func, "lineno", 0)
+                    authority = f"（候选：{', '.join(sorted(method_pool))}）"
                 missing.append((fname, lineno, f"<obj>.{attr}()", f"[疑似] → 契约方法名：{authority}"))
 
     return missing
