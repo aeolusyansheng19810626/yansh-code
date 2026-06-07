@@ -2359,6 +2359,7 @@ symbol_contract value 支持两种格式（向后兼容）：
   - `members`：其他文件会以 `EnumType.MEMBER` 访问的枚举成员名
   - `methods`：跨文件调用的方法。每项为 `{{"name": "register_csv", "params": ["table_name", "path"]}}` dict（推荐，params 不含 self）或纯字符串（向后兼容）。列出 params 可防止调用端参数数量不对齐。
   - 纯函数/变量用 `{{}}` 作为占位值，例：`{{"analyze": {{}}}}`（被其他文件 import 的顶层函数也必须作为 key 出现，否则易漏列函数型导出 → ImportError）
+  - **被多处调用的模块级函数强烈建议声明签名**：`{{"build_logical_plan": {{"params": ["resolved", "catalog"]}}}}`（params 不含 self，**只列必填参数——有默认值的省略**，否则会误报 arity）。系统据此检测各调用点 arity 是否一致——真实失败：`build_logical_plan` 定义 2 参，`__main__.py` 调 1 参、测试调 2 参，三处不一致致 fixer 反复横跳改不好。声明 params 后所有调用点会被强制统一到此签名。
 
 Full example（多文件语言解释器）：
 {{"symbol_contract": {{"mini/ast_nodes.py": {{"LetDecl": {{"fields": ["name", "value"]}}, "IfStmt": {{"fields": ["cond", "then_block", "else_block"]}}, "BinaryOp": {{"fields": ["left", "op", "right"]}}}}, "mini/token.py": {{"TokenType": {{"members": ["IDENTIFIER", "INT", "FLOAT", "STRING", "PLUS", "MINUS", "STAR", "SLASH", "EOF"]}}}}}}, "files": [{{"filename": "mini/parser.py", "description": "recursive descent parser", "expected_edits": 8}}], "test_command": "pytest tests/"}}
@@ -3471,6 +3472,7 @@ def _scan_member_mismatches(plan, workspace, error_info=""):
 
     method_pool: set = set()    # 所有契约 methods 名集合（跨类合并），用于 error_info 激活
     method_arity: dict = {}     # {method_name: param_count}（仅 dict 格式项有值）
+    func_arity: dict = {}       # {func_name: param_count} 模块级裸函数签名（顶层项含 params）
     for mod_val in contract.values():
         if not isinstance(mod_val, dict):
             continue
@@ -3481,6 +3483,12 @@ def _scan_member_mismatches(plan, workspace, error_info=""):
                 enum_members[cls_name] = set(details["members"])
             if details.get("fields"):
                 field_names.update(details["fields"])
+            # 顶层裸函数签名：details 含 params 且无 class 成员（methods/fields/members）→ cls_name 是函数名
+            if (isinstance(details.get("params"), list)
+                    and not details.get("methods")
+                    and not details.get("fields")
+                    and not details.get("members")):
+                func_arity[cls_name] = len(details["params"])
             for m in details.get("methods", []):
                 name, params = _method_entry(m)
                 if name:
@@ -3488,7 +3496,7 @@ def _scan_member_mismatches(plan, workspace, error_info=""):
                     if params is not None:
                         method_arity[name] = len(params)
 
-    if not enum_members and not field_names and not method_pool:
+    if not enum_members and not field_names and not method_pool and not func_arity:
         return []
 
     # dataclass 字段检查的触发集合：只含在 error_info AttributeError 中出现过的属性名
@@ -3546,13 +3554,33 @@ def _scan_member_mismatches(plan, workspace, error_info=""):
                     if isinstance(node.ctx, _ast_mod.Load):
                         missing.append((fname, lineno, f"<obj>.{attr}", authority))
 
-        # 3. 方法调用检查
+        # 3. 方法/函数调用检查
         # 3a. 方法名错误：仅在 error_info AttributeError 中出现且不在 method_pool 时报（保守）
-        # 3b. 参数数量错误：契约有 arity 信息时主动扫描，不依赖 error_info（签名级问题不先抛 AttributeError）
-        if method_pool and (_active_synonyms or method_arity):
+        # 3b. 方法参数数量错误：契约有 arity 信息时主动扫描，不依赖 error_info（签名级问题不先抛 AttributeError）
+        # 3c. 模块级裸函数 f(args) 参数数量错误：func_arity 有声明时主动扫描（多调用点 arity 不一致根因）
+        if (method_pool and (_active_synonyms or method_arity)) or func_arity:
             for node in _ast_mod.walk(tree):
                 if not isinstance(node, _ast_mod.Call):
                     continue
+
+                # 3c. 裸函数调用 f(args)：node.func 是 Name
+                if isinstance(node.func, _ast_mod.Name):
+                    fn = node.func.id
+                    if (fn in func_arity
+                            and not any(isinstance(a, _ast_mod.Starred) for a in node.args)
+                            and not any(k.arg is None for k in node.keywords)):
+                        n_call = len(node.args) + len(node.keywords)
+                        n_def = func_arity[fn]
+                        if n_call != n_def:
+                            lineno = getattr(node.func, "lineno", 0)
+                            sig = f"{fn}({', '.join(['...'] * n_def)})"
+                            missing.append((
+                                fname, lineno, f"{fn}({n_call} args)",
+                                f"[arity] 函数签名应为 {n_def} 参 {sig} — **把所有调用点统一到此签名，"
+                                f"勿改函数定义去迁就单个调用点**；此处传了 {n_call} 个"
+                            ))
+                    continue
+
                 if not isinstance(node.func, _ast_mod.Attribute):
                     continue
                 attr = node.func.attr
@@ -3719,17 +3747,25 @@ def fix(test_result, plan, reason="test_failure", baseline_failures=None,
                 "由用户判断是否单独立项；不要读测试文件再去揣摩，归属规则已足够定性。\n\n"
                 "**严禁通过弱化测试断言（加 `or` 子句、改字面量、删除关键字）来让失败「过」** —— 这是把 bug 藏起来，不是修。"
             )
-        # [Debt 2] 跨轮 regression 警告：上一轮修改后失败数上升 → 注入震荡提示
+        # [Debt 2 / R8] 跨轮 regression 警告：失败数上升 → 注入震荡提示。
+        # R8 修：注入条件不再硬依赖 prev_changed 非空——震荡时 fixer 反复改同一文件，
+        # prev_changed 累计差集恒空会把上升 regression 警告吞掉（R7 build_logical_plan 91↔1 没拦住的主因）。
+        # prev_changed 降级为可选文案：有则点名具体文件，无则泛化提示。
         if (prev_fail_count is not None and cur_fail_count is not None
-                and cur_fail_count > prev_fail_count and prev_changed):
+                and cur_fail_count > prev_fail_count):
+            _changed_line = (
+                f"上一轮你修改了：{', '.join(prev_changed)}\n" if prev_changed
+                else "复查你上一轮的改动——\n"
+            )
             _reg_block = (
                 f"\n\n**[⚠ 震荡警告 — 上一轮修改引入了 regression]**\n"
-                f"上一轮你修改了：{', '.join(prev_changed)}\n"
+                f"{_changed_line}"
                 f"失败数从 {prev_fail_count} 变为 {cur_fail_count}（**上升了 {cur_fail_count - prev_fail_count}**）。\n"
-                "这说明你的修改破坏了别处的逻辑。**先 read_file 仔细复查你上轮改过的这几个文件**，"
+                "这说明你的修改破坏了别处的逻辑。**先 read_file 仔细复查你上轮改过的文件**，"
                 "确认是否把其他代码依赖的接口或逻辑改坏了，再动手修。\n"
-                "⚠ 同一处代码来回反复改（A→B→A）是震荡——一旦发现，"
-                "task_complete(success=false, summary='X 与 Y 约束冲突，单方向修复会引入对方回归，需人工裁决') 结束，不要烧完剩余轮次。"
+                "⚠ 同一处代码来回反复改（A→B→A）是震荡——尤其是『一个函数被多处用不同参数个数调用』时，"
+                "**应把所有调用点统一到函数定义的签名，而不是改定义去迁就某一个调用点**（改定义会让其他调用点回归）。\n"
+                "若确认是无解的约束冲突，task_complete(success=false, summary='...需人工裁决') 结束，不要烧完剩余轮次。"
             )
             content += _reg_block
 

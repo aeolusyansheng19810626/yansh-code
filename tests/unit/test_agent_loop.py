@@ -2312,6 +2312,89 @@ def test_fix_loop_invokes_compact(tmp_path, monkeypatch):
     assert spy["n"] >= 1, "fix() 每轮必须调用 _maybe_compact_messages（防 R6 漏 compact 回归）"
 
 
+def test_scan_func_arity_detects_bare_call_mismatch(tmp_path):
+    """R8: 裸函数 f(args) 调用 arity 与契约 params 不符 → 检出（覆盖 ast.Name 分支）。"""
+    contract = {"miniql/catalog.py":
+                {"build_logical_plan": {"params": ["resolved", "catalog"]}}}
+    callee = "def build_logical_plan(resolved, catalog):\n    return 1\n"
+    caller = "from miniql.catalog import build_logical_plan\nx = build_logical_plan(resolved)\n"
+    plan = _make_arity_plan(str(tmp_path), contract, caller, callee)
+    result = agent._scan_member_mismatches(plan, str(tmp_path), error_info="")
+    arity = [r for r in result if "arity" in str(r[3]).lower()]
+    assert arity, f"裸函数少传参应检出 arity 缺口: {result}"
+    assert any("统一到此签名" in str(r[3]) for r in arity), \
+        f"应给出'统一调用点'方向: {arity}"
+
+
+def test_scan_func_arity_passes_when_consistent(tmp_path):
+    """R8: 裸函数调用 arity 与契约一致 → 不报。"""
+    contract = {"miniql/catalog.py":
+                {"build_logical_plan": {"params": ["resolved", "catalog"]}}}
+    callee = "def build_logical_plan(resolved, catalog):\n    return 1\n"
+    caller = "build_logical_plan(resolved, cat)\n"
+    plan = _make_arity_plan(str(tmp_path), contract, caller, callee)
+    result = agent._scan_member_mismatches(plan, str(tmp_path), error_info="")
+    arity = [r for r in result if "arity" in str(r[3]).lower()]
+    assert not arity, f"arity 一致不应报: {result}"
+
+
+def test_scan_func_arity_skips_starred(tmp_path):
+    """R8: 裸函数调用含 *args/**kwargs → 跳过 arity 检测（避免误报）。"""
+    contract = {"miniql/catalog.py":
+                {"build_logical_plan": {"params": ["resolved", "catalog"]}}}
+    callee = "def build_logical_plan(resolved, catalog):\n    return 1\n"
+    caller = "build_logical_plan(*args)\nbuild_logical_plan(**kw)\n"
+    plan = _make_arity_plan(str(tmp_path), contract, caller, callee)
+    result = agent._scan_member_mismatches(plan, str(tmp_path), error_info="")
+    arity = [r for r in result if "arity" in str(r[3]).lower()]
+    assert not arity, f"*args/**kwargs 不应报 arity: {result}"
+
+
+def test_scan_func_arity_plain_placeholder_no_report(tmp_path):
+    """R8: 纯 {} 占位（无 params）的函数不参与 arity 检测。"""
+    contract = {"miniql/catalog.py": {"build_logical_plan": {}}}
+    callee = "def build_logical_plan(resolved, catalog):\n    return 1\n"
+    caller = "build_logical_plan(resolved)\n"  # 少参，但契约无 params 声明
+    plan = _make_arity_plan(str(tmp_path), contract, caller, callee)
+    result = agent._scan_member_mismatches(plan, str(tmp_path), error_info="")
+    arity = [r for r in result if "arity" in str(r[3]).lower()]
+    assert not arity, f"无 params 声明不应报 arity: {result}"
+
+
+def test_fix_regression_warning_injects_when_prev_changed_empty(tmp_path):
+    """R8: 失败数上升时即使 prev_changed 为空（震荡反复改同一文件）也应注入震荡警告。
+    这是 R7 build_logical_plan 91↔1 没拦住的主因——prev_changed 累计差集恒空把警告吞了。"""
+    import config, tools
+    config.set_workspace_dir(str(tmp_path))
+    tools._reinit_paths()
+
+    import agent as _a
+    captured = {}
+    orig = _a.call_llm
+
+    def mock_llm(msgs, *a, **kw):
+        if msgs and msgs[-1]["role"] == "user":
+            captured["user"] = msgs[-1]["content"]
+        return _make_response(
+            tool_calls=[("id1", "task_complete", {"success": False, "summary": "t"})])
+
+    _a.call_llm = mock_llm
+    try:
+        _a.fix(
+            {"returncode": 1, "stdout": "", "stderr": "91 failed"},
+            {"files": [{"filename": "x.py", "expected_edits": 1}]},
+            prev_changed=[],          # 空（震荡反复改同一文件的场景）
+            prev_fail_count=1,
+            cur_fail_count=91,        # 上升
+        )
+    finally:
+        _a.call_llm = orig
+
+    user_msg = captured.get("user", "")
+    assert "震荡警告" in user_msg, f"prev_changed 空但失败数上升仍应注入震荡警告: {user_msg[:300]}"
+    assert "统一到函数定义的签名" in user_msg, "应含'统一调用点到定义签名'方向引导"
+
+
 def test_maybe_compact_under_threshold_noop(monkeypatch):
     """低于阈值 → 原样返回，state 不变。"""
     state = agent._make_compact_state()
