@@ -1967,6 +1967,92 @@ def test_scan_contract_export_flat_list_format(tmp_path):
     assert "Analyzer" not in missing
 
 
+# ---------------------------------------------------------------------------
+# _parse_plan_with_status — symbol_contract 强制校验（R4 新增）
+# ---------------------------------------------------------------------------
+
+def _make_plan_json(filenames, with_contract=False):
+    """构造含指定文件的 plan JSON 字符串。"""
+    import json as _json
+    files = [{"filename": f, "description": "test", "expected_edits": 1} for f in filenames]
+    plan = {"files": files, "test_command": "pytest"}
+    if with_contract:
+        plan["symbol_contract"] = {"mod.py": {"Foo": {}}}
+    return _json.dumps(plan)
+
+
+def test_parse_plan_missing_contract_ge3_new_files():
+    """≥3 新文件且无 symbol_contract → ok=False，err 含 symbol_contract。"""
+    content = _make_plan_json(["a.py", "b.py", "c.py"])
+    ok, data, err = agent._parse_plan_with_status(content, existing_files=[])
+    assert not ok, "≥3 新文件无契约应 ok=False"
+    assert "symbol_contract" in (err or ""), f"err 应提示 symbol_contract 缺失: {err}"
+
+
+def test_parse_plan_empty_contract_dict_rejected():
+    """symbol_contract 为空 dict {} 等同缺失 → ok=False。"""
+    import json as _json
+    plan = {"files": [{"filename": f, "description": "x", "expected_edits": 1}
+                      for f in ["a.py", "b.py", "c.py"]],
+            "test_command": "pytest",
+            "symbol_contract": {}}
+    ok, data, err = agent._parse_plan_with_status(_json.dumps(plan), existing_files=[])
+    assert not ok, "symbol_contract={} 应视为缺失，ok=False"
+
+
+def test_parse_plan_with_contract_passes():
+    """≥3 新文件且有非空 symbol_contract → ok=True。"""
+    content = _make_plan_json(["a.py", "b.py", "c.py"], with_contract=True)
+    ok, data, err = agent._parse_plan_with_status(content, existing_files=[])
+    assert ok, f"带契约应 ok=True，err={err}"
+
+
+def test_parse_plan_lt3_new_files_no_contract_ok():
+    """仅 2 新文件无 symbol_contract → ok=True（小任务不强制）。"""
+    content = _make_plan_json(["a.py", "b.py"])
+    ok, data, err = agent._parse_plan_with_status(content, existing_files=[])
+    assert ok, f"2 新文件无契约应 ok=True，err={err}"
+
+
+def test_parse_plan_existing_files_deducted():
+    """3 文件但 2 个是 existing → 仅 1 新文件，不强制 symbol_contract。"""
+    content = _make_plan_json(["a.py", "b.py", "c.py"])
+    # a.py, b.py 已存在，只有 c.py 是新文件
+    ok, data, err = agent._parse_plan_with_status(
+        content, existing_files=["a.py", "b.py"])
+    assert ok, f"仅 1 新文件应 ok=True，err={err}"
+
+
+def test_parse_plan_no_existing_files_arg_skips_check():
+    """existing_files=None（旧调用，向后兼容）→ 跳过校验，≥3 新文件无契约仍 ok=True。"""
+    content = _make_plan_json(["a.py", "b.py", "c.py"])
+    ok, data, err = agent._parse_plan_with_status(content, existing_files=None)
+    assert ok, f"existing_files=None 应跳过校验，ok=True，err={err}"
+
+
+def test_parse_plan_module_only_contract_valid():
+    """symbol_contract 的模块 value 为空 dict {} → 视为有效（声明了模块，无成员细节）。"""
+    import json as _json
+    plan = {"files": [{"filename": f, "description": "x", "expected_edits": 1}
+                      for f in ["a.py", "b.py", "c.py"]],
+            "test_command": "pytest",
+            "symbol_contract": {"mod.py": {}}}  # value 是空 dict，但 contract 本身非空
+    ok, data, err = agent._parse_plan_with_status(_json.dumps(plan), existing_files=[])
+    assert ok, f"契约含模块声明（value=空dict）应视为有效，ok=True，err={err}"
+
+
+def test_parse_plan_windows_path_normalization():
+    """existing_files 含反斜杠路径，plan filename 含正斜杠 → 正确去重（Windows 路径兼容）。"""
+    import os
+    # existing: Windows 风格反斜杠
+    existing = [os.path.join("sub", "a.py"), os.path.join("sub", "b.py")]
+    # plan: 正斜杠
+    content = _make_plan_json(["sub/a.py", "sub/b.py", "sub/c.py"])
+    ok, data, err = agent._parse_plan_with_status(content, existing_files=existing)
+    # 只有 c.py 是新文件（1 个），不强制 symbol_contract
+    assert ok, f"路径归一化后仅 1 新文件，应 ok=True，err={err}"
+
+
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, "-v"])

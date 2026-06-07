@@ -821,8 +821,8 @@ def _call_with_json_retry(stage, messages, parser_fn,
         retry_messages = list(messages)
     else:
         fix_prompt = (
-            f"上一轮你的输出无法被解析为合法 JSON。请仅输出合法 JSON（无多余说明、无 markdown 围栏）。\n"
-            f"错误：{err}\n"
+            f"上一轮输出存在问题，请修正后重新输出完整合法 JSON（无多余说明、无 markdown 围栏）。\n"
+            f"问题：{err}\n"
             f"前次输出（截断）：\n{_truncate(content)}"
         )
         retry_messages = list(messages) + [
@@ -2309,7 +2309,7 @@ Full example（多文件语言解释器）：
 Field constraints:
 - Each files entry requires filename; description describes the change intent (no full code)
 - For existing files, only describe what to append/modify — do not recreate
-- **symbol_contract** (MANDATORY when ≥3 new files are being created): authoritative source of truth for all cross-file symbol names.
+- **symbol_contract** (MANDATORY when ≥3 new files are being created; **系统会硬校验，缺失将被自动拒绝并要求重新生成**): authoritative source of truth for all cross-file symbol names.
   - **Must include class-internal members** when another file accesses them: enum members (`TokenType.IDENTIFIER`), dataclass fields (`node.value`, `node.cond`), and **cross-file method calls** (`ExprEvaluator.evaluate`). Omitting these causes AttributeError at runtime — import works but execution crashes.
   - Coder and fixer MUST use exact names from this contract — never inventing synonyms (e.g. if contract says `value`, never write `initializer`; if contract says `IDENTIFIER`, never write `IDENT`).
   - Single-file or pure-modification tasks may omit this field.
@@ -2339,8 +2339,11 @@ Note: do not recreate existing files; prefer incremental changes. For existing f
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_content}
     ]
+    from functools import partial as _partial
+    _plan_parser = _partial(_parse_plan_with_status,
+                            existing_files=ws_files.get("files", []))
     plan_result = _call_with_json_retry(
-        "plan", messages, _parse_plan_with_status,
+        "plan", messages, _plan_parser,
         response_format={"type": "json_object"},
     )
     # [P1 #5] 把 explorer summary 持久化到 plan_result，让 coder 阶段也能读到
@@ -2350,8 +2353,12 @@ Note: do not recreate existing files; prefer incremental changes. For existing f
     return plan_result
 
 
-def _parse_plan_with_status(content: str):
-    """返回 (ok, plan_dict, err_msg)。retry 包装用此版本；旧 _parse_plan_response 委托到这里。"""
+def _parse_plan_with_status(content: str, existing_files=None):
+    """返回 (ok, plan_dict, err_msg)。retry 包装用此版本；旧 _parse_plan_response 委托到这里。
+
+    existing_files: 当前 workspace 已有文件的相对路径列表（来自 list_files()）。
+    传入时对 ≥3 新文件的 plan 强制校验 symbol_contract 是否存在；None 时跳过（向后兼容）。
+    """
     if not content.strip():
         return False, {"files": [], "test_command": ""}, "LLM 返回空内容"
     extracted = _extract_json(content)
@@ -2383,6 +2390,25 @@ def _parse_plan_with_status(content: str):
     sc = getattr(validated, "symbol_contract", None) or raw.get("symbol_contract")
     if isinstance(sc, dict):
         out["symbol_contract"] = sc
+
+    # 后置校验：≥3 新文件时 symbol_contract 为 MANDATORY（系统硬校验）
+    if existing_files is not None:
+        existing_norm = {os.path.normpath(f) for f in existing_files}
+        new_files = [
+            f for f in files_out
+            if os.path.normpath(
+                f.get("filename", f) if isinstance(f, dict) else f
+            ) not in existing_norm
+        ]
+        sc_val = out.get("symbol_contract")
+        if len(new_files) >= 3 and not (isinstance(sc_val, dict) and sc_val):
+            return False, out, (
+                f"缺失 symbol_contract：本计划新建 {len(new_files)} 个文件（≥3），"
+                "symbol_contract 为 MANDATORY 字段，请重新输出包含 symbol_contract 的完整 plan。"
+                "用成员级 dict 格式列出所有跨文件 import 的类名、函数名、枚举成员、dataclass 字段、跨文件方法名。"
+                "示例：{\"analyzer.py\": {\"analyze\": {}, \"Analyzer\": {\"methods\": [\"run\"]}}}"
+            )
+
     return True, out, None
 
 
