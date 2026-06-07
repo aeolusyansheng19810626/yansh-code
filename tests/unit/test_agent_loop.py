@@ -1828,6 +1828,145 @@ def test_scan_import_always_active_without_import_error(tmp_path):
         f"主动扫描应发现 MissingName 缺口（不依赖 ImportError 触发）: {user_msg[:400]}"
 
 
+# ---------------------------------------------------------------------------
+# _scan_import_mismatches — 绝对 import 检测（R3 新增）
+# ---------------------------------------------------------------------------
+
+def test_scan_import_absolute_detects_missing(tmp_path):
+    """绝对 import（level==0）且目标文件在 plan 内时，缺失名应被检出。"""
+    # analyzer.py 只有 class Analyzer，无 analyze 函数
+    analyzer = tmp_path / "analyzer.py"
+    analyzer.write_text("class Analyzer:\n    pass\n", encoding="utf-8")
+    # main.py 用绝对 import: from miniql.analyzer import analyze
+    main = tmp_path / "main.py"
+    main.write_text("from miniql.analyzer import analyze\n", encoding="utf-8")
+
+    import os
+    plan = {
+        "files": [
+            {"filename": "analyzer.py"},
+            {"filename": os.path.join("miniql", "analyzer.py")},
+            {"filename": "main.py"},
+        ]
+    }
+    # 把 analyzer.py 也放进 miniql/ 子目录（匹配绝对路径）
+    miniql_dir = tmp_path / "miniql"
+    miniql_dir.mkdir()
+    (miniql_dir / "analyzer.py").write_text("class Analyzer:\n    pass\n", encoding="utf-8")
+
+    result = agent._scan_import_mismatches(plan, str(tmp_path))
+    missing_names = [r[2] for r in result]
+    assert "analyze" in missing_names, f"应检出 analyze 缺失，实际: {result}"
+
+
+def test_scan_import_absolute_strip_package_prefix(tmp_path):
+    """plan 文件名无顶层包名前缀（analyzer.py），但 import 写 from miniql.analyzer import X，应仍能命中。"""
+    analyzer = tmp_path / "analyzer.py"
+    analyzer.write_text("class Analyzer:\n    pass\n", encoding="utf-8")
+    main = tmp_path / "main.py"
+    main.write_text("from miniql.analyzer import analyze\n", encoding="utf-8")
+
+    plan = {
+        "files": [
+            {"filename": "analyzer.py"},
+            {"filename": "main.py"},
+        ]
+    }
+    result = agent._scan_import_mismatches(plan, str(tmp_path))
+    missing_names = [r[2] for r in result]
+    assert "analyze" in missing_names, f"去顶层包名后应命中 analyzer.py 并检出 analyze: {result}"
+
+
+def test_scan_import_absolute_no_false_positive_stdlib(tmp_path):
+    """标准库 / 外部库绝对 import 不在 plan 内，不应误报。"""
+    main = tmp_path / "main.py"
+    main.write_text("from os import path\nimport pytest\nfrom collections import OrderedDict\n",
+                    encoding="utf-8")
+    plan = {"files": [{"filename": "main.py"}]}
+    result = agent._scan_import_mismatches(plan, str(tmp_path))
+    assert result == [], f"外部库 import 不应误报，实际: {result}"
+
+
+def test_scan_import_relative_regression_after_absolute_fix(tmp_path):
+    """放开 level==0 后，原 relative import（level==1）行为不退化。"""
+    errors_py = tmp_path / "errors.py"
+    errors_py.write_text("class RuntimeError_:\n    pass\n", encoding="utf-8")
+    caller = tmp_path / "caller.py"
+    caller.write_text("from .errors import RuntimeError\n", encoding="utf-8")
+
+    plan = {
+        "files": [
+            {"filename": "errors.py"},
+            {"filename": "caller.py"},
+        ]
+    }
+    result = agent._scan_import_mismatches(plan, str(tmp_path))
+    missing_names = [r[2] for r in result]
+    assert "RuntimeError" in missing_names, f"相对 import 缺失应仍被检出: {result}"
+
+
+# ---------------------------------------------------------------------------
+# _scan_contract_export_mismatches（R3 新增）
+# ---------------------------------------------------------------------------
+
+def test_scan_contract_export_finds_missing(tmp_path):
+    """契约声明 analyze，但文件只有 class Analyzer → 检出缺口。"""
+    analyzer = tmp_path / "analyzer.py"
+    analyzer.write_text("class Analyzer:\n    pass\n", encoding="utf-8")
+
+    plan = {
+        "symbol_contract": {
+            "analyzer.py": {"analyze": {}, "Analyzer": {}}
+        },
+        "files": [{"filename": "analyzer.py"}]
+    }
+    result = agent._scan_contract_export_mismatches(plan, str(tmp_path))
+    missing = [name for _, name in result]
+    assert "analyze" in missing, f"analyze 缺失应被检出: {result}"
+    assert "Analyzer" not in missing, f"Analyzer 存在，不应误报: {result}"
+
+
+def test_scan_contract_export_passes_when_all_defined(tmp_path):
+    """契约声明的名称全部存在 → 返回空。"""
+    f = tmp_path / "utils.py"
+    f.write_text("def analyze():\n    pass\nclass Analyzer:\n    pass\n", encoding="utf-8")
+
+    plan = {
+        "symbol_contract": {"utils.py": {"analyze": {}, "Analyzer": {}}},
+        "files": [{"filename": "utils.py"}]
+    }
+    result = agent._scan_contract_export_mismatches(plan, str(tmp_path))
+    assert result == [], f"全部定义，应返回空: {result}"
+
+
+def test_scan_contract_export_star_import_skipped(tmp_path):
+    """含 star-import 的模块 exports unknown → 保守跳过，不误报。"""
+    f = tmp_path / "utils.py"
+    f.write_text("from other import *\n", encoding="utf-8")
+
+    plan = {
+        "symbol_contract": {"utils.py": {"analyze": {}}},
+        "files": [{"filename": "utils.py"}]
+    }
+    result = agent._scan_contract_export_mismatches(plan, str(tmp_path))
+    assert result == [], f"star-import 应保守跳过，不误报: {result}"
+
+
+def test_scan_contract_export_flat_list_format(tmp_path):
+    """契约用扁平列表格式 ['analyze', 'Analyzer']，缺失 analyze 应检出。"""
+    f = tmp_path / "analyzer.py"
+    f.write_text("class Analyzer:\n    pass\n", encoding="utf-8")
+
+    plan = {
+        "symbol_contract": {"analyzer.py": ["analyze", "Analyzer"]},
+        "files": [{"filename": "analyzer.py"}]
+    }
+    result = agent._scan_contract_export_mismatches(plan, str(tmp_path))
+    missing = [name for _, name in result]
+    assert "analyze" in missing
+    assert "Analyzer" not in missing
+
+
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, "-v"])

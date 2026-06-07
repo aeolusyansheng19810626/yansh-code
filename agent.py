@@ -1901,10 +1901,10 @@ Principles:
   list aren't necessarily out of scope** — your job is to surface these hidden dependencies.
 
 - **Multi-file new projects (≥3 new files, critical)**: before listing files, FIRST establish a cross-file symbol contract. Use the **member-level dict format** for the `symbol_contract` field. Two layers MUST both be covered:
-  1. **Export names** (class/function/variable names imported by other modules) — prevents ImportError
+  1. **Export names** (class/function/variable names imported by other modules) — prevents ImportError. **函数与类都必须列**：真实失败——`analyzer.py` 仅定义 `class Analyzer`，调用方写 `from analyzer import analyze`（函数），ImportError。凡被跨文件 import 的顶层函数，按确切函数名列入 exports；import 名须与实现端定义种类（函数/类）完全一致，不可 import 一个不存在的函数名。
   2. **Class-internal member names** (enum members like `TokenType.IDENTIFIER`, dataclass fields like `node.cond`, `node.then_block`) — prevents AttributeError at runtime. Import works fine but execution crashes silently if these are misnamed. For every Enum class and every dataclass whose fields are accessed by another file, enumerate ALL accessed member/field names in the contract.
   3. **Cross-file method names** — for any class whose methods are *called from another file* (e.g. `executor.py` calls `evaluator.evaluate()`), enumerate the exact public method name(s) under `methods`. Real failure: `expression.py` defined `ExprEvaluator.evaluate()` but `executor.py` called `.eval()` — import succeeded, runtime AttributeError. List every method name that will be called across file boundaries.
-  Real failure example: `token.py` defined `TokenType.IDENTIFIER` but `parser.py` wrote `TokenType.IDENT` — import succeeded, runtime crashed. This is the #1 failure mode for multi-file generated packages.
+  Real failure examples: (a) `token.py` defined `TokenType.IDENTIFIER` but `parser.py` wrote `TokenType.IDENT` — import succeeded, runtime crashed. (b) `analyzer.py` defined `class Analyzer` but `main.py` wrote `from analyzer import analyze` — ImportError. These are the #1 and #2 failure modes for multi-file generated packages.
 
 Always respond in Chinese (用户的项目规则要求中文回复).
 """
@@ -2301,7 +2301,7 @@ symbol_contract value 支持两种格式（向后兼容）：
   - `fields`：其他文件会以 `obj.field` 访问的 dataclass/类实例属性名
   - `members`：其他文件会以 `EnumType.MEMBER` 访问的枚举成员名
   - `methods`：其他文件会以 `obj.method(...)` 调用的跨文件方法名（如 `ExprEvaluator.evaluate`）
-  - 纯函数/变量用 `{{}}` 作为占位值
+  - 纯函数/变量用 `{{}}` 作为占位值，例：`{{"analyze": {{}}}}`（被其他文件 import 的顶层函数也必须作为 key 出现，否则易漏列函数型导出 → ImportError）
 
 Full example（多文件语言解释器）：
 {{"symbol_contract": {{"mini/ast_nodes.py": {{"LetDecl": {{"fields": ["name", "value"]}}, "IfStmt": {{"fields": ["cond", "then_block", "else_block"]}}, "BinaryOp": {{"fields": ["left", "op", "right"]}}}}, "mini/token.py": {{"TokenType": {{"members": ["IDENTIFIER", "INT", "FLOAT", "STRING", "PLUS", "MINUS", "STAR", "SLASH", "EOF"]}}}}}}, "files": [{{"filename": "mini/parser.py", "description": "recursive descent parser", "expected_edits": 8}}], "test_command": "pytest tests/"}}
@@ -3212,7 +3212,19 @@ def _scan_import_mismatches(plan, workspace):
         return names, unknown
 
     def _resolve_target(importer_fname, level, module):
-        """将相对 import 解析为相对于 workspace 的路径（含 .py 后缀）。"""
+        """将 import 解析为相对于 workspace 的路径（含 .py 后缀）。
+        level>=1：相对 import，按父目录回退解析。
+        level==0：包内绝对 import，尝试全路径 + 去顶层包名两种候选，命中 plan_files_set 才返回，否则返回 None（外部库，跳过）。
+        """
+        if level == 0:
+            parts = module.split(".")
+            candidates = [os.path.normpath(os.sep.join(parts) + ".py")]
+            if len(parts) > 1:
+                candidates.append(os.path.normpath(os.sep.join(parts[1:]) + ".py"))
+            for cand in candidates:
+                if cand in plan_files_set:
+                    return cand
+            return None  # 外部库或不在 plan，跳过
         base_dir = os.path.dirname(importer_fname)
         for _ in range(level - 1):
             base_dir = os.path.dirname(base_dir) or ""
@@ -3244,7 +3256,7 @@ def _scan_import_mismatches(plan, workspace):
         except Exception:
             continue
         for node in _ast_mod.walk(tree):
-            if not (isinstance(node, _ast_mod.ImportFrom) and node.level >= 1 and node.module):
+            if not (isinstance(node, _ast_mod.ImportFrom) and node.module):
                 continue
             target = _resolve_target(fname, node.level, node.module)
             if target is None or target not in plan_files_set:
@@ -3256,6 +3268,91 @@ def _scan_import_mismatches(plan, workspace):
                 if alias.name != "*" and alias.name not in exports:
                     missing.append((fname, target, alias.name, alias.asname))
     return missing
+
+
+def _scan_contract_export_mismatches(plan, workspace):
+    """反向校验：symbol_contract 声明的顶层导出名在实际文件中是否真的存在。
+    返回 [(module_rel_path, declared_name), ...]
+    仅报 plan 内文件、且文件已存在、且 exports 不含 star-import（unknown=False）时才判定。
+    """
+    import ast as _ast_mod
+    contract = plan.get("symbol_contract") if isinstance(plan, dict) else None
+    if not contract or not isinstance(contract, dict):
+        return []
+
+    plan_items = plan.get("files", []) if isinstance(plan, dict) else []
+    plan_files_set = {
+        os.path.normpath(p.get("filename", ""))
+        for p in plan_items
+        if isinstance(p, dict) and p.get("filename", "").endswith(".py")
+    }
+
+    def _collect_exports(fpath):
+        """返回 (names: set, unknown: bool)，与 _scan_import_mismatches 内同名函数逻辑一致。"""
+        try:
+            with open(fpath, encoding="utf-8", errors="replace") as _fh:
+                tree = _ast_mod.parse(_fh.read())
+        except Exception:
+            return set(), True
+        names: set = set()
+        unknown = False
+
+        def _scan_stmts(stmts):
+            nonlocal unknown
+            for node in stmts:
+                if isinstance(node, (_ast_mod.ClassDef, _ast_mod.FunctionDef, _ast_mod.AsyncFunctionDef)):
+                    names.add(node.name)
+                elif isinstance(node, _ast_mod.Assign):
+                    for t in node.targets:
+                        if isinstance(t, _ast_mod.Name):
+                            names.add(t.id)
+                        elif isinstance(t, (_ast_mod.Tuple, _ast_mod.List)):
+                            for elt in t.elts:
+                                if isinstance(elt, _ast_mod.Name):
+                                    names.add(elt.id)
+                elif isinstance(node, _ast_mod.ImportFrom):
+                    if any(a.name == "*" for a in node.names):
+                        unknown = True
+                    else:
+                        for a in node.names:
+                            names.add(a.asname if a.asname else a.name)
+                elif isinstance(node, (_ast_mod.If, _ast_mod.With)):
+                    _scan_stmts(getattr(node, "body", []))
+                    _scan_stmts(getattr(node, "orelse", []))
+                elif isinstance(node, _ast_mod.Try):
+                    _scan_stmts(node.body)
+                    for handler in node.handlers:
+                        _scan_stmts(handler.body)
+                    _scan_stmts(getattr(node, "orelse", []))
+                    _scan_stmts(getattr(node, "finalbody", []))
+
+        _scan_stmts(tree.body)
+        return names, unknown
+
+    mismatches = []
+    for mod_key, value in contract.items():
+        mod_path = os.path.normpath(mod_key)
+        if mod_path not in plan_files_set:
+            continue  # 不在 plan 内，跳过
+        fpath = os.path.join(workspace, mod_path)
+        if not os.path.exists(fpath):
+            continue
+        actual_names, unknown = _collect_exports(fpath)
+        if unknown:
+            continue  # star-import，保守跳过
+
+        # 提取契约声明的顶层导出名
+        if isinstance(value, list):
+            declared = list(value)
+        elif isinstance(value, dict):
+            declared = list(value.keys())
+        else:
+            continue
+
+        for name in declared:
+            if name not in actual_names:
+                mismatches.append((mod_path, name))
+    return mismatches
 
 
 def _render_contract(contract):
@@ -3481,10 +3578,24 @@ def fix(test_result, plan, reason="test_failure", baseline_failures=None,
                 )
                 for _f, _tgt, _n, _asname in _imp_issues:
                     _alias_str = f" as {_asname}" if _asname else ""
-                    _imp_block += f"  - {_f}: `from .{os.path.splitext(os.path.basename(_tgt))[0]} import {_n}{_alias_str}` — `{_n}` 在 {_tgt} 中不存在，请先 list_symbols({_tgt}) 确认正确名称\n"
+                    _tgt_mod = os.path.splitext(_tgt.replace(os.sep, "."))[0]
+                    _imp_block += f"  - {_f}: `from {_tgt_mod} import {_n}{_alias_str}` — `{_n}` 在 {_tgt} 中不存在，请先 list_symbols({_tgt}) 确认正确名称\n"
                 error_info += _imp_block
         except Exception as _scan_err:
             console.print(f"[debug] _scan_import_mismatches 失败（不影响修复）：{_scan_err}", style="dim", highlight=False)
+
+        try:
+            _ce_issues = _scan_contract_export_mismatches(plan, _get_workspace())
+            if _ce_issues:
+                _ce_block = (
+                    "\n\n**[契约导出缺口 — 以下名称在 symbol_contract 中声明但实现端无对应顶层定义]**\n"
+                    "契约是唯一真值源；若实现端用了不同名称（如 Analyzer 而非 analyze），必须把实现端改成与契约一致：\n"
+                )
+                for _mod, _declared in _ce_issues:
+                    _ce_block += f"  - {_mod}: 契约声明导出 `{_declared}`，但文件中无此顶层定义——确认是函数还是类，按契约名补齐\n"
+                error_info += _ce_block
+        except Exception as _ce_err:
+            console.print(f"[debug] _scan_contract_export_mismatches 失败（不影响修复）：{_ce_err}", style="dim", highlight=False)
 
     if reason == "review_rejection":
         content = f"Code review failed. Fix the code item-by-item per the review comments below:\n\n{error_info}\n\nPlan: {json.dumps(plan)}"
