@@ -1411,8 +1411,16 @@ def _compact_messages(msgs, keep_recent_pairs: int = 2):
     if not summary:
         return msgs
 
-    summary_msg = {"role": "system",
-                   "content": f"[历史摘要 - 旧对话已压缩] {summary}"}
+    summary_content = f"[历史摘要 - 旧对话已压缩] {summary}"
+    # 注入状态文件（若存在）：确定性恢复 agent 自维护的环境事实/签名/进度
+    _state_path = Path(_get_workspace()) / ".yansh" / "agent_state.md"
+    try:
+        _state_content = _state_path.read_text(encoding="utf-8").strip()
+        if _state_content:
+            summary_content += f"\n\n[持久状态 .yansh/agent_state.md — agent 自维护，以真实代码为准]\n{_state_content}"
+    except (FileNotFoundError, OSError):
+        pass
+    summary_msg = {"role": "system", "content": summary_content}
 
     new_msgs = head + [summary_msg]
     for p in recent_pairs:
@@ -2247,6 +2255,15 @@ _CODER_ROLE 的「禁止 write_file 整体重写」只适用于**已存在的 >1
 - 并行无依赖调用：一轮内同时 fire 多个 read/search。
 - 写工具失败会直接返回 error，不必再 read_file 确认。
 - dispatch_subagent 仅用于真正大规模独立探索；小事直接做。
+
+[状态文件 — 防遗忘锚点]
+在 `.yansh/agent_state.md` 维护一份精炼状态笔记，严格控制在 2000 字符以内：
+- **发现有效 shell 命令后立即写入**：完整命令前缀原文（如 `py -3.11 -X utf8 -m pytest`）
+- **失败命令黑名单**：会报错的前缀（如 `cd /workspace &&` 在本环境无效）
+- **跨文件关键签名**：每个模块主要类/函数签名（只写名称和参数，不写代码）
+- **当前进度锚点**：已完成的文件列表、当前卡点（一句话）
+不要写代码内容、traceback、已读文件正文——只写"指针和事实"。
+context 压缩时框架会自动把此文件重新注入，**无需手动读取**；但你负责及时更新它。
 
 [终止协议 — 必读]
 - 完成判据：真实入口跑通 + 自测全绿 + 覆盖 requirement 全部能力 → `task_complete(success=true, summary="...")`。
