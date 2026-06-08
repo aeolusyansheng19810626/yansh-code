@@ -38,7 +38,7 @@ OPENROUTER_BASE_URL = (
 )
 
 # 模型 ID（按 ICA 网关接受的格式填写，示例供参考；ID 形如 claude-opus-4-7 / claude-sonnet-4-6 / claude-haiku-4-5）
-CLAUDE_OPUS   = "claude-opus-4-7"
+CLAUDE_OPUS   = "claude-opus-4-8"
 CLAUDE_SONNET = "claude-sonnet-4-6"
 CLAUDE_HAIKU  = "claude-haiku-4-5"
 
@@ -57,7 +57,7 @@ GEMINI_BASE_URL = f"https://{_gcp_region}-aiplatform.googleapis.com/v1beta1/proj
 
 DEEPSEEK_FLASH = "deepseek/deepseek-v4-flash"
 
-TIER_TOP = CLAUDE_SONNET
+TIER_TOP = CLAUDE_OPUS  # R9: 临时切 opus-4.8 验证模型能力（跑完切回 CLAUDE_SONNET）
 
 # 主模型 + Haiku 兜底（主模型已是 Haiku 时不重复）
 QUALITY_CASCADE = [TIER_TOP] if TIER_TOP == CLAUDE_HAIKU else [TIER_TOP, CLAUDE_HAIKU]
@@ -79,6 +79,7 @@ def set_workspace_dir(path: str):
 # 按 $1M tokens 计算。show_stats 按实际调用的模型分别计费再求和
 TOKEN_PRICE_TABLE = {
     "claude-opus-4-7":             {"input": 15.0, "output": 75.0},
+    "claude-opus-4-8":             {"input": 15.0, "output": 75.0},
     "claude-sonnet-4-6":           {"input": 3.0,  "output": 15.0},
     "claude-haiku-4-5":            {"input": 1.0,  "output": 5.0},
     "google/gemini-2.5-flash":     {"input": 0.30, "output": 2.50},
@@ -113,7 +114,7 @@ _DEFAULTS = {
     "coder_rounds_per_file": 8,            # 单文件 coder loop 工具调用轮次基线
     "coder_max_rounds_per_file": 40,       # 单文件轮次硬上限（已放宽；真正兜底交给无进展熔断+费用熔断）
     "coder_edits_per_round": 3,            # 假设 LLM 平均一轮发的 edit 数（保留兼容，调度已改为按 expected_edits 计）
-    "coder_no_progress_rounds": 4,         # 连续 N 轮无有效编辑则熔断本文件
+    "coder_no_progress_rounds": 8,         # 连续 N 轮无有效编辑则熔断本文件（4→8：opus 写复杂文件前多轮 read/探索，4 轮误杀执行层）
     "parallel_max_workers": 4,             # worktree 并行编排最大并发子进程数（防 ICA 限速）
     "fix_soft_limit": 12,                  # fix loop 单次 attempt 工具轮次上限（基线）
     "fix_mechanical_error_bonus": 12,      # 检测到机械错（同类 TypeError 缺参等）时再追加的轮次
