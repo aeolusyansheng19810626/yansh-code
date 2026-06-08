@@ -1417,8 +1417,11 @@ def _compact_messages(msgs, keep_recent_pairs: int = 2):
     try:
         _state_content = _state_path.read_text(encoding="utf-8").strip()
         if _state_content:
+            _MAX_STATE = 4000  # 硬截断：防止超大状态文件抵消 compact 收益
+            if len(_state_content) > _MAX_STATE:
+                _state_content = _state_content[:_MAX_STATE] + "\n[...已截断]"
             summary_content += f"\n\n[持久状态 .yansh/agent_state.md — agent 自维护，以真实代码为准]\n{_state_content}"
-    except (FileNotFoundError, OSError):
+    except Exception:
         pass
     summary_msg = {"role": "system", "content": summary_content}
 
@@ -2263,6 +2266,7 @@ _CODER_ROLE 的「禁止 write_file 整体重写」只适用于**已存在的 >1
 - **跨文件关键签名**：每个模块主要类/函数签名（只写名称和参数，不写代码）
 - **当前进度锚点**：已完成的文件列表、当前卡点（一句话）
 不要写代码内容、traceback、已读文件正文——只写"指针和事实"。
+更新时用 `write_file` 整体重写此文件（它是小文件，每次全量覆盖即可）；**只在有新事实时才更新**，不要每轮都写。
 context 压缩时框架会自动把此文件重新注入，**无需手动读取**；但你负责及时更新它。
 
 [终止协议 — 必读]
