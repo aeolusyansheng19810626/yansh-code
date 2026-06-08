@@ -11,6 +11,20 @@ _WORKSPACE_ROOT = Path(WORKSPACE_DIR).resolve()
 
 
 # #P0_3 错误恢复闭环：标准化 error_kind 分类
+# execute_command 输出截断：保留头尾，省略中间噪音（如 pytest 逐条 PASSED 行）
+_CMD_OUTPUT_HEAD = 3000  # chars
+_CMD_OUTPUT_TAIL = 3000  # chars
+
+
+def _truncate_cmd_output(text: str) -> str:
+    if not text or len(text) <= _CMD_OUTPUT_HEAD + _CMD_OUTPUT_TAIL:
+        return text
+    omitted = len(text) - _CMD_OUTPUT_HEAD - _CMD_OUTPUT_TAIL
+    return (text[:_CMD_OUTPUT_HEAD]
+            + f"\n[... {omitted} chars truncated — middle output omitted, head/tail preserved ...]\n"
+            + text[-_CMD_OUTPUT_TAIL:])
+
+
 ERROR_KINDS = frozenset({
     "invalid_args",  # 参数格式/取值错
     "not_found",     # 文件/符号不存在
@@ -393,8 +407,8 @@ def execute_command(command, _timeout_sec=30):
         t_err.join()
 
         return {
-            "stdout": ''.join(stdout_lines),
-            "stderr": ''.join(stderr_lines),
+            "stdout": _truncate_cmd_output(''.join(stdout_lines)),
+            "stderr": _truncate_cmd_output(''.join(stderr_lines)),
             "returncode": process.returncode
         }
     except Exception as e:

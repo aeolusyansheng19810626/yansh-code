@@ -1420,7 +1420,7 @@ def _make_compact_state() -> dict:
     """auto-compact 跨轮状态（threshold/keep/thrashing 计数/disabled）。
     code() 与 fix() 各自的 LLM loop 共用，避免重复内联逻辑。"""
     return {
-        "threshold": int(_cfg("compact_threshold_tokens") or 60_000),
+        "threshold": int(_cfg("compact_threshold_tokens") or 40_000),
         "keep_pairs": int(_cfg("compact_keep_recent_pairs") or 2),
         "consecutive_over": 0,
         "max_consecutive": int(_cfg("compact_max_consecutive_over") or 4),
@@ -2233,6 +2233,7 @@ This plan is your anchor. Refer back to it; keep names consistent with it.
 - 覆盖 requirement 的关键能力路径，写进 tests/（pytest 风格，子目录测试文件顶部加 sys.path 注入三行）。
 - 自己先把测试跑绿（execute_command 跑 pytest），再 task_complete。外部还有一道 test gate 会复核，**不要弱化断言来骗过测试**——那是把 bug 藏起来。
 - 数值/范围断言：先 execute_command 跑出真实值再写断言，不要猜。
+- **运行 pytest 时默认加 `-q`**（减少 PASSED 行噪音，节省 context）；需要完整 traceback 定位时再加 `-v`。
 
 [新建文件例外 — 覆盖 _CODER_ROLE 第 10 条]
 _CODER_ROLE 的「禁止 write_file 整体重写」只适用于**已存在的 >100 行大文件**。**从零创建新文件就该用 write_file 一次写出完整内容**——这是正常且推荐的。只有在已存在的大文件上做局部修改时，才必须改用 replace_in_file。
