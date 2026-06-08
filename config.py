@@ -103,7 +103,7 @@ _CONFIG_FILE = Path(WORKSPACE_DIR) / ".yansh" / "config.json"
 
 _DEFAULTS = {
     "model": TIER_TOP,
-    "mode": "auto",
+    "mode": "solo",
     "max_attempts": MAX_ATTEMPTS,
     "test_command": None,
     "safe_mode": True,
