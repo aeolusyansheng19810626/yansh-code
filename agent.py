@@ -132,6 +132,13 @@ _FIX_TOKEN_BUDGET   = 60_000   # fix loop token 增量预算
 _AUDIT_SOFT_LIMIT   = 16       # 原 8
 _AUDIT_TOKEN_BUDGET = 120_000  # audit loop token 增量预算
 
+# solo mode：单一连续 context 端到端 agent（自主规划→读写跑修→自测）
+# 与逐文件 code() 并存，验证「架构 vs 模型」命题。详见 plan / notes shadow R9。
+_SOLO_SOFT_LIMIT     = 120       # 主 loop 工具调用轮次上限（连续 context，复杂多文件任务需大轮数）
+_SOLO_TOKEN_BUDGET   = 600_000   # token 增量软提醒阈值（超过注入一次收敛提示；硬熔断交给 --max-cost）
+_SOLO_NO_PROGRESS_CAP = 6        # 连续 N 轮无写编辑先注提醒，2N 轮熔断（agent 级，区别于逐文件 no_progress）
+_SOLO_GATE_MAX_ROUNDS = 8        # 外部 test gate 回灌最大轮数
+
 # backlog #1: fix loop baseline 失败识别
 # 进入 code() 前跑一次 test_command 捕获 baseline failures
 # test+fix 循环里 returncode!=0 但 current\baseline 为空时视为通过
@@ -2204,6 +2211,46 @@ Discipline principles:
 Always respond in Chinese (用户的项目规则要求中文回复); 报告正文与 task_complete summary 必须中文, 仅 file:line 与符号名保持英文.
 """
 
+_SOLO_ROLE = """[Role: Solo Agent — 单一连续 context 端到端工程师]
+You hold ONE continuous conversation context from start to finish. Unlike a per-file pipeline, you can see every file you have already written — so cross-file consistency is your own responsibility and is naturally achievable: read your own real code instead of guessing names.
+
+You autonomously: plan → create/edit files → run real entry points → read tracebacks → fix → write & run tests → repeat, all in this same context. No separate architect hands you a symbol contract; YOU are the architect, coder, and tester.
+
+[开场规划 — 动手前必做，固化在本轮]
+Before writing any code, in your FIRST assistant turn lay out (in the message body, concisely):
+- 文件清单：每个要创建的文件 + 一句话职责
+- 模块边界与依赖方向（谁 import 谁，避免环）
+- 关键跨文件接口签名：函数名/类名/方法签名/数据类字段名 —— 这就是你自产的 symbol_contract，存在于这段连续 context 里。后续每写一个文件都以此为准；若中途调整了某个签名，必须同步更新所有引用端。
+This plan is your anchor. Refer back to it; keep names consistent with it.
+
+[实现节奏 — 边写边验证，禁止盲写一大批再回头]
+- 按依赖顺序自底向上写（先无依赖的 errors/types/tokens，再 lexer/parser，最后 executor 这类重依赖文件）。
+- **每完成一个可运行单元，立即用 execute_command 跑真实入口**看 traceback：`python -c "import pkg.mod"`、`python -m pkg ...`、或跑你刚写的小测试。报错就在同一 context 内 read→fix→re-run，直到该单元干净。
+- 写重依赖文件（如 executor）前，**直接 read_file 你自己刚写的依赖模块**确认真实签名 —— 你看得到它们，不要凭记忆。
+- 写新文件就用 write_file 输出完整文件内容（见下方「新建文件例外」）；改已有文件用 replace_in_file 精确编辑。
+
+[自测 — 必须留下可运行的测试]
+- 覆盖 requirement 的关键能力路径，写进 tests/（pytest 风格，子目录测试文件顶部加 sys.path 注入三行）。
+- 自己先把测试跑绿（execute_command 跑 pytest），再 task_complete。外部还有一道 test gate 会复核，**不要弱化断言来骗过测试**——那是把 bug 藏起来。
+- 数值/范围断言：先 execute_command 跑出真实值再写断言，不要猜。
+
+[新建文件例外 — 覆盖 _CODER_ROLE 第 10 条]
+_CODER_ROLE 的「禁止 write_file 整体重写」只适用于**已存在的 >100 行大文件**。**从零创建新文件就该用 write_file 一次写出完整内容**——这是正常且推荐的。只有在已存在的大文件上做局部修改时，才必须改用 replace_in_file。
+
+[工具效率]
+- 定位优先：search_in_files / list_symbols / get_symbol_definition 精确定位，别整文件 read 再筛。
+- 并行无依赖调用：一轮内同时 fire 多个 read/search。
+- 写工具失败会直接返回 error，不必再 read_file 确认。
+- dispatch_subagent 仅用于真正大规模独立探索；小事直接做。
+
+[终止协议 — 必读]
+- 完成判据：真实入口跑通 + 自测全绿 + 覆盖 requirement 全部能力 → `task_complete(success=true, summary="...")`。
+- 卡死/约束冲突无解 → `task_complete(success=false, summary="卡在 X，需人工")`，**不要烧光剩余轮次**。
+- **必须显式 task_complete 终止**，不要沉默退出（loop 会再追问一轮，浪费）。
+
+Always respond in Chinese (用户的项目规则要求中文回复); task_complete 的 summary 字段必须中文，仅文件名/符号名/代码保持英文。
+"""
+
 _PLANNER_ROLE = """[Role: Planner Agent (Plan Mode)]
 You are in Plan Mode — **all write tools are disabled**; you can only use read-only tools to explore code and think through approaches.
 Your task: through multi-turn dialogue with the user, produce a clear, executable implementation plan (plan draft); the user decides via /approve whether to implement.
@@ -3874,6 +3921,229 @@ def fix(test_result, plan, reason="test_failure", baseline_failures=None,
     console.print(f"[警告] fix 已达 {fix_soft_limit} 轮上限，强制退出", style="yellow", highlight=False)
     return {"early_exit": False, "success": False, "summary": ""}
 
+
+# ============================================================
+# solo mode：单一连续 context 端到端 agent
+# ============================================================
+
+def _solo_tools():
+    """solo 工具集：全工具去掉 plan-mode 专用工具，保留 dispatch_subagent / 写工具 / execute_command。"""
+    with _TOOLS_LOCK:
+        all_names = {t["function"]["name"] for t in TOOLS}
+    allowed = all_names - {"update_plan_draft", "exit_plan_mode_signal"}
+    return _filter_tools(allowed)
+
+
+def _solo_drive(messages, tools, compact_state, *, soft_limit, start_tokens,
+                budget_state, no_progress_state):
+    """solo 主驱动循环。原地 append messages；budget_state / no_progress_state 跨 gate 回灌持续累积。
+    返回 {"early_exit", "success", "summary", "rounds_used"}.
+    """
+    from subagent import _WRITE_TOOLS
+    rounds_used = 0
+    silent_prompted = False  # 沉默退出兜底：本次 drive 内只追问一次
+
+    while no_progress_state["total_rounds"] < soft_limit:
+        rounds_used += 1
+        no_progress_state["total_rounds"] += 1
+        if interrupt.is_interrupted():
+            raise interrupt.Interrupted()
+
+        # 每轮 call_llm 前 auto-compact，防连续 context O(N²) 膨胀全量重发
+        messages[:] = _maybe_compact_messages(messages, compact_state, label="solo-compact")
+
+        # token 预算软提醒（只一次）
+        if not budget_state["warned"]:
+            used = get_session_total_tokens() - start_tokens
+            if used > _SOLO_TOKEN_BUDGET:
+                console.print(f"[预算] solo token 增量 {used} > {_SOLO_TOKEN_BUDGET}，提醒 LLM 收敛",
+                              style="yellow", highlight=False)
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        f"You have used {used} tokens (budget {_SOLO_TOKEN_BUDGET}). "
+                        "Converge: finish remaining files and tests, run them, then task_complete. "
+                        "Do not start large new explorations."
+                    ),
+                })
+                budget_state["warned"] = True
+
+        response = call_llm(messages, tools=tools, tool_choice="auto")
+        msg = response.choices[0].message
+        messages.append({
+            "role": "assistant",
+            "content": msg.content,
+            "tool_calls": [tc.model_dump() for tc in msg.tool_calls] if msg.tool_calls else None,
+        })
+
+        if msg.tool_calls:
+            _rn = no_progress_state["total_rounds"]
+            console.print(f"solo 轮 {_rn}: {len(msg.tool_calls)} 次工具调用")
+            outs = _dispatch_tool_calls(
+                msg.tool_calls, mode="code", allow_hil=True, allow_confirm=False,
+                snap=_CURRENT_SNAPSHOT, messages=messages, console_label=f"solo 轮 {_rn}",
+            )
+            # sentinel：LLM 主动声明任务结束
+            for out in outs:
+                if out["result"].get("_task_complete"):
+                    success = bool(out["result"].get("success"))
+                    summary = out["result"].get("summary", "")
+                    console.print(f"solo task_complete（{'成功' if success else '放弃'}）：{summary}",
+                                  style=None if success else "yellow", highlight=False)
+                    return {"early_exit": True, "success": success,
+                            "summary": summary, "rounds_used": rounds_used}
+            # agent 级 no_progress：本轮是否有「正当进展」（区别于逐文件 no_progress）。
+            # 端到端模式下，跑真实入口验证（execute_command）也是进展，不算空转——
+            # R10 实测：写完全部模块后用 execute_command 连跑验证 12 轮被误熔断。
+            # 真正的空转 = 纯 read/search/list/git 多轮无写无跑（R9 的探索死循环）。
+            productive = any(
+                tc.function.name in _WRITE_TOOLS or tc.function.name == "execute_command"
+                for tc in msg.tool_calls
+            )
+            if productive:
+                no_progress_state["streak"] = 0
+            else:
+                no_progress_state["streak"] += 1
+                if no_progress_state["streak"] >= 2 * _SOLO_NO_PROGRESS_CAP:
+                    console.print(f"[solo] 连续 {no_progress_state['streak']} 轮无写编辑/无运行，熔断",
+                                  style="yellow", highlight=False)
+                    return {"early_exit": False, "success": False,
+                            "summary": "连续多轮无写编辑且未运行任何命令，疑似探索死循环，熔断", "rounds_used": rounds_used}
+                if no_progress_state["streak"] == _SOLO_NO_PROGRESS_CAP:
+                    messages.append({
+                        "role": "system",
+                        "content": (
+                            f"You have gone {_SOLO_NO_PROGRESS_CAP} rounds doing only read/search/list "
+                            "(no file edits, no command runs). If you are stuck exploring, commit to writing the "
+                            "next file now using write_file, or run your entry point to verify. "
+                            "If genuinely blocked, task_complete(success=false, summary=...)."
+                        ),
+                    })
+        else:
+            # 沉默退出兜底：第一次没调工具 → 追问一次
+            if not silent_prompted:
+                silent_prompted = True
+                console.print("[兜底] solo 未调工具，追问一次要求显式 task_complete", style="yellow", highlight=False)
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "You did not call any tool this turn — by protocol you must terminate explicitly with task_complete(success, summary). "
+                        "If everything is done and tests pass, task_complete(success=true, summary=...); "
+                        "if you cannot continue, task_complete(success=false, summary=...)."
+                    ),
+                })
+                continue
+            console.print("solo 结束（沉默退出，已追问过一次）")
+            return {"early_exit": False, "success": False,
+                    "summary": "沉默退出", "rounds_used": rounds_used}
+
+    console.print(f"[警告] solo 已达 {soft_limit} 轮上限，强制退出", style="yellow", highlight=False)
+    return {"early_exit": False, "success": False,
+            "summary": f"达到 {soft_limit} 轮上限", "rounds_used": rounds_used}
+
+
+def solo(requirement, model_override=None):
+    """单一连续 context 端到端 agent：自主规划→读写跑修→自测，外部 test gate 回灌复核。
+    返回 {"success", "test_result", "task_complete_signal"?}（与 audit 分支对齐，保证 batch --json）。
+    """
+    console.print("[Agent: Solo]", highlight=False)
+
+    # system prompt：role + 项目规则 + workspace 顶层符号索引（借 audit 的注入逻辑）
+    ws_symbols_result = workspace_symbols()
+    if "error" in ws_symbols_result:
+        symbols_brief = f"(workspace_symbols failed: {ws_symbols_result['error']})"
+    else:
+        files_map = ws_symbols_result.get("files", {})
+        subdirs_map = ws_symbols_result.get("subdirs", {})
+        lines = []
+        for path, syms in sorted(files_map.items()):
+            head = ", ".join(f"{s['name']}({s['type'][0]}:L{s['line']})" for s in syms[:30])
+            extra = f" +{len(syms)-30}" if len(syms) > 30 else ""
+            lines.append(f"  {path}: {head}{extra}")
+        if subdirs_map:
+            lines.append("")
+            lines.append("Sub-directories (drill in with workspace_symbols(path='<dir>')):")
+            for d, info in sorted(subdirs_map.items()):
+                lines.append(f"  {d}/  ({info['py_files']} .py files / {info['total_symbols']} symbols)")
+        symbols_brief = (
+            f"Workspace top-level symbol index ({ws_symbols_result['total_files']} files / "
+            f"{ws_symbols_result['total_symbols']} symbols):\n" + "\n".join(lines)
+        )
+
+    sys_prompt = f"{_SOLO_ROLE}{_get_project_rules()}\n\n{symbols_brief}"
+    sys_prompt = _append_active_prompts(sys_prompt)
+    messages = [
+        {"role": "system", "content": sys_prompt},
+        {"role": "user", "content": f"Task: {requirement}"},
+    ]
+
+    tools = _solo_tools()
+
+    # 快照：solo 不预知文件清单，用空快照；写工具按需增量备份（供 /revert）
+    global _CURRENT_SNAPSHOT
+    _gc_old_snapshots(keep=10)
+    _CURRENT_SNAPSHOT = create_snapshot([])
+
+    compact_state = _make_compact_state()
+    start_tokens = get_session_total_tokens()
+    budget_state = {"warned": False}
+    no_progress_state = {"streak": 0, "total_rounds": 0}
+
+    signal = _solo_drive(messages, tools, compact_state, soft_limit=_SOLO_SOFT_LIMIT,
+                         start_tokens=start_tokens, budget_state=budget_state,
+                         no_progress_state=no_progress_state)
+
+    # 外部 test gate 回灌：files_modified 推断 scope → 跑测试 → 红则把 stderr append 进同一 messages 继续驱动修复
+    test_result = {"returncode": 0, "stdout": "", "stderr": ""}
+    gate_round = 0
+    while gate_round < _SOLO_GATE_MAX_ROUNDS:
+        modified = _task_log_mod.snapshot_files_modified()
+        scope = _infer_test_scope([{"filename": f} for f in modified])
+        _ws_path = Path(_get_workspace())
+        test_cmd = (_detect_python_test_cmd(_ws_path, scope=scope)
+                    or _detect_python_test_cmd(_ws_path))
+        if not test_cmd:
+            console.print("[solo gate] 无可用测试命令，跳过外部复核", style="yellow", highlight=False)
+            break
+        test_result = test(test_cmd)
+        if judge(test_result):
+            console.print(f"[solo gate] 测试通过（{test_cmd}）", style="green", highlight=False)
+            signal["success"] = True
+            break
+        gate_round += 1
+        if no_progress_state["total_rounds"] >= _SOLO_SOFT_LIMIT:
+            console.print("[solo gate] 主 loop 轮次已耗尽，无法继续回灌修复", style="yellow", highlight=False)
+            signal["success"] = False
+            break
+        raw = test_result.get("stderr") or test_result.get("stdout") or "测试失败（无输出）"
+        err_excerpt = raw[-4000:] if len(raw) > 4000 else raw
+        console.print(f"[solo gate] 测试失败，回灌驱动修复（gate 轮 {gate_round}）", style="yellow", highlight=False)
+        messages.append({
+            "role": "user",
+            "content": (
+                f"外部 test gate 运行 `{test_cmd}` 失败。错误输出（末尾 4000 字）：\n```\n{err_excerpt}\n```\n"
+                "请在当前 context 内定位并修复，跑绿后再 task_complete。禁止弱化断言来骗过测试。"
+            ),
+        })
+        signal = _solo_drive(messages, tools, compact_state, soft_limit=_SOLO_SOFT_LIMIT,
+                             start_tokens=start_tokens, budget_state=budget_state,
+                             no_progress_state=no_progress_state)
+    else:
+        console.print(f"[solo gate] 回灌已达 {_SOLO_GATE_MAX_ROUNDS} 轮上限", style="yellow", highlight=False)
+        signal["success"] = bool(judge(test_result))
+
+    success = bool(signal.get("success"))
+    return {
+        "success": success,
+        "test_result": test_result,
+        "task_complete_signal": {
+            "early_exit": signal.get("early_exit", False),
+            "success": success,
+            "summary": signal.get("summary", ""),
+        },
+    }
+
+
 def test(test_command):
     """执行测试命令"""
     if not test_command or not test_command.strip():
@@ -4107,6 +4377,16 @@ def _run(requirement, mode):
         return {"success": res["success"],
                 "test_result": {"returncode": 0 if res["success"] else 1,
                                 "stdout": res.get("report", ""), "stderr": ""}}
+
+    # solo 模式：单一连续 context 端到端 agent，独立路径，不进 plan/code/review/fix
+    if mode == "solo":
+        res = solo(original_requirement)
+        finish_task_log(res["success"], 0, test_result=res.get("test_result"),
+                        task_complete_signal=res.get("task_complete_signal"))
+        return {"success": res["success"],
+                "test_result": res.get("test_result",
+                                       {"returncode": 0 if res["success"] else 1,
+                                        "stdout": "", "stderr": ""})}
 
     # [路由] code/auto 模式：按复杂度路由，减少简单/只读任务的 pipeline 开销
     # --mode audit 已在上方 early return，本块不影响显式 audit 模式

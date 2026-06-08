@@ -238,7 +238,7 @@ def _read_input(prompt_str="> "):
                 completion_enabled = True  # 按 / 重开补全
             buf.insert(cursor, ch); cursor += 1; redraw()
 
-VALID_MODES = {"plan", "code", "auto", "audit"}
+VALID_MODES = {"plan", "code", "auto", "audit", "solo"}
 
 def show_config():
     cfg = get_config()
@@ -261,7 +261,7 @@ def main():
     parser.add_argument(
         "--mode",
         choices=VALID_MODES,
-        help="运行模式：auto=plan+人工确认+code+test+fix；code=同 auto 但跳过人工确认（仍走 plan）；plan=只输出计划不执行；audit=只读分析",
+        help="运行模式：auto=plan+人工确认+code+test+fix；code=同 auto 但跳过人工确认（仍走 plan）；plan=只输出计划不执行；audit=只读分析；solo=单一连续 context 端到端 agent（自主规划→读写跑修→自测）",
     )
     parser.add_argument("--model", help="指定 LLM 模型")
     parser.add_argument("--json", action="store_true", help="以 JSON 格式输出最后结果 (batch 模式)")
