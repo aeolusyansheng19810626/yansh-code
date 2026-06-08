@@ -34,6 +34,9 @@ _RF_UNSUPPORTED: set = set()
 
 LLM_TIMEOUT_SEC = 120
 LLM_MAX_RETRIES_PER_MODEL = 3  # 每个模型对 429/5xx 的退避重试次数
+# 显式 output 上限：不设时 ICA 网关默认 8192，opus 长 plan（成员级 symbol_contract）会被截断
+# 导致 plan JSON 解析失败 → plan=[] → coder 处理 0 文件 → 假绿。16384 给足余量。
+LLM_MAX_TOKENS = 16384
 
 
 class CostExceededError(Exception):
@@ -174,7 +177,7 @@ def _client_for(model: str):
 
 
 def _call_single_model(cl, model, messages, response_format=None, stream=False):
-    kwargs = {"model": model, "messages": messages, "timeout": LLM_TIMEOUT_SEC}
+    kwargs = {"model": model, "messages": messages, "timeout": LLM_TIMEOUT_SEC, "max_tokens": LLM_MAX_TOKENS}
     if response_format and not _should_skip_rf(model):
         kwargs["response_format"] = response_format
     if stream and not _is_gemini(model):
@@ -235,7 +238,7 @@ def call_llm(messages, tools=None, tool_choice=None, response_format=None,
             backoff = 1.0
             for attempt in range(LLM_MAX_RETRIES_PER_MODEL):
                 try:
-                    kwargs = {"model": model, "messages": messages, "timeout": LLM_TIMEOUT_SEC}
+                    kwargs = {"model": model, "messages": messages, "timeout": LLM_TIMEOUT_SEC, "max_tokens": LLM_MAX_TOKENS}
                     if tools is not None:
                         kwargs["tools"] = tools
                     if tool_choice is not None:
