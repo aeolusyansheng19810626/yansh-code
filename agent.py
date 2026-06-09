@@ -1412,7 +1412,7 @@ def _compact_messages(msgs, keep_recent_pairs: int = 2):
         return msgs
 
     summary_content = f"[历史摘要 - 旧对话已压缩] {summary}"
-    # 注入状态文件（若存在）：确定性恢复 agent 自维护的环境事实/签名/进度
+    # 注入状态文件（若存在）：框架自动维护的环境知识（python/pytest 命令白/黑名单）
     _state_path = Path(_get_workspace()) / ".yansh" / "agent_state.md"
     try:
         _state_content = _state_path.read_text(encoding="utf-8").strip()
@@ -1420,7 +1420,7 @@ def _compact_messages(msgs, keep_recent_pairs: int = 2):
             _MAX_STATE = 4000  # 硬截断：防止超大状态文件抵消 compact 收益
             if len(_state_content) > _MAX_STATE:
                 _state_content = _state_content[:_MAX_STATE] + "\n[...已截断]"
-            summary_content += f"\n\n[持久状态 .yansh/agent_state.md — agent 自维护，以真实代码为准]\n{_state_content}"
+            summary_content += f"\n\n[持久环境知识 .yansh/agent_state.md — 框架自动维护，跨 run 有效]\n{_state_content}"
     except Exception:
         pass
     summary_msg = {"role": "system", "content": summary_content}
@@ -2259,15 +2259,9 @@ _CODER_ROLE 的「禁止 write_file 整体重写」只适用于**已存在的 >1
 - 写工具失败会直接返回 error，不必再 read_file 确认。
 - dispatch_subagent 仅用于真正大规模独立探索；小事直接做。
 
-[状态文件 — 防遗忘锚点]
-在 `.yansh/agent_state.md` 维护一份精炼状态笔记，严格控制在 2000 字符以内：
-- **发现有效 shell 命令后立即写入**：完整命令前缀原文（如 `py -3.11 -X utf8 -m pytest`）
-- **失败命令黑名单**：会报错的前缀（如 `cd /workspace &&` 在本环境无效）
-- **跨文件关键签名**：每个模块主要类/函数签名（只写名称和参数，不写代码）
-- **当前进度锚点**：已完成的文件列表、当前卡点（一句话）
-不要写代码内容、traceback、已读文件正文——只写"指针和事实"。
-更新时用 `write_file` 整体重写此文件（它是小文件，每次全量覆盖即可）；**只在有新事实时才更新**，不要每轮都写。
-context 压缩时框架会自动把此文件重新注入，**无需手动读取**；但你负责及时更新它。
+[环境知识 — 框架自动维护]
+`.yansh/agent_state.md` 由框架在每次 execute_command 后自动更新（python/pytest 命令白/黑名单）。
+任务开始及 context 压缩时框架会自动注入此文件，**无需手动读取或写入**。
 
 [终止协议 — 必读]
 - 完成判据：真实入口跑通 + 自测全绿 + 覆盖 requirement 全部能力 → `task_complete(success=true, summary="...")`。
@@ -4098,6 +4092,19 @@ def solo(requirement, model_override=None):
 
     sys_prompt = f"{_SOLO_ROLE}{_get_project_rules()}\n\n{symbols_brief}"
     sys_prompt = _append_active_prompts(sys_prompt)
+
+    # 任务开始时注入持久环境知识（框架自动维护，跨 run 复用）
+    _state_path = Path(_get_workspace()) / ".yansh" / "agent_state.md"
+    try:
+        _state_content = _state_path.read_text(encoding="utf-8").strip()
+        if _state_content:
+            _MAX_STATE = 4000
+            if len(_state_content) > _MAX_STATE:
+                _state_content = _state_content[:_MAX_STATE] + "\n[...已截断]"
+            sys_prompt += f"\n\n[持久环境知识 .yansh/agent_state.md — 框架自动维护，跨 run 有效]\n{_state_content}"
+    except Exception:
+        pass
+
     messages = [
         {"role": "system", "content": sys_prompt},
         {"role": "user", "content": f"Task: {requirement}"},

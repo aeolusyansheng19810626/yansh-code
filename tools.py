@@ -25,6 +25,34 @@ def _truncate_cmd_output(text: str) -> str:
             + text[-_CMD_OUTPUT_TAIL:])
 
 
+_STATE_CMD_RE = re.compile(r'^\s*(py\b|python[0-9.]*|pytest)', re.IGNORECASE)
+
+
+def _update_agent_state(command: str, returncode: int) -> None:
+    """框架自动维护 .yansh/agent_state.md：记录 python/pytest 命令的成功/失败。"""
+    if not _STATE_CMD_RE.match(command):
+        return
+    try:
+        state_dir = Path(_get_workspace()) / ".yansh"
+        state_path = state_dir / "agent_state.md"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        existing = state_path.read_text(encoding="utf-8") if state_path.exists() else ""
+        cmd_str = f"`{command.strip()}`"
+        if cmd_str in existing:
+            return
+        section = "## 已验证命令（exit=0）" if returncode == 0 else "## 失败命令（exit≠0）"
+        if not existing:
+            existing = "# 框架自动维护 — 环境知识（跨 run 复用）\n"
+        entry = f"- {cmd_str}\n"
+        if section in existing:
+            existing = existing.replace(section + "\n", section + "\n" + entry, 1)
+        else:
+            existing = existing.rstrip("\n") + f"\n\n{section}\n{entry}"
+        state_path.write_text(existing, encoding="utf-8")
+    except Exception:
+        pass
+
+
 ERROR_KINDS = frozenset({
     "invalid_args",  # 参数格式/取值错
     "not_found",     # 文件/符号不存在
@@ -406,6 +434,7 @@ def execute_command(command, _timeout_sec=30):
         t_out.join()
         t_err.join()
 
+        _update_agent_state(command, process.returncode)
         return {
             "stdout": _truncate_cmd_output(''.join(stdout_lines)),
             "stderr": _truncate_cmd_output(''.join(stderr_lines)),
