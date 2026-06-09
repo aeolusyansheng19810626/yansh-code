@@ -3954,34 +3954,40 @@ def _summarize_test_failure(raw: str, max_chars: int = 1200) -> str:
     summary = "\n".join(key)
     if summary and len(summary) <= max_chars:
         return summary
+    # fallback：优先含 error/assert/import 的行，比纯尾部切片信息量更高
+    error_lines = [l for l in lines if any(k in l.lower() for k in ("error", "assert", "import"))]
+    fallback = "\n".join(error_lines)
+    if fallback and len(fallback) <= max_chars:
+        return fallback
     return raw[-max_chars:] if len(raw) > max_chars else raw
+
+
+_RGLOB_SKIP = {".yansh", ".git", "venv", ".venv", "site-packages", "__pycache__", "node_modules"}
 
 
 def _solo_inject_import_diagnostics(outs, messages):
     """检测 execute_command 结果中的 pytest import/collection error，
     自动调用 _scan_import_mismatches 一次性暴露所有缺失导入名，注入 system message。
-    每组连续 import error 只注入一次（去重检查 messages 末尾）。
+    同一批缺失导入只注入一次（扫全部 messages 去重，避免预算提醒插队导致重复注入）。
     """
     has_import_err = any(
-        ("ImportError" in (out.get("result", {}).get("stdout", "") +
-                           out.get("result", {}).get("stderr", "")) or
-         "ERROR collecting" in (out.get("result", {}).get("stdout", "") +
-                                out.get("result", {}).get("stderr", "")))
+        ("ImportError" in ((out.get("result") or {}).get("stdout") or "") +
+                           ((out.get("result") or {}).get("stderr") or "") or
+         "ERROR collecting" in ((out.get("result") or {}).get("stdout") or "") +
+                                ((out.get("result") or {}).get("stderr") or ""))
         for out in outs
-        if out.get("result", {}).get("stdout") is not None or
-           out.get("result", {}).get("stderr") is not None
     )
     if not has_import_err:
         return
-    # 去重：已有相同诊断时跳过
-    last_sys = next((m["content"] for m in reversed(messages)
-                     if m.get("role") == "system"), "")
-    if "[Import 诊断]" in last_sys:
+    # 去重：扫全部 messages，防止预算/其他 system message 插在诊断后导致误判
+    if any(m.get("role") == "system" and "[Import 诊断]" in (m.get("content") or "")
+           for m in messages):
         return
     try:
         ws = Path(_get_workspace())
         plan_files = [{"filename": str(p.relative_to(ws))}
-                      for p in ws.rglob("*.py") if ".yansh" not in str(p)]
+                      for p in ws.rglob("*.py")
+                      if not any(part in _RGLOB_SKIP for part in p.parts)]
         issues = _scan_import_mismatches({"files": plan_files}, str(ws))
         if not issues:
             return
