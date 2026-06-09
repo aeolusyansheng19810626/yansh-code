@@ -33,6 +33,10 @@ def _update_agent_state(command: str, returncode: int) -> None:
     """框架自动维护 .yansh/agent_state.md：记录 python/pytest 命令的成功/失败。"""
     if not _STATE_CMD_RE.match(command):
         return
+    # 跳过多行命令和超长命令（debug 脚本，对跨 run 无复用价值）
+    cmd_stripped = command.strip()
+    if "\n" in cmd_stripped or len(cmd_stripped) > 160:
+        return
     try:
         state_dir = Path(_get_workspace()) / ".yansh"
         state_path = state_dir / "agent_state.md"
