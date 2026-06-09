@@ -3946,61 +3946,6 @@ def fix(test_result, plan, reason="test_failure", baseline_failures=None,
 # solo mode：单一连续 context 端到端 agent
 # ============================================================
 
-def _summarize_test_failure(raw: str, max_chars: int = 1200) -> str:
-    """从 pytest 输出提取失败用例名+错因，缩减 gate 回灌体积。"""
-    lines = raw.splitlines()
-    key = [l for l in lines if l.startswith("FAILED ") or l.startswith("ERROR ")
-           or ("::" in l and "FAILED" in l)]
-    summary = "\n".join(key)
-    if summary and len(summary) <= max_chars:
-        return summary
-    # fallback：优先含 error/assert/import 的行，比纯尾部切片信息量更高
-    error_lines = [l for l in lines if any(k in l.lower() for k in ("error", "assert", "import"))]
-    fallback = "\n".join(error_lines)
-    if fallback and len(fallback) <= max_chars:
-        return fallback
-    return raw[-max_chars:] if len(raw) > max_chars else raw
-
-
-_RGLOB_SKIP = {".yansh", ".git", "venv", ".venv", "site-packages", "__pycache__", "node_modules"}
-
-
-def _solo_inject_import_diagnostics(outs, messages):
-    """检测 execute_command 结果中的 pytest import/collection error，
-    自动调用 _scan_import_mismatches 一次性暴露所有缺失导入名，注入 system message。
-    同一批缺失导入只注入一次（扫全部 messages 去重，避免预算提醒插队导致重复注入）。
-    """
-    has_import_err = any(
-        ("ImportError" in ((out.get("result") or {}).get("stdout") or "") +
-                           ((out.get("result") or {}).get("stderr") or "") or
-         "ERROR collecting" in ((out.get("result") or {}).get("stdout") or "") +
-                                ((out.get("result") or {}).get("stderr") or ""))
-        for out in outs
-    )
-    if not has_import_err:
-        return
-    # 去重：扫全部 messages，防止预算/其他 system message 插在诊断后导致误判
-    if any(m.get("role") == "system" and "[Import 诊断]" in (m.get("content") or "")
-           for m in messages):
-        return
-    try:
-        ws = Path(_get_workspace())
-        plan_files = [{"filename": str(p.relative_to(ws))}
-                      for p in ws.rglob("*.py")
-                      if not any(part in _RGLOB_SKIP for part in p.parts)]
-        issues = _scan_import_mismatches({"files": plan_files}, str(ws))
-        if not issues:
-            return
-        block = "[Import 诊断 — 以下缺失导入名，请一次性全部修正]\n"
-        for f, tgt, name, alias in issues:
-            alias_str = f" as {alias}" if alias else ""
-            block += f"  - {f}: `import {name}{alias_str}` — `{name}` 在 {os.path.basename(tgt)} 中不存在，用 list_symbols({tgt}) 确认正确名称\n"
-        messages.append({"role": "system", "content": block.strip()})
-        console.print(f"[solo import诊断] 发现 {len(issues)} 个缺失导入，已注入", style="cyan", highlight=False)
-    except Exception as e:
-        console.print(f"[solo import诊断] 扫描失败（不影响流程）：{e}", style="dim", highlight=False)
-
-
 def _solo_tools():
     """solo 工具集：全工具去掉 plan-mode 专用工具，保留 dispatch_subagent / 写工具 / execute_command。"""
     with _TOOLS_LOCK:
@@ -4067,8 +4012,6 @@ def _solo_drive(messages, tools, compact_state, *, soft_limit, start_tokens,
                                   style=None if success else "yellow", highlight=False)
                     return {"early_exit": True, "success": success,
                             "summary": summary, "rounds_used": rounds_used}
-            # pytest import/collection error → 一次性暴露所有缺失导入名，省去 agent 逐个 py -c 反查
-            _solo_inject_import_diagnostics(outs, messages)
             # agent 级 no_progress：本轮是否有「正当进展」（区别于逐文件 no_progress）。
             # 端到端模式下，跑真实入口验证（execute_command）也是进展，不算空转——
             # R10 实测：写完全部模块后用 execute_command 连跑验证 12 轮被误熔断。
@@ -4206,12 +4149,12 @@ def solo(requirement, model_override=None):
             signal["success"] = False
             break
         raw = test_result.get("stderr") or test_result.get("stdout") or "测试失败（无输出）"
-        err_excerpt = _summarize_test_failure(raw)
+        err_excerpt = raw[-4000:] if len(raw) > 4000 else raw
         console.print(f"[solo gate] 测试失败，回灌驱动修复（gate 轮 {gate_round}）", style="yellow", highlight=False)
         messages.append({
             "role": "user",
             "content": (
-                f"外部 test gate 运行 `{test_cmd}` 失败。失败摘要：\n```\n{err_excerpt}\n```\n"
+                f"外部 test gate 运行 `{test_cmd}` 失败。错误输出（末尾 4000 字）：\n```\n{err_excerpt}\n```\n"
                 "请在当前 context 内定位并修复，跑绿后再 task_complete。禁止弱化断言来骗过测试。"
             ),
         })
