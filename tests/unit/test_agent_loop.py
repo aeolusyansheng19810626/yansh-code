@@ -2417,7 +2417,7 @@ def test_maybe_compact_over_threshold_compresses(monkeypatch):
     # est: 第一次大、压缩后小
     ests = iter([50_000, 5_000])
     monkeypatch.setattr(agent, "_estimate_messages_tokens", lambda m: next(ests))
-    monkeypatch.setattr(agent, "_compact_messages", lambda m, keep_recent_pairs: compacted)
+    monkeypatch.setattr(agent, "_compact_messages", lambda m, keep_recent_pairs, plan_anchor=None: compacted)
     out = agent._maybe_compact_messages(msgs, state)
     assert out is compacted
     assert state["consecutive_over"] == 0  # 降幅 90% ≥ 15%，重置
@@ -2431,7 +2431,7 @@ def test_maybe_compact_thrashing_disables(monkeypatch):
     msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
     # 估值恒定（压缩无效），_compact_messages 原样返回
     monkeypatch.setattr(agent, "_estimate_messages_tokens", lambda m: 50_000)
-    monkeypatch.setattr(agent, "_compact_messages", lambda m, keep_recent_pairs: m)
+    monkeypatch.setattr(agent, "_compact_messages", lambda m, keep_recent_pairs, plan_anchor=None: m)
     agent._maybe_compact_messages(msgs, state)
     assert state["consecutive_over"] == 1
     agent._maybe_compact_messages(msgs, state)

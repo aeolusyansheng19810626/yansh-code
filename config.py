@@ -118,6 +118,7 @@ _DEFAULTS = {
     "parallel_max_workers": 4,             # worktree 并行编排最大并发子进程数（防 ICA 限速）
     "fix_soft_limit": 12,                  # fix loop 单次 attempt 工具轮次上限（基线）
     "fix_mechanical_error_bonus": 12,      # 检测到机械错（同类 TypeError 缺参等）时再追加的轮次
+    "test_gate_timeout_sec": 300,          # solo gate 外部测试超时（秒）；普通 execute_command 仍用 30s
 }
 
 _effective_config: dict = dict(_DEFAULTS)
