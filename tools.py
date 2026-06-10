@@ -25,8 +25,27 @@ def _truncate_cmd_output(text: str) -> str:
             + text[-_CMD_OUTPUT_TAIL:])
 
 
-_STATE_CMD_RE = re.compile(r'^\s*(py\b|python[0-9.]*|pytest)', re.IGNORECASE)
+_STATE_CMD_RE = re.compile(r'^\s*(py\b|python[0-9.]*\b|pytest\b)', re.IGNORECASE)
 _STATE_FILE_LOCK = threading.Lock()
+_STATE_SECTION_LIMIT = 20  # 每 section 最多保留 20 条命令记录
+
+
+def _trim_section(content: str, section_header: str, limit: int) -> str:
+    """把 section_header 下的条目裁剪到最多 limit 条（保留最新的，即靠近 header 的）。"""
+    if section_header not in content:
+        return content
+    idx = content.index(section_header)
+    after = content[idx + len(section_header):]
+    next_sec = re.search(r'\n## ', after)
+    sec_body = after[:next_sec.start()] if next_sec else after
+    rest = after[next_sec.start():] if next_sec else ""
+    lines = [l for l in sec_body.splitlines(keepends=True) if l.strip()]
+    if len(lines) > limit:
+        lines = lines[:limit]  # 保留最新（靠近 header）的 limit 条
+    new_body = "".join(lines)
+    if new_body and not new_body.startswith("\n"):
+        new_body = "\n" + new_body
+    return content[:idx] + section_header + new_body + rest
 
 
 def _update_agent_state(command: str, returncode: int) -> None:
@@ -67,7 +86,11 @@ def _update_agent_state(command: str, returncode: int) -> None:
                 existing = existing.replace(correct_section + "\n", correct_section + "\n" + entry_line, 1)
             else:
                 existing = existing.rstrip("\n") + f"\n\n{correct_section}\n{entry_line}"
-            state_path.write_text(existing, encoding="utf-8")
+            existing = _trim_section(existing, "## 已验证命令（exit=0）", _STATE_SECTION_LIMIT)
+            existing = _trim_section(existing, "## 失败命令（exit≠0）", _STATE_SECTION_LIMIT)
+            _tmp = state_path.with_suffix(".md.tmp")
+            _tmp.write_text(existing, encoding="utf-8")
+            os.replace(str(_tmp), str(state_path))
     except Exception:
         pass
 

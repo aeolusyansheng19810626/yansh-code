@@ -649,3 +649,108 @@ def test_read_file_max_bytes_no_truncation():
     assert "error" not in result
     assert result.get("truncated") is not True
     assert result["content"] == content
+
+
+# ── P2-13：_STATE_CMD_RE 词边界 ──────────────────────────────────────────────
+
+def test_p213_state_cmd_re_no_match_pythonic():
+    """pythonic_tool 不应被 _STATE_CMD_RE 匹配。"""
+    import tools
+    assert not tools._STATE_CMD_RE.match("pythonic_tool --help")
+
+
+def test_p213_state_cmd_re_no_match_pytestx():
+    """pytestx 不应被 _STATE_CMD_RE 匹配。"""
+    import tools
+    assert not tools._STATE_CMD_RE.match("pytestx run")
+
+
+def test_p213_state_cmd_re_match_python_main():
+    """python main.py 应被 _STATE_CMD_RE 匹配。"""
+    import tools
+    assert tools._STATE_CMD_RE.match("python main.py")
+
+
+def test_p213_state_cmd_re_match_pytest_tests():
+    """pytest tests/ 应被 _STATE_CMD_RE 匹配。"""
+    import tools
+    assert tools._STATE_CMD_RE.match("pytest tests/")
+
+
+# ── P2-14：agent_state.md 原子写 ─────────────────────────────────────────────
+
+def test_p214_atomic_write_original_intact_on_replace_error(tmp_path, monkeypatch):
+    """os.replace 抛异常时，原文件内容不变。"""
+    import tools, os
+    import config
+    config.WORKSPACE_DIR = str(tmp_path)
+    tools._reinit_paths()
+
+    state_dir = tmp_path / ".yansh"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    state_path = state_dir / "agent_state.md"
+    original_content = "# 原始内容\n"
+    state_path.write_text(original_content, encoding="utf-8")
+
+    # patch os.replace 抛异常
+    def bad_replace(src, dst):
+        raise OSError("模拟中断")
+
+    monkeypatch.setattr(os, "replace", bad_replace)
+
+    # 调用写入（内部捕获 Exception，不应崩溃）
+    tools._update_agent_state("python run.py", 0)
+
+    # 原文件内容不变（因为异常被捕获，_tmp 写了但 replace 失败）
+    assert state_path.read_text(encoding="utf-8") == original_content
+
+
+# ── P2-16：agent_state.md section 条目上限 ────────────────────────────────────
+
+def test_p216_section_trim_limits_entries(tmp_path, monkeypatch):
+    """写入超过 20 条不同的成功命令后，section 条目 ≤ 20。"""
+    import tools, config
+    config.WORKSPACE_DIR = str(tmp_path)
+    tools._reinit_paths()
+
+    # 写 25 条不同命令（exit=0）
+    for i in range(25):
+        tools._update_agent_state(f"python script_{i:02d}.py", 0)
+
+    state_path = (tmp_path / ".yansh" / "agent_state.md")
+    content = state_path.read_text(encoding="utf-8")
+    # 统计 "已验证命令" section 的条目数（以 "- `" 开头的行）
+    in_section = False
+    count = 0
+    for line in content.splitlines():
+        if line.startswith("## 已验证命令"):
+            in_section = True
+            continue
+        if in_section and line.startswith("## "):
+            break
+        if in_section and line.strip().startswith("- `"):
+            count += 1
+
+    assert count <= 20, f"section 条目数为 {count}，应 ≤ 20"
+
+
+def test_p216_trim_section_helper():
+    """_trim_section 直接单测：超过 limit 时被截断。"""
+    import tools
+    header = "## 已验证命令（exit=0）"
+    lines = "\n".join(f"- `cmd_{i}`" for i in range(30))
+    content = f"# 标题\n\n{header}\n{lines}\n"
+    result = tools._trim_section(content, header, 20)
+
+    # 统计裁剪后的条目
+    in_sec = False
+    count = 0
+    for line in result.splitlines():
+        if line.startswith("## 已验证命令"):
+            in_sec = True
+            continue
+        if in_sec and line.startswith("## "):
+            break
+        if in_sec and line.strip().startswith("- `"):
+            count += 1
+    assert count == 20

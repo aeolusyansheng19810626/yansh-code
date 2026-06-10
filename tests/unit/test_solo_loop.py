@@ -595,3 +595,62 @@ def test_p111_gate_skips_test_when_rounds_exhausted(tmp_path, monkeypatch):
     res = agent.solo("任务")
     assert test_called["n"] == 0, f"轮次耗尽后不应跑测试，但 test 被调了 {test_called['n']} 次"
     assert res["task_complete_signal"]["gate_status"] == "failed"
+
+
+# ── P2-15：no_progress 按 dispatch result 区分有效进展 ─────────────────────────
+
+def test_p215_failed_write_increments_streak(tmp_path, monkeypatch):
+    """write_file 返回无 success 键（失败）时，streak 应递增而不是清零。"""
+    _setup_ws(tmp_path)
+
+    # 让 _solo_drive 中的 LLM 返回一次 write_file 调用，dispatch 返回失败 result（无 success）
+    # 然后返回 task_complete，让循环退出
+    call_count = {"n": 0}
+
+    def stubbed_llm(msgs, **kw):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return _make_response("writing", [("w1", "write_file", {"path": "x.py", "content": ""})])
+        return _make_response("done", [("c1", "task_complete", {"success": True, "summary": "ok"})])
+
+    def dispatch_fail_write(tool_calls, **kw):
+        outs = []
+        for tc in tool_calls:
+            if tc.function.name == "write_file":
+                # 失败：无 success 键
+                outs.append({"id": tc.id, "result": {"error": "权限拒绝"}})
+            elif tc.function.name == "task_complete":
+                import json
+                args = json.loads(tc.function.arguments)
+                outs.append({"id": tc.id, "result": {
+                    "_task_complete": True,
+                    "success": args.get("success"),
+                    "summary": args.get("summary", ""),
+                }})
+            else:
+                outs.append({"id": tc.id, "result": {}})
+        return outs
+
+    no_progress_state = {"streak": 0, "total_rounds": 0}
+    budget_state = {"cost": 0.0, "input_tokens": 0, "output_tokens": 0, "warned": False}
+    compact_state = agent._make_compact_state()
+    compact_state["disabled"] = True  # 禁用 compact，避免阈值触发
+
+    monkeypatch.setattr(agent, "call_llm", stubbed_llm)
+    monkeypatch.setattr(agent, "_dispatch_tool_calls", dispatch_fail_write)
+
+    # 直接调用 _solo_drive，传入最小 messages
+    result = agent._solo_drive(
+        messages=[{"role": "user", "content": "任务"}],
+        tools=[],
+        compact_state=compact_state,
+        soft_limit=5,
+        start_tokens=0,
+        budget_state=budget_state,
+        no_progress_state=no_progress_state,
+    )
+
+    # write_file 失败（无 success）→ productive=False → streak 应 ≥ 1
+    assert no_progress_state["streak"] >= 1, (
+        f"失败 write_file 后 streak 应递增，实际 streak={no_progress_state['streak']}"
+    )

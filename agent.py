@@ -3988,6 +3988,14 @@ def _solo_tools():
     return _filter_tools(allowed)
 
 
+def _get_out_result(outs: list, tc) -> dict:
+    """按 tool_call_id 从 dispatch 结果列表里取 result dict。"""
+    for o in outs:
+        if isinstance(o, dict) and o.get("id") == tc.id:
+            return o.get("result") or {}
+    return {}
+
+
 def _solo_drive(messages, tools, compact_state, *, soft_limit, start_tokens,
                 budget_state, no_progress_state):
     """solo 主驱动循环。原地 append messages；budget_state / no_progress_state 跨 gate 回灌持续累积。
@@ -4056,7 +4064,9 @@ def _solo_drive(messages, tools, compact_state, *, soft_limit, start_tokens,
             # R10 实测：写完全部模块后用 execute_command 连跑验证 12 轮被误熔断。
             # 真正的空转 = 纯 read/search/list/git 多轮无写无跑（R9 的探索死循环）。
             productive = any(
-                tc.function.name in _WRITE_TOOLS or tc.function.name == "execute_command"
+                (tc.function.name in _WRITE_TOOLS and _get_out_result(outs, tc).get("success"))
+                or (tc.function.name == "execute_command"
+                    and _get_out_result(outs, tc).get("returncode") not in (-1, None))
                 for tc in msg.tool_calls
             )
             if productive:
