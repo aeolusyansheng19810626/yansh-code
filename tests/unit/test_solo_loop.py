@@ -421,3 +421,177 @@ def test_p05_clip_preserves_head_and_tail():
     assert result.startswith("A" * 100)
     assert result.endswith("B" * 100)
     assert "omitted" in result
+
+
+# ========== P1 新增用例 ==========
+
+# ── P1-7：_infer_test_scope 支持 *_test.py ──
+
+def test_p17_infer_scope_finds_foo_test_py(tmp_path):
+    """P1-7：tests/ 下有 foo_test.py（*_test.py 命名）→ 源文件 foo.py 能命中。"""
+    import config
+    config.set_workspace_dir(str(tmp_path))
+    import agent as _agent
+    _agent._reinit_paths()
+
+    # 构造 tests/foo_test.py
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "foo_test.py").write_text("# foo_test")
+
+    plan_files = [{"filename": "foo.py"}]
+    scope = _agent._infer_test_scope(plan_files)
+    assert any("foo_test.py" in p for p in scope), f"未找到 foo_test.py，scope={scope}"
+
+
+def test_p17_infer_scope_test_and_xtest_both_found(tmp_path):
+    """P1-7：同时存在 test_foo.py 和 foo_test.py → 两个都命中，去重正确。"""
+    import config
+    config.set_workspace_dir(str(tmp_path))
+    import agent as _agent
+    _agent._reinit_paths()
+
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_foo.py").write_text("# test_foo")
+    (tests_dir / "foo_test.py").write_text("# foo_test")
+
+    plan_files = [{"filename": "foo.py"}]
+    scope = _agent._infer_test_scope(plan_files)
+    assert any("test_foo.py" in p for p in scope), f"未找到 test_foo.py，scope={scope}"
+    assert any("foo_test.py" in p for p in scope), f"未找到 foo_test.py，scope={scope}"
+    assert len(scope) == len(set(scope)), "scope 含重复项"
+
+
+# ── P1-8：move_file 成功后 record_file_modified ──
+
+def test_p18_move_file_records_src_and_dst(tmp_path, monkeypatch):
+    """P1-8：move_file 成功 → record_file_modified 对 src 和 dst 各调一次。"""
+    _setup_ws(tmp_path)
+    from unittest.mock import patch, MagicMock
+
+    recorded = []
+
+    with patch("agent.move_file") as mock_move, \
+         patch("agent._task_log_mod") as mock_log, \
+         patch("agent._backup_file_if_needed"):
+        mock_move.return_value = {"success": True}
+        mock_log.record_file_modified.side_effect = lambda f: recorded.append(f)
+
+        # 构造一个最小 tool_call
+        tc = MagicMock()
+        tc.id = "c1"
+        tc.function.name = "move_file"
+        tc.function.arguments = _json.dumps({"src": "old.py", "dst": "new.py"})
+
+        # 调用内部分发（args 已解析，snap=None，allow_confirm=False）
+        parsed_args = {"src": "old.py", "dst": "new.py"}
+        agent._dispatch_tool_call_inner(tc, parsed_args, snap=None, allow_confirm=False)
+
+    assert "old.py" in recorded, f"src 未记录，recorded={recorded}"
+    assert "new.py" in recorded, f"dst 未记录，recorded={recorded}"
+
+
+# ── P1-9：gate drive_limit 限制 ──
+
+def test_p19_gate_drive_soft_limit_bounded(tmp_path, monkeypatch):
+    """P1-9：gate 回灌时 _solo_drive soft_limit 被限制在 total_rounds + 15 以内。"""
+    _setup_ws(tmp_path)
+
+    drive_soft_limits = []
+
+    def capture_drive(messages, tools, compact_state, *, soft_limit, **kw):
+        drive_soft_limits.append(soft_limit)
+        # 模拟 drive：不执行任何轮，直接返回（total_rounds 不变）
+        return {"early_exit": False, "success": False, "summary": ""}
+
+    monkeypatch.setattr(agent, "_solo_drive", capture_drive)
+    monkeypatch.setattr(agent, "_dispatch_tool_calls", _stub_dispatch)
+
+    # 第一次 drive（初始）：被调时 total_rounds=0，soft_limit=_SOLO_SOFT_LIMIT
+    # gate：测试第一次失败→回灌→第二次通过
+    test_results = [
+        {"returncode": 1, "stderr": "FAILED", "stdout": ""},
+        {"returncode": 0, "stderr": "", "stdout": "1 passed"},
+    ]
+    test_calls = {"n": 0}
+
+    def mock_test(cmd, timeout_sec=None):
+        r = test_results[min(test_calls["n"], len(test_results) - 1)]
+        test_calls["n"] += 1
+        return r
+
+    monkeypatch.setattr(agent, "call_llm", lambda msgs, **kw: _make_response(
+        "done", [("c1", "task_complete", {"success": True, "summary": "ok"})]))
+    monkeypatch.setattr(agent, "test", mock_test)
+    monkeypatch.setattr(agent, "_detect_python_test_cmd", lambda ws, scope=None: "pytest -q")
+
+    agent.solo("任务")
+
+    # drive_soft_limits[0] 是初始 drive（=_SOLO_SOFT_LIMIT）
+    # drive_soft_limits[1] 是 gate 回灌 drive，应 <= total_rounds_at_that_point + 15
+    assert len(drive_soft_limits) >= 2, f"应有至少 2 次 drive 调用，实际={drive_soft_limits}"
+    gate_drive_limit = drive_soft_limits[1]
+    assert gate_drive_limit <= agent._SOLO_SOFT_LIMIT, "gate drive limit 不得超过全局上限"
+    # 初始 drive 的 soft_limit 减去 gate drive 的 soft_limit 应 >= _SOLO_SOFT_LIMIT - 15
+    assert drive_soft_limits[0] - gate_drive_limit >= agent._SOLO_SOFT_LIMIT - agent._SOLO_GATE_DRIVE_LIMIT - 5, \
+        f"gate drive_limit 未被限制，drive_soft_limits={drive_soft_limits}"
+
+
+# ── P1-10：同错收敛检测 ──
+
+def test_p110_same_error_convergence_stops_gate(tmp_path, monkeypatch):
+    """P1-10：连续两轮 test_cmd / err / modified 完全相同 → gate 提前退出 gate_status=failed。"""
+    _setup_ws(tmp_path)
+
+    # drive 不修改任何文件，也不 task_complete
+    drive_call = {"n": 0}
+
+    def capture_drive(messages, tools, compact_state, *, soft_limit, **kw):
+        drive_call["n"] += 1
+        return {"early_exit": False, "success": False, "summary": ""}
+
+    monkeypatch.setattr(agent, "_solo_drive", capture_drive)
+    monkeypatch.setattr(agent, "_dispatch_tool_calls", _stub_dispatch)
+    monkeypatch.setattr(agent, "call_llm", lambda msgs, **kw: _make_response(
+        "done", [("c1", "task_complete", {"success": True, "summary": "ok"})]))
+
+    # 每次测试都返回相同的失败
+    monkeypatch.setattr(agent, "test", lambda cmd, timeout_sec=None: {
+        "returncode": 1, "stderr": "same error", "stdout": ""
+    })
+    monkeypatch.setattr(agent, "_detect_python_test_cmd", lambda ws, scope=None: "pytest -q")
+
+    res = agent.solo("任务")
+    assert res["task_complete_signal"]["gate_status"] == "failed"
+    # 第一轮无 _prev，第二轮检测到相同 → 停止，gate_round 应很小
+    assert drive_call["n"] <= 3, f"同错应快速收敛，但 drive 调用了 {drive_call['n']} 次"
+
+
+# ── P1-11：gate 顶部先检查轮次 ──
+
+def test_p111_gate_skips_test_when_rounds_exhausted(tmp_path, monkeypatch):
+    """P1-11：total_rounds >= soft_limit 时，gate 不再跑测试（test 未被调用）。"""
+    _setup_ws(tmp_path)
+
+    test_called = {"n": 0}
+
+    def counting_test(cmd, timeout_sec=None):
+        test_called["n"] += 1
+        return {"returncode": 0, "stdout": "ok", "stderr": ""}
+
+    # drive 耗尽所有轮次（修改 no_progress_state["total_rounds"] 到上限）
+    def exhausting_drive(messages, tools, compact_state, *, soft_limit, no_progress_state, **kw):
+        no_progress_state["total_rounds"] = agent._SOLO_SOFT_LIMIT  # 直接耗尽
+        return {"early_exit": True, "success": True, "summary": "ok"}
+
+    monkeypatch.setattr(agent, "_solo_drive", exhausting_drive)
+    monkeypatch.setattr(agent, "_dispatch_tool_calls", _stub_dispatch)
+    monkeypatch.setattr(agent, "call_llm", lambda msgs, **kw: _make_response(
+        "done", [("c1", "task_complete", {"success": True, "summary": "ok"})]))
+    monkeypatch.setattr(agent, "test", counting_test)
+    monkeypatch.setattr(agent, "_detect_python_test_cmd", lambda ws, scope=None: "pytest -q")
+
+    res = agent.solo("任务")
+    assert test_called["n"] == 0, f"轮次耗尽后不应跑测试，但 test 被调了 {test_called['n']} 次"
+    assert res["task_complete_signal"]["gate_status"] == "failed"

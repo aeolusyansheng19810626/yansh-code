@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import re
@@ -138,6 +139,7 @@ _SOLO_SOFT_LIMIT     = 120       # 主 loop 工具调用轮次上限（连续 co
 _SOLO_TOKEN_BUDGET   = 600_000   # token 增量软提醒阈值（超过注入一次收敛提示；硬熔断交给 --max-cost）
 _SOLO_NO_PROGRESS_CAP = 6        # 连续 N 轮无写编辑先注提醒，2N 轮熔断（agent 级，区别于逐文件 no_progress）
 _SOLO_GATE_MAX_ROUNDS = 8        # 外部 test gate 回灌最大轮数
+_SOLO_GATE_DRIVE_LIMIT = 15      # 每次 gate 回灌最多给 agent 15 轮修复机会
 
 # backlog #1: fix loop baseline 失败识别
 # 进入 code() 前跑一次 test_command 捕获 baseline failures
@@ -1520,10 +1522,14 @@ def _infer_test_scope(plan_files, exclude: set | None = None) -> list[str]:
     scope: list[str] = []
     seen: set[str] = set()
 
-    # 预扫 tests/ 下的所有 test_*.py 加速查找（按 stem 索引）
+    # 预扫 tests/ 下的所有 test_*.py 和 *_test.py 加速查找（按 stem 索引）
     test_files_by_stem: dict[str, list[str]] = {}
     if tests_root.is_dir():
         for p in tests_root.rglob("test_*.py"):
+            rel = p.relative_to(ws).as_posix()
+            test_files_by_stem.setdefault(p.stem, []).append(rel)
+        # P1-7：同时收集 *_test.py，按 p.stem（即 "foo_test"）为键
+        for p in tests_root.rglob("*_test.py"):
             rel = p.relative_to(ws).as_posix()
             test_files_by_stem.setdefault(p.stem, []).append(rel)
 
@@ -1537,14 +1543,14 @@ def _infer_test_scope(plan_files, exclude: set | None = None) -> list[str]:
                 scope.append(rel)
                 seen.add(rel)
             continue
-        # 2. 源文件 → 找同名 test_<stem>.py（越权新建的测试文件在此处排除）
-        target_stem = f"test_{stem}"
-        for rel in test_files_by_stem.get(target_stem, []):
-            if exclude and rel in exclude:
-                continue  # 越权新建，跳过
-            if rel not in seen:
-                scope.append(rel)
-                seen.add(rel)
+        # 2. 源文件 → 找同名 test_<stem>.py 或 <stem>_test.py（越权新建的测试文件在此处排除）
+        for target_stem in (f"test_{stem}", f"{stem}_test"):
+            for rel in test_files_by_stem.get(target_stem, []):
+                if exclude and rel in exclude:
+                    continue  # 越权新建，跳过
+                if rel not in seen:
+                    scope.append(rel)
+                    seen.add(rel)
     return scope
 
 
@@ -1759,6 +1765,13 @@ def _dispatch_tool_call_inner(tool_call, args, *, mode="auto", allow_hil=True,
         _backup_file_if_needed(snap, args.get("src", ""))
         _backup_file_if_needed(snap, args.get("dst", ""))
         result = move_file(**args)
+        if result.get("success"):
+            src_f = args.get("src", "")
+            dst_f = args.get("dst", "")
+            if src_f:
+                _task_log_mod.record_file_modified(src_f)
+            if dst_f:
+                _task_log_mod.record_file_modified(dst_f)
         return {"name": name, "args": args, "id": tool_call.id, "result": result}
 
     if name == "apply_patch":
@@ -4164,21 +4177,35 @@ def solo(requirement, model_override=None):
     # P0-2 超时早停：连续两轮 timeout 且摘要相同则停止回灌
     _last_timeout_excerpt = None
     _consecutive_timeout = 0
+    # P1-10：同错收敛检测
+    _prev_gate_key = None
 
     while gate_round < _SOLO_GATE_MAX_ROUNDS:
+        # P1-11：在跑测试前先检查轮次是否耗尽
+        if no_progress_state["total_rounds"] >= _SOLO_SOFT_LIMIT:
+            console.print("[solo gate] 主 loop 轮次已耗尽，跳过本轮测试", style="yellow", highlight=False)
+            gate_status = "failed"
+            break
         modified = _task_log_mod.snapshot_files_modified()
         _ws_path = Path(_get_workspace())
         scope = _infer_test_scope([{"filename": f} for f in modified])
         # P0-4：两路共用 smoke 强并入
         scope = _force_include_smoke(scope, _ws_path)
-        # P0-1：区分 scope 是否命中（targeted）还是全量兜底（full）
-        targeted_cmd = _detect_python_test_cmd(_ws_path, scope=scope) if scope else None
-        if targeted_cmd:
-            test_cmd = targeted_cmd
-            coverage = "targeted"
-        else:
-            test_cmd = _detect_python_test_cmd(_ws_path)
+        # P0-1 / P1-12：区分 scope 是否命中（targeted）还是全量兜底（full）；按项目类型选 detector
+        _ptype = _PROJECT_TYPE or "python"
+        if _ptype.lower() == "node.js" or _ptype.lower() == "node":
+            from linter import _detect_node_test_cmd as _node_test_cmd
+            targeted_cmd = None  # node detector 暂不区分 targeted
+            test_cmd = _node_test_cmd(_ws_path)
             coverage = "full" if test_cmd else None
+        else:
+            targeted_cmd = _detect_python_test_cmd(_ws_path, scope=scope) if scope else None
+            if targeted_cmd:
+                test_cmd = targeted_cmd
+                coverage = "targeted"
+            else:
+                test_cmd = _detect_python_test_cmd(_ws_path)
+                coverage = "full" if test_cmd else None
         if not test_cmd:
             console.print("[solo gate] 无可用测试命令，跳过外部复核", style="yellow", highlight=False)
             gate_status = "no_command"
@@ -4207,15 +4234,27 @@ def solo(requirement, model_override=None):
             _consecutive_timeout = 0
             _last_timeout_excerpt = None
 
-        if no_progress_state["total_rounds"] >= _SOLO_SOFT_LIMIT:
-            console.print("[solo gate] 主 loop 轮次已耗尽，无法继续回灌修复", style="yellow", highlight=False)
+        # P1-10：同错 + 同修改集连续两轮未变化，停止无效回灌
+        _cur_err_hash = hashlib.md5(
+            (((test_result.get("stderr") or "") + (test_result.get("stdout") or ""))[:500]).encode()
+        ).hexdigest()[:8]
+        _cur_modified = tuple(sorted(_task_log_mod.snapshot_files_modified()))
+        _cur_gate_key = (test_cmd, _cur_err_hash, _cur_modified)
+        if _prev_gate_key is not None and _cur_gate_key == _prev_gate_key:
+            console.print("[solo gate] 同一错误 + 同一修改集连续两轮未变化，停止无效回灌", style="yellow", highlight=False)
             gate_status = "failed"
             break
+        _prev_gate_key = _cur_gate_key
+
         # P0-5：用确定性 payload 回灌，不再 stderr or stdout 二选一
         feedback = _build_gate_feedback(test_cmd, test_result, kind, hint)
         console.print(f"[solo gate] 测试失败（{kind}），回灌驱动修复（gate 轮 {gate_round}）", style="yellow", highlight=False)
         messages.append({"role": "user", "content": feedback})
-        signal = _solo_drive(messages, tools, compact_state, soft_limit=_SOLO_SOFT_LIMIT,
+        # P1-9：每次 gate 回灌限制轮次，避免单次 drive 耗尽全部 soft_limit
+        _remaining = _SOLO_SOFT_LIMIT - no_progress_state["total_rounds"]
+        _drive_limit = min(_SOLO_GATE_DRIVE_LIMIT, max(1, _remaining))
+        signal = _solo_drive(messages, tools, compact_state,
+                             soft_limit=no_progress_state["total_rounds"] + _drive_limit,
                              start_tokens=start_tokens, budget_state=budget_state,
                              no_progress_state=no_progress_state)
         # gate 每轮后更新 agent_completed（agent 可能在回灌后放弃）

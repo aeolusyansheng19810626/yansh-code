@@ -7,11 +7,23 @@ _backup_file_if_needed() 在 LLM 写入前增量补充。回滚时按 meta.files
 import os
 import json
 import shutil
+import tempfile
+import threading
 from datetime import datetime
 from pathlib import Path
 
 from console_shared import console
 import config as _cfg_mod
+
+# P1-升级：meta.json 读-改-写原子化，防并发 subagent race
+_SNAPSHOT_META_LOCK = threading.Lock()
+
+
+def _atomic_write(path: Path, content: str):
+    """原子写：先写临时文件再 os.replace（Windows 上也原子）"""
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    os.replace(str(tmp), str(path))
 
 # 快照/回滚时需要跳过的目录
 _SNAPSHOT_IGNORE_DIRS = {".git", ".yansh", "__pycache__", "venv", "node_modules", ".pytest_cache"}
@@ -74,22 +86,24 @@ def _backup_file_if_needed(snap_info, filename):
         return  # 已备份过
     src = Path(_cfg_mod.WORKSPACE_DIR) / filename
     meta_file = snap_dir / "meta.json"
-    try:
-        meta = json.loads(meta_file.read_text(encoding="utf-8")) if meta_file.exists() else {}
-    except Exception:
-        meta = {}
 
-    if src.exists() and src.is_file():
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(str(src), str(target))
-        if filename not in meta.get("files", []):
-            meta.setdefault("files", []).append(filename)
-            meta_file.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
-    else:
-        # src 不存在：即将新建的文件，记入 created 以便回滚时删除
-        if filename not in meta.get("created", []):
-            meta.setdefault("created", []).append(filename)
-            meta_file.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+    with _SNAPSHOT_META_LOCK:
+        try:
+            meta = json.loads(meta_file.read_text(encoding="utf-8")) if meta_file.exists() else {}
+        except Exception:
+            meta = {}
+
+        if src.exists() and src.is_file():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(src), str(target))
+            if filename not in meta.get("files", []):
+                meta.setdefault("files", []).append(filename)
+                _atomic_write(meta_file, json.dumps(meta, ensure_ascii=False))
+        else:
+            # src 不存在：即将新建的文件，记入 created 以便回滚时删除
+            if filename not in meta.get("created", []):
+                meta.setdefault("created", []).append(filename)
+                _atomic_write(meta_file, json.dumps(meta, ensure_ascii=False))
 
 
 def restore_snapshot(snap_info):
