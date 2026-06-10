@@ -1579,6 +1579,38 @@ def _smoke_exists(ws) -> bool:
     return (Path(ws) / "tests" / "test_smoke.py").is_file()
 
 
+def _final_gate_verdict(ws_path, timeout_gate):
+    """轮次耗尽兜底：烧光 soft_limit ≠ 失败，做一次最终裁定。
+    跑一次测试，按与正常 gate pass 分支**完全相同**的语义判 gate_status，
+    但不再回灌、不做确认 drive（没有剩余轮次）。返回 (gate_status, test_result)。
+    救回「功能其实满分却因 agent 啰嗦烧光轮次被无条件判 failed」的假阴性（见 R19）。"""
+    modified = _task_log_mod.snapshot_files_modified()
+    scope = _force_include_smoke(_infer_test_scope([{"filename": f} for f in modified]), ws_path)
+    _ptype = (_PROJECT_TYPE or "python").lower()
+    if _ptype in ("node.js", "node"):
+        from linter import _detect_node_test_cmd as _node_test_cmd
+        test_cmd = _node_test_cmd(ws_path)
+        coverage = "full" if test_cmd else None
+    else:
+        targeted = _detect_python_test_cmd(ws_path, scope=scope) if scope else None
+        if targeted:
+            test_cmd, coverage = targeted, "targeted"
+        else:
+            test_cmd = _detect_python_test_cmd(ws_path)
+            coverage = "full" if test_cmd else None
+    if not test_cmd:
+        return "no_command", {"returncode": 0, "stdout": "", "stderr": ""}
+    tr = test(test_cmd, timeout_sec=timeout_gate)
+    if not judge(tr):
+        return "failed", tr
+    # 通过：targeted → passed（但改入口且无 smoke → no_smoke，暴露真实缺陷）；全量兜底 → coverage_unknown
+    if coverage == "targeted":
+        if _entry_modified(modified) and not _smoke_exists(ws_path):
+            return "no_smoke", tr
+        return "passed", tr
+    return "coverage_unknown", tr
+
+
 def _apply_test_scope_override(plan_result: dict, exclude: set | None = None) -> None:
     """P1.3：原地重写 plan_result['test_command']——基于 plan_result['files'] 推断
     相关测试 scope，命中后用 _detect_python_test_cmd(scope=...) 重新构造命令。
@@ -4211,10 +4243,11 @@ def solo(requirement, model_override=None):
     _smoke_demanded = False
 
     while gate_round < _SOLO_GATE_MAX_ROUNDS:
-        # P1-11：在跑测试前先检查轮次是否耗尽
+        # P1-11 / R19 兜底：轮次耗尽不直接判失败，做一次最终裁定（不再回灌）
         if no_progress_state["total_rounds"] >= _SOLO_SOFT_LIMIT:
-            console.print("[solo gate] 主 loop 轮次已耗尽，跳过本轮测试", style="yellow", highlight=False)
-            gate_status = "failed"
+            console.print("[solo gate] 主 loop 轮次已耗尽，做一次最终裁定（不再回灌）", style="yellow", highlight=False)
+            gate_status, test_result = _final_gate_verdict(Path(_get_workspace()), _timeout_gate)
+            console.print(f"[solo gate] 最终裁定：{gate_status}", style="yellow", highlight=False)
             break
         modified = _task_log_mod.snapshot_files_modified()
         _ws_path = Path(_get_workspace())

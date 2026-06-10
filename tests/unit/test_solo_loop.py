@@ -570,8 +570,9 @@ def test_p110_same_error_convergence_stops_gate(tmp_path, monkeypatch):
 
 # ── P1-11：gate 顶部先检查轮次 ──
 
-def test_p111_gate_skips_test_when_rounds_exhausted(tmp_path, monkeypatch):
-    """P1-11：total_rounds >= soft_limit 时，gate 不再跑测试（test 未被调用）。"""
+def test_p111_gate_runs_final_verdict_when_rounds_exhausted(tmp_path, monkeypatch):
+    """R19 兜底：total_rounds >= soft_limit 时，gate 不再无条件 failed，而是做一次
+    最终裁定（跑一次测试，test 被调 1 次）。本例无 scope 全量绿 → coverage_unknown。"""
     _setup_ws(tmp_path)
 
     test_called = {"n": 0}
@@ -593,8 +594,8 @@ def test_p111_gate_skips_test_when_rounds_exhausted(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "_detect_python_test_cmd", lambda ws, scope=None: "pytest -q")
 
     res = agent.solo("任务")
-    assert test_called["n"] == 0, f"轮次耗尽后不应跑测试，但 test 被调了 {test_called['n']} 次"
-    assert res["task_complete_signal"]["gate_status"] == "failed"
+    assert test_called["n"] == 1, f"轮次耗尽应做一次最终裁定，但 test 被调了 {test_called['n']} 次"
+    assert res["task_complete_signal"]["gate_status"] == "coverage_unknown"
 
 
 # ── P2-15：no_progress 按 dispatch result 区分有效进展 ─────────────────────────
