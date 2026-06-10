@@ -1564,6 +1564,21 @@ def _force_include_smoke(scope: list, ws) -> list:
     return scope
 
 
+# 方案a #6：CLI 入口文件惯例名（console_scripts 入口暂不解析 pyproject/setup.py 声明）
+_SOLO_ENTRY_BASENAMES = {"__main__.py", "cli.py"}
+
+
+def _entry_modified(modified) -> bool:
+    """方案a #6：本次改动是否触及 CLI 入口文件（__main__.py / cli.py）。
+    用于判定 targeted 测试虽绿但可能漏测跨文件 CLI 调用链断裂。"""
+    return any(Path(f).name in _SOLO_ENTRY_BASENAMES for f in (modified or []))
+
+
+def _smoke_exists(ws) -> bool:
+    """方案a #6：ws 是否存在 tests/test_smoke.py。"""
+    return (Path(ws) / "tests" / "test_smoke.py").is_file()
+
+
 def _apply_test_scope_override(plan_result: dict, exclude: set | None = None) -> None:
     """P1.3：原地重写 plan_result['test_command']——基于 plan_result['files'] 推断
     相关测试 scope，命中后用 _detect_python_test_cmd(scope=...) 重新构造命令。
@@ -2283,6 +2298,7 @@ This plan is your anchor. Refer back to it; keep names consistent with it.
 - 自己先把测试跑绿（execute_command 跑 pytest），再 task_complete。外部还有一道 test gate 会复核，**不要弱化断言来骗过测试**——那是把 bug 藏起来。
 - 数值/范围断言：先 execute_command 跑出真实值再写断言，不要猜。
 - **运行 pytest 时默认加 `-q`**（减少 PASSED 行噪音，节省 context）；需要完整 traceback 定位时再加 `-v`。
+- **端到端 smoke 必写（硬性判据）**：若 requirement 涉及命令行 / CLI 入口（`__main__.py` / `cli.py` / console_scripts），**必须**新建 `tests/test_smoke.py`，用 subprocess 调真实入口（如 `subprocess.run([sys.executable, "-m", "<pkg>", ...], capture_output=True)`），断言退出码为 0 且关键输出正确。单元测试与实现共享同一套模块假设，**测不出跨文件 CLI 调用链断裂**——smoke 是唯一出口。外部 gate 会强制要求此文件，缺它不算完成。
 
 [新建文件例外 — 覆盖 _CODER_ROLE 第 10 条]
 _CODER_ROLE 的「禁止 write_file 整体重写」只适用于**已存在的 >100 行大文件**。**从零创建新文件就该用 write_file 一次写出完整内容**——这是正常且推荐的。只有在已存在的大文件上做局部修改时，才必须改用 replace_in_file。
@@ -4191,6 +4207,8 @@ def solo(requirement, model_override=None):
     _prev_gate_key = None
     # #2 fix：记录上一轮 drive 前的 modified 快照，用于判断本轮是否有新增写
     _prev_gate_modified: set = set()
+    # 方案a #6：改入口文件却无 smoke 时只回灌一次要求补
+    _smoke_demanded = False
 
     while gate_round < _SOLO_GATE_MAX_ROUNDS:
         # P1-11：在跑测试前先检查轮次是否耗尽
@@ -4227,6 +4245,35 @@ def solo(requirement, model_override=None):
             console.print(f"[solo gate] 测试通过（{test_cmd}）", style="green", highlight=False)
             # P0-1：scope 命中得到针对性测试 → passed；全量兜底 → coverage_unknown（不能证明本次改动被覆盖）
             gate_status = "passed" if coverage == "targeted" else "coverage_unknown"
+            # 方案a #6：targeted 绿但改了 CLI 入口却无 tests/test_smoke.py → no_smoke（不放行），回灌一次要求补
+            if gate_status == "passed" and _entry_modified(modified) and not _smoke_exists(_ws_path):
+                if (not _smoke_demanded
+                        and no_progress_state["total_rounds"] < _SOLO_SOFT_LIMIT
+                        and gate_round < _SOLO_GATE_MAX_ROUNDS):
+                    _smoke_demanded = True
+                    gate_status = "no_smoke"
+                    console.print("[solo gate] 改动含 CLI 入口但缺 tests/test_smoke.py，回灌要求补端到端 smoke",
+                                  style="yellow", highlight=False)
+                    messages.append({"role": "user", "content": (
+                        "针对性单元测试已通过，但本次改动涉及 CLI 入口文件（__main__.py / cli.py），"
+                        "却没有 tests/test_smoke.py。单元测试与实现共享同样的模块假设，"
+                        "测不出跨文件 CLI 调用链断裂。请新建 tests/test_smoke.py：用 subprocess 调用真实入口"
+                        "（如 subprocess.run([sys.executable, '-m', '<pkg>', ...], capture_output=True)），"
+                        "断言退出码为 0 且关键输出正确，先把它跑绿，再 task_complete。"
+                    )})
+                    gate_round += 1
+                    _remaining = _SOLO_SOFT_LIMIT - no_progress_state["total_rounds"]
+                    _prev_gate_modified = set(_task_log_mod.snapshot_files_modified())
+                    signal = _solo_drive(messages, tools, compact_state,
+                                         soft_limit=no_progress_state["total_rounds"] + min(_SOLO_GATE_DRIVE_LIMIT, max(1, _remaining)),
+                                         start_tokens=start_tokens, budget_state=budget_state,
+                                         no_progress_state=no_progress_state)
+                    agent_completed = bool(signal.get("early_exit") and signal.get("success"))
+                    continue  # 回去重跑测试（agent 应已补 smoke，_force_include_smoke 会纳入）
+                else:
+                    # 已要求过仍未补，或轮次/gate 耗尽 → 保持 no_smoke，不放行
+                    gate_status = "no_smoke"
+                    break
             # #3 fix：gate 绿但 agent 未重宣告（drive 撞 _drive_limit 退出），给一次确认 drive
             if gate_status == "passed" and not agent_completed:
                 if no_progress_state["total_rounds"] < _SOLO_SOFT_LIMIT:

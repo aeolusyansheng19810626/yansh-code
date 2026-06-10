@@ -393,6 +393,120 @@ def test_fable5_5_no_overwrite_when_target_exists(tmp_path, monkeypatch):
         "target 已存在时不应用 modified src 覆盖 baseline"
 
 
+# ══════════════════════════════════════════════
+# #6 方案a：no_smoke 状态（改 CLI 入口却无 smoke 不放行）
+# ══════════════════════════════════════════════
+
+def test_fable5_6_entry_modified_helper():
+    """#6：_entry_modified 仅对 __main__.py / cli.py 返回 True。"""
+    assert agent._entry_modified(["pkg/__main__.py"]) is True
+    assert agent._entry_modified(["pkg/sub/cli.py"]) is True
+    assert agent._entry_modified(["pkg/foo.py", "pkg/bar.py"]) is False
+    assert agent._entry_modified([]) is False
+    assert agent._entry_modified(None) is False
+
+
+def test_fable5_6_smoke_exists_helper(tmp_path):
+    """#6：_smoke_exists 检测 tests/test_smoke.py。"""
+    assert agent._smoke_exists(tmp_path) is False
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_smoke.py").write_text("x", encoding="utf-8")
+    assert agent._smoke_exists(tmp_path) is True
+
+
+def _setup_gate_mocks(monkeypatch, *, test_passes=True):
+    """公共：targeted 测试命令 + 测试结果。"""
+    _ = test_passes
+    monkeypatch.setattr(agent, "_infer_test_scope", lambda *a, **k: ["tests/test_foo.py"])
+    monkeypatch.setattr(agent, "_detect_python_test_cmd",
+                        lambda ws, scope=None: "pytest -q tests/test_foo.py" if scope else None)
+    monkeypatch.setattr(agent, "_force_include_smoke", lambda scope, ws: scope)
+    monkeypatch.setattr(agent, "test",
+                        lambda cmd, timeout_sec=None: {"returncode": 0, "stdout": "1 passed", "stderr": ""})
+
+
+def test_fable5_6_no_smoke_blocks_when_entry_no_smoke(tmp_path, monkeypatch):
+    """#6：改了 CLI 入口、targeted 绿、但始终无 smoke → 回灌一次后仍 no_smoke，不放行。"""
+    _setup_ws(tmp_path)
+    monkeypatch.setattr(agent, "_dispatch_tool_calls", _stub_dispatch)
+    _setup_gate_mocks(monkeypatch)
+    monkeypatch.setattr(agent, "_entry_modified", lambda modified: True)
+    monkeypatch.setattr(agent, "_smoke_exists", lambda ws: False)  # agent 始终不补
+
+    llm_seq = [
+        _make_response("done", [("c1", "task_complete", {"success": True, "summary": "v1"})]),
+        _make_response("done2", [("c2", "task_complete", {"success": True, "summary": "v2"})]),
+    ]
+    calls = {"n": 0}
+
+    def mock_llm(msgs, **kw):
+        r = llm_seq[min(calls["n"], len(llm_seq) - 1)]
+        calls["n"] += 1
+        return r
+
+    monkeypatch.setattr(agent, "call_llm", mock_llm)
+    res = agent.solo("写个 CLI")
+    assert res["task_complete_signal"]["gate_status"] == "no_smoke"
+    assert res["success"] is False
+
+
+def test_fable5_6_passed_when_smoke_added_after_demand(tmp_path, monkeypatch):
+    """#6：回灌后 agent 补了 smoke → 第二次复核放行 passed。"""
+    _setup_ws(tmp_path)
+    monkeypatch.setattr(agent, "_dispatch_tool_calls", _stub_dispatch)
+    _setup_gate_mocks(monkeypatch)
+    monkeypatch.setattr(agent, "_entry_modified", lambda modified: True)
+    # 首次复核无 smoke，回灌后第二次复核已补
+    smoke_state = {"vals": [False, True], "n": 0}
+
+    def mock_smoke(ws):
+        v = smoke_state["vals"][min(smoke_state["n"], len(smoke_state["vals"]) - 1)]
+        smoke_state["n"] += 1
+        return v
+
+    monkeypatch.setattr(agent, "_smoke_exists", mock_smoke)
+
+    llm_seq = [
+        _make_response("done", [("c1", "task_complete", {"success": True, "summary": "v1"})]),
+        _make_response("补了 smoke", [("c2", "task_complete", {"success": True, "summary": "v2"})]),
+    ]
+    calls = {"n": 0}
+
+    def mock_llm(msgs, **kw):
+        r = llm_seq[min(calls["n"], len(llm_seq) - 1)]
+        calls["n"] += 1
+        return r
+
+    monkeypatch.setattr(agent, "call_llm", mock_llm)
+    res = agent.solo("写个 CLI")
+    assert res["task_complete_signal"]["gate_status"] == "passed"
+    assert res["success"] is True
+
+
+def test_fable5_6_no_entry_normal_pass(tmp_path, monkeypatch):
+    """#6：未改 CLI 入口 → 不触发 no_smoke，正常 passed。"""
+    _setup_ws(tmp_path)
+    monkeypatch.setattr(agent, "_dispatch_tool_calls", _stub_dispatch)
+    _setup_gate_mocks(monkeypatch)
+    monkeypatch.setattr(agent, "_entry_modified", lambda modified: False)
+    monkeypatch.setattr(agent, "_smoke_exists", lambda ws: False)
+
+    llm_seq = [
+        _make_response("done", [("c1", "task_complete", {"success": True, "summary": "v1"})]),
+    ]
+    calls = {"n": 0}
+
+    def mock_llm(msgs, **kw):
+        r = llm_seq[min(calls["n"], len(llm_seq) - 1)]
+        calls["n"] += 1
+        return r
+
+    monkeypatch.setattr(agent, "call_llm", mock_llm)
+    res = agent.solo("写个普通库")
+    assert res["task_complete_signal"]["gate_status"] == "passed"
+    assert res["success"] is True
+
+
 def test_fable5_5_concurrent_no_overwrite(tmp_path, monkeypatch):
     """#5：并发两个线程首触，只有一个写入 baseline，另一个因双重检查放弃。"""
     snap_dir = tmp_path / "snap"
