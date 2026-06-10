@@ -3997,7 +3997,7 @@ def _get_out_result(outs: list, tc) -> dict:
 
 
 def _solo_drive(messages, tools, compact_state, *, soft_limit, start_tokens,
-                budget_state, no_progress_state):
+                budget_state, no_progress_state, capture_anchor: bool = False):
     """solo 主驱动循环。原地 append messages；budget_state / no_progress_state 跨 gate 回灌持续累积。
     返回 {"early_exit", "success", "summary", "rounds_used"}.
     """
@@ -4038,8 +4038,8 @@ def _solo_drive(messages, tools, compact_state, *, soft_limit, start_tokens,
             "tool_calls": [tc.model_dump() for tc in msg.tool_calls] if msg.tool_calls else None,
         })
 
-        # P0-3：首轮捕获 agent 开场规划作为 plan_anchor，跨 compact 持久保留
-        if rounds_used == 1 and compact_state.get("plan_anchor") is None:
+        # P0-3：初始 drive 期间任意轮，只要 anchor 仍为 None 且本轮有文本就捕获
+        if capture_anchor and compact_state.get("plan_anchor") is None:
             if msg.content and msg.content.strip():
                 compact_state["plan_anchor"] = msg.content[:2000]
 
@@ -4173,7 +4173,7 @@ def solo(requirement, model_override=None):
 
     signal = _solo_drive(messages, tools, compact_state, soft_limit=_SOLO_SOFT_LIMIT,
                          start_tokens=start_tokens, budget_state=budget_state,
-                         no_progress_state=no_progress_state)
+                         no_progress_state=no_progress_state, capture_anchor=True)
 
     # P0-1：agent 自述完成 = agent 主动 task_complete(success=true)
     agent_completed = bool(signal.get("early_exit") and signal.get("success"))
@@ -4189,6 +4189,8 @@ def solo(requirement, model_override=None):
     _consecutive_timeout = 0
     # P1-10：同错收敛检测
     _prev_gate_key = None
+    # #2 fix：记录上一轮 drive 前的 modified 快照，用于判断本轮是否有新增写
+    _prev_gate_modified: set = set()
 
     while gate_round < _SOLO_GATE_MAX_ROUNDS:
         # P1-11：在跑测试前先检查轮次是否耗尽
@@ -4225,6 +4227,18 @@ def solo(requirement, model_override=None):
             console.print(f"[solo gate] 测试通过（{test_cmd}）", style="green", highlight=False)
             # P0-1：scope 命中得到针对性测试 → passed；全量兜底 → coverage_unknown（不能证明本次改动被覆盖）
             gate_status = "passed" if coverage == "targeted" else "coverage_unknown"
+            # #3 fix：gate 绿但 agent 未重宣告（drive 撞 _drive_limit 退出），给一次确认 drive
+            if gate_status == "passed" and not agent_completed:
+                if no_progress_state["total_rounds"] < _SOLO_SOFT_LIMIT:
+                    messages.append({"role": "user", "content": "针对性测试已全部通过。如确认任务完成，请立即调用 task_complete(success=true)。"})
+                    _confirm_signal = _solo_drive(
+                        messages, tools, compact_state,
+                        soft_limit=no_progress_state["total_rounds"] + 2,
+                        start_tokens=start_tokens, budget_state=budget_state,
+                        no_progress_state=no_progress_state,
+                    )
+                    agent_completed = bool(_confirm_signal.get("early_exit") and _confirm_signal.get("success"))
+                    signal = _confirm_signal
             break
         gate_round += 1
         # P0-2：超时早停——连续 2 轮 timeout 且错误摘要相同，停止烧 gate 轮
@@ -4244,14 +4258,25 @@ def solo(requirement, model_override=None):
             _consecutive_timeout = 0
             _last_timeout_excerpt = None
 
-        # P1-10：同错 + 同修改集连续两轮未变化，停止无效回灌
-        _cur_err_hash = hashlib.md5(
-            (((test_result.get("stderr") or "") + (test_result.get("stdout") or ""))[:500]).encode()
-        ).hexdigest()[:8]
-        _cur_modified = tuple(sorted(_task_log_mod.snapshot_files_modified()))
-        _cur_gate_key = (test_cmd, _cur_err_hash, _cur_modified)
-        if _prev_gate_key is not None and _cur_gate_key == _prev_gate_key:
-            console.print("[solo gate] 同一错误 + 同一修改集连续两轮未变化，停止无效回灌", style="yellow", highlight=False)
+        # P1-10 / #2 fix：同错收敛检测——err_hash 用 test-id 集合，第三元用新增写标志
+        _stdout = test_result.get("stdout") or ""
+        _stderr = test_result.get("stderr") or ""
+        _test_ids = _parse_pytest_failures(_stdout + _stderr)
+        if _test_ids:
+            _cur_err_hash = hashlib.md5(
+                (" ".join(sorted(_test_ids))).encode()
+            ).hexdigest()[:8]
+        else:
+            # 解析失败 fallback：用输出尾部 500 字符
+            _cur_err_hash = hashlib.md5(
+                ((_stderr + _stdout)[-500:]).encode()
+            ).hexdigest()[:8]
+        # 计算本 gate 轮内新增写（与上一轮 drive 前快照对比）
+        _new_writes = set(_task_log_mod.snapshot_files_modified()) - _prev_gate_modified
+        _cur_gate_key = (test_cmd, _cur_err_hash)
+        # 收敛：test-id 集合 hash 相同 AND 本轮无新增写，才停止
+        if _prev_gate_key is not None and _cur_gate_key == _prev_gate_key and not _new_writes:
+            console.print("[solo gate] 同一失败集合连续两轮无新写，停止无效回灌", style="yellow", highlight=False)
             gate_status = "failed"
             break
         _prev_gate_key = _cur_gate_key
@@ -4263,6 +4288,8 @@ def solo(requirement, model_override=None):
         # P1-9：每次 gate 回灌限制轮次，避免单次 drive 耗尽全部 soft_limit
         _remaining = _SOLO_SOFT_LIMIT - no_progress_state["total_rounds"]
         _drive_limit = min(_SOLO_GATE_DRIVE_LIMIT, max(1, _remaining))
+        # 记录本次 drive 前的 modified 快照，供下轮收敛判定用
+        _prev_gate_modified = set(_task_log_mod.snapshot_files_modified())
         signal = _solo_drive(messages, tools, compact_state,
                              soft_limit=no_progress_state["total_rounds"] + _drive_limit,
                              start_tokens=start_tokens, budget_state=budget_state,

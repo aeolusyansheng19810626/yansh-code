@@ -54,7 +54,7 @@ def _update_agent_state(command: str, returncode: int) -> None:
         return
     # 跳过多行命令和超长命令（debug 脚本，对跨 run 无复用价值）
     cmd_stripped = command.strip()
-    if "\n" in cmd_stripped or len(cmd_stripped) > 160:
+    if any(ord(c) < 0x20 for c in cmd_stripped) or len(cmd_stripped) > 160:
         return
     try:
         state_dir = Path(_get_workspace()) / ".yansh"
