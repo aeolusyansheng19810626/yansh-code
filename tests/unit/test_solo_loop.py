@@ -61,7 +61,7 @@ def _setup_ws(tmp_path):
 
 
 def test_solo_basic_flow_write_then_complete(tmp_path, monkeypatch):
-    """写一轮 → task_complete(success=true)；gate 无测试命令跳过 → solo 成功。"""
+    """写一轮 → task_complete(success=true)；gate 无测试命令 → P0-1：no_command → success=False。"""
     _setup_ws(tmp_path)
     seq = [
         _make_response("规划：写 foo.py", [("c1", "write_file", {"filename": "foo.py", "content": "x=1"})]),
@@ -79,7 +79,10 @@ def test_solo_basic_flow_write_then_complete(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "_detect_python_test_cmd", lambda *a, **k: None)
 
     res = agent.solo("实现 foo")
-    assert res["success"] is True
+    # P0-1：无测试命令 → gate_status=no_command → final_success=False（零外部复核不得放行）
+    assert res["success"] is False
+    assert res["task_complete_signal"]["gate_status"] == "no_command"
+    assert res["task_complete_signal"]["agent_completed"] is True
     assert res["task_complete_signal"]["early_exit"] is True
     assert calls["n"] == 2
 
@@ -106,7 +109,8 @@ def test_solo_no_progress_circuit_break(tmp_path, monkeypatch):
 
 
 def test_solo_gate_reinjection_drives_fix(tmp_path, monkeypatch):
-    """agent 先 task_complete，但外部 gate 测试首轮失败 → 回灌再驱动 → 二轮通过。"""
+    """agent 先 task_complete，但外部 gate 测试首轮失败 → 回灌再驱动 → 二轮通过。
+    P0-1：全量兜底 coverage=full → gate_status=coverage_unknown → final_success=False。"""
     _setup_ws(tmp_path)
     monkeypatch.setattr(agent, "_dispatch_tool_calls", _stub_dispatch)
     monkeypatch.setattr(agent, "_detect_python_test_cmd", lambda *a, **k: "pytest -q")
@@ -130,7 +134,7 @@ def test_solo_gate_reinjection_drives_fix(tmp_path, monkeypatch):
     ]
     test_calls = {"n": 0}
 
-    def mock_test(cmd):
+    def mock_test(cmd, timeout_sec=None):
         r = test_results[min(test_calls["n"], len(test_results) - 1)]
         test_calls["n"] += 1
         return r
@@ -139,7 +143,11 @@ def test_solo_gate_reinjection_drives_fix(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "test", mock_test)
 
     res = agent.solo("实现并测试")
-    assert res["success"] is True
+    # P0-1：_detect_python_test_cmd 不区分 scope，coverage=full → gate_status=coverage_unknown
+    # coverage_unknown 不得视为成功（全量旧测试绿不能证明本次改动被覆盖）
+    assert res["success"] is False
+    assert res["task_complete_signal"]["gate_status"] == "coverage_unknown"
+    assert res["task_complete_signal"]["agent_completed"] is True
     assert test_calls["n"] == 2   # 跑了两次测试（失败→回灌→通过）
     assert calls["n"] == 2        # 两次 drive 各 task_complete 一次
 
@@ -173,3 +181,243 @@ def test_solo_tools_writable_and_no_planmode():
     assert "dispatch_subagent" in names
     assert "update_plan_draft" not in names
     assert "exit_plan_mode_signal" not in names
+
+
+# ========== P0 新增用例 ==========
+
+# ── P0-1：gate 三态真值表 ──
+
+def _make_targeted_test_setup(tmp_path, monkeypatch, agent_success, test_returncode):
+    """公共 helper：设置 targeted scope（直接 mock _infer_test_scope 返回非空）。"""
+    _setup_ws(tmp_path)
+    monkeypatch.setattr(agent, "_dispatch_tool_calls", _stub_dispatch)
+    # targeted_cmd 路径：scope 非空时 _detect_python_test_cmd 返回命令
+    monkeypatch.setattr(agent, "_detect_python_test_cmd", lambda ws, scope=None: "pytest -q tests/test_foo.py" if scope else None)
+    monkeypatch.setattr(agent, "_infer_test_scope", lambda *a, **k: ["tests/test_foo.py"])
+
+    llm_seq = [_make_response("done", [("c1", "task_complete", {"success": agent_success, "summary": "s"})])]
+    calls = {"n": 0}
+
+    def mock_llm(msgs, **kw):
+        r = llm_seq[min(calls["n"], len(llm_seq) - 1)]
+        calls["n"] += 1
+        return r
+
+    def mock_test(cmd, timeout_sec=None):
+        return {"returncode": test_returncode, "stdout": "ok" if test_returncode == 0 else "", "stderr": "FAILED" if test_returncode != 0 else ""}
+
+    monkeypatch.setattr(agent, "call_llm", mock_llm)
+    monkeypatch.setattr(agent, "test", mock_test)
+
+
+def test_p01_agent_abandoned_gate_green_is_false(tmp_path, monkeypatch):
+    """P0-1 原 bug ①：agent 放弃（success=false）但测试绿 → final_success 必须 False。"""
+    _make_targeted_test_setup(tmp_path, monkeypatch, agent_success=False, test_returncode=0)
+    res = agent.solo("任务")
+    assert res["success"] is False, "agent 放弃时，gate 绿不得覆盖失败"
+    assert res["task_complete_signal"]["agent_completed"] is False
+    assert res["task_complete_signal"]["gate_status"] == "passed"
+
+
+def test_p01_agent_completed_no_test_cmd_is_false(tmp_path, monkeypatch):
+    """P0-1 原 bug ②：agent 自述成功但无测试命令 → final_success 必须 False（no_command）。"""
+    _setup_ws(tmp_path)
+    monkeypatch.setattr(agent, "_dispatch_tool_calls", _stub_dispatch)
+    monkeypatch.setattr(agent, "_detect_python_test_cmd", lambda *a, **k: None)
+
+    monkeypatch.setattr(agent, "call_llm", lambda msgs, **kw: _make_response(
+        "done", [("c1", "task_complete", {"success": True, "summary": "完成"})]))
+
+    res = agent.solo("任务")
+    assert res["success"] is False, "无测试命令不得放行"
+    assert res["task_complete_signal"]["gate_status"] == "no_command"
+    assert res["task_complete_signal"]["agent_completed"] is True
+
+
+def test_p01_agent_completed_targeted_green_is_true(tmp_path, monkeypatch):
+    """P0-1：agent 完成 + targeted 测试绿 → final_success True（正常路径）。"""
+    _make_targeted_test_setup(tmp_path, monkeypatch, agent_success=True, test_returncode=0)
+    res = agent.solo("任务")
+    assert res["success"] is True
+    assert res["task_complete_signal"]["gate_status"] == "passed"
+    assert res["task_complete_signal"]["agent_completed"] is True
+
+
+def test_p01_coverage_unknown_is_false(tmp_path, monkeypatch):
+    """P0-1：scope 落空 → full 兜底绿 → coverage_unknown → final_success False。"""
+    _setup_ws(tmp_path)
+    monkeypatch.setattr(agent, "_dispatch_tool_calls", _stub_dispatch)
+    # scope 空（_infer_test_scope 返回 []）→ targeted_cmd=None → 全量兜底
+    monkeypatch.setattr(agent, "_detect_python_test_cmd", lambda ws, scope=None: "pytest -q" if scope is None or not scope else None)
+    monkeypatch.setattr(agent, "_infer_test_scope", lambda *a, **k: [])
+
+    monkeypatch.setattr(agent, "call_llm", lambda msgs, **kw: _make_response(
+        "done", [("c1", "task_complete", {"success": True, "summary": "完成"})]))
+    monkeypatch.setattr(agent, "test", lambda cmd, timeout_sec=None: {"returncode": 0, "stdout": "1 passed", "stderr": ""})
+
+    res = agent.solo("任务")
+    assert res["success"] is False
+    assert res["task_complete_signal"]["gate_status"] == "coverage_unknown"
+
+
+# ── P0-2：判定分类 ──
+
+def test_p02_classify_timeout():
+    """_classify_test_failure：error_kind=timeout → kind=timeout。"""
+    kind, hint = agent._classify_test_failure({"error_kind": "timeout", "returncode": -1, "stdout": "", "stderr": ""})
+    assert kind == "timeout"
+    assert "超时" in hint
+
+
+def test_p02_classify_rc2():
+    """_classify_test_failure：rc=2 → uncollectable。"""
+    kind, hint = agent._classify_test_failure({"returncode": 2, "stdout": "", "stderr": ""})
+    assert kind == "uncollectable"
+
+
+def test_p02_classify_import_error():
+    """_classify_test_failure：ImportError 在输出中 → uncollectable。"""
+    kind, hint = agent._classify_test_failure({"returncode": 1, "stdout": "ImportError: no module", "stderr": ""})
+    assert kind == "uncollectable"
+
+
+def test_p02_classify_assertion():
+    """_classify_test_failure：rc=1 无特殊标记 → assertion。"""
+    kind, hint = agent._classify_test_failure({"returncode": 1, "stdout": "FAILED tests/x.py - AssertionError", "stderr": ""})
+    assert kind == "assertion"
+    assert "断言" in hint
+
+
+# ── P0-3：compact 锚点 ──
+
+def test_p03_compact_plan_anchor_injected(tmp_path, monkeypatch):
+    """compact 时 plan_anchor 非空 → new_msgs 含 '[开场规划锚点' 系统消息。"""
+    import agent as _agent
+    # 构造足够多的 messages 触发 compact（绕过 token 阈值，直接调 _compact_messages）
+    plan_text = "规划：实现 foo + bar，接口 foo(x)->int，bar(y)->str"
+    head = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "task"},
+    ]
+    pairs_flat = []
+    for i in range(5):
+        pairs_flat.append({"role": "assistant", "content": f"步骤 {i}", "tool_calls": None})
+        pairs_flat.append({"role": "user", "content": f"结果 {i}"})
+    msgs = head + pairs_flat
+
+    # mock _summarize_old_history 避免真实 LLM 调用
+    monkeypatch.setattr(_agent, "_summarize_old_history", lambda text: "历史摘要")
+
+    new_msgs = _agent._compact_messages(msgs, keep_recent_pairs=2, plan_anchor=plan_text)
+    roles_contents = [(m["role"], m["content"]) for m in new_msgs]
+    anchor_msgs = [c for r, c in roles_contents if r == "system" and c.startswith("[开场规划锚点")]
+    assert len(anchor_msgs) == 1, f"应有 1 条锚点 system 消息，实际：{roles_contents}"
+    assert plan_text in anchor_msgs[0]
+
+
+def test_p03_compact_anchor_survives_multiple_compacts(tmp_path, monkeypatch):
+    """多次 compact 后锚点仍在（不丢失）。"""
+    import agent as _agent
+    plan_text = "规划：接口 A→B→C"
+    monkeypatch.setattr(_agent, "_summarize_old_history", lambda text: "摘要")
+
+    def build_msgs(head, n_pairs):
+        msgs = list(head)
+        for i in range(n_pairs):
+            msgs.append({"role": "assistant", "content": f"步 {i}", "tool_calls": None})
+            msgs.append({"role": "user", "content": f"结果 {i}"})
+        return msgs
+
+    head = [{"role": "system", "content": "sys"}, {"role": "user", "content": "task"}]
+    msgs = build_msgs(head, 6)
+
+    # 第一次 compact
+    msgs1 = _agent._compact_messages(msgs, keep_recent_pairs=2, plan_anchor=plan_text)
+    anchor1 = [m for m in msgs1 if m["role"] == "system" and "[开场规划锚点" in m["content"]]
+    assert anchor1, "第一次 compact 后锚点应存在"
+
+    # 扩充 msgs1，模拟继续运行后再次触发 compact
+    msgs2_input = list(msgs1)
+    for i in range(4):
+        msgs2_input.append({"role": "assistant", "content": f"新步 {i}", "tool_calls": None})
+        msgs2_input.append({"role": "user", "content": f"新结果 {i}"})
+
+    msgs2 = _agent._compact_messages(msgs2_input, keep_recent_pairs=2, plan_anchor=plan_text)
+    anchor2 = [m for m in msgs2 if m["role"] == "system" and "[开场规划锚点" in m["content"]]
+    assert anchor2, "第二次 compact 后锚点应仍然存在（不丢失）"
+
+
+# ── P0-4：smoke 强并入 ──
+
+def test_p04_force_include_smoke_adds_when_exists(tmp_path):
+    """tests/test_smoke.py 存在且 scope 未含 → _force_include_smoke 加进去。"""
+    smoke_dir = tmp_path / "tests"
+    smoke_dir.mkdir()
+    (smoke_dir / "test_smoke.py").write_text("# smoke")
+
+    import config
+    config.set_workspace_dir(str(tmp_path))
+    import agent as _agent
+    _agent._reinit_paths()
+
+    scope = ["tests/test_foo.py"]
+    result = _agent._force_include_smoke(scope, tmp_path)
+    assert "tests/test_smoke.py" in result
+    assert "tests/test_foo.py" in result
+
+
+def test_p04_force_include_smoke_no_add_when_absent(tmp_path):
+    """tests/test_smoke.py 不存在 → _force_include_smoke 不加。"""
+    import config
+    config.set_workspace_dir(str(tmp_path))
+    import agent as _agent
+    _agent._reinit_paths()
+
+    scope = ["tests/test_foo.py"]
+    result = _agent._force_include_smoke(scope, tmp_path)
+    assert "tests/test_smoke.py" not in result
+
+
+def test_p04_force_include_smoke_no_duplicate(tmp_path):
+    """tests/test_smoke.py 已在 scope → 不重复加入。"""
+    smoke_dir = tmp_path / "tests"
+    smoke_dir.mkdir()
+    (smoke_dir / "test_smoke.py").write_text("# smoke")
+
+    import config
+    config.set_workspace_dir(str(tmp_path))
+    import agent as _agent
+    _agent._reinit_paths()
+
+    scope = ["tests/test_smoke.py", "tests/test_foo.py"]
+    result = _agent._force_include_smoke(scope, tmp_path)
+    assert result.count("tests/test_smoke.py") == 1
+
+
+# ── P0-5：回灌内容 ──
+
+def test_p05_build_gate_feedback_both_channels():
+    """_build_gate_feedback：stdout 和 stderr 都有内容时两段都出现，不二选一。"""
+    tr = {"returncode": 1, "stdout": "FAILED tests/x.py - boom", "stderr": "Traceback: error"}
+    feedback = agent._build_gate_feedback("pytest -q", tr, "assertion", "断言失败，正常定位修复。")
+    assert "STDOUT" in feedback
+    assert "STDERR" in feedback
+    assert "FAILED tests/x.py" in feedback
+    assert "Traceback" in feedback
+
+
+def test_p05_build_gate_feedback_only_stdout():
+    """_build_gate_feedback：只有 stdout 时不出现 STDERR 段。"""
+    tr = {"returncode": 1, "stdout": "FAILED tests/x.py", "stderr": ""}
+    feedback = agent._build_gate_feedback("pytest -q", tr, "assertion", "hint")
+    assert "STDOUT" in feedback
+    assert "STDERR" not in feedback
+
+
+def test_p05_clip_preserves_head_and_tail():
+    """_clip：超长字符串保头尾，省略中间。"""
+    s = "A" * 2000 + "MIDDLE" * 100 + "B" * 2000
+    result = agent._clip(s, head=100, tail=100)
+    assert result.startswith("A" * 100)
+    assert result.endswith("B" * 100)
+    assert "omitted" in result
