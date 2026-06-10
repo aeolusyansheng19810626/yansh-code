@@ -1591,6 +1591,22 @@ def _no_tests_collected(tr: dict) -> bool:
     return ("no tests ran" in out) or ("collected 0 items" in out)
 
 
+def _has_impl_files(modified) -> bool:
+    """实验1 解法B：modified 是否含「实现文件」——非 tests/ 下、非 test_*.py/_test_*.py 的 .py。
+    用于判定「改了实现却没留正规测试」。数据文件/草稿脚本不算实现。"""
+    for f in modified or []:
+        if not f.endswith(".py"):
+            continue
+        parts = Path(f).parts
+        if "tests" in parts:
+            continue
+        name = Path(f).name
+        if name.startswith("test_") or name.endswith("_test.py") or name.startswith("_test") or name == "conftest.py":
+            continue
+        return True
+    return False
+
+
 def _final_gate_verdict(ws_path, timeout_gate):
     """轮次耗尽兜底：烧光 soft_limit ≠ 失败，做一次最终裁定。
     跑一次测试，按与正常 gate pass 分支**完全相同**的语义判 gate_status，
@@ -2364,6 +2380,16 @@ _CODER_ROLE 的「禁止 write_file 整体重写」只适用于**已存在的 >1
 - **必须显式 task_complete 终止**，不要沉默退出（loop 会再追问一轮，浪费）。
 
 Always respond in Chinese (用户的项目规则要求中文回复); task_complete 的 summary 字段必须中文，仅文件名/符号名/代码保持英文。
+"""
+
+_SOLO_ROLE_TEST_FIRST = """
+
+[强制：测试优先工作流 — 不可跳过（本任务已启用）]
+你必须严格按以下顺序，否则任务判定为未完成：
+1. **动手写任何实现代码之前**，先在 tests/ 目录建好正规 pytest 测试骨架（按需求能力点分文件，如 tests/test_<模块>.py），每个关键能力至少写一个具体断言用例（初期可红/import 失败，但必须是 pytest 能收集的正规用例）。
+2. 涉及 CLI / 命令行入口的，必须含 tests/test_smoke.py：用 subprocess 跑真实入口，断言退出码与关键输出。
+3. 然后才实现功能，边实现边把对应测试跑绿。
+**禁止用根目录 _test_*.py 这类临时草稿脚本代替正规 tests/ 测试**——框架只认 tests/ 下 pytest 能收集的用例。task_complete 前必须确认 tests/ 下有可被 pytest 收集的测试且全绿。
 """
 
 _PLANNER_ROLE = """[Role: Planner Agent (Plan Mode)]
@@ -4200,7 +4226,10 @@ def solo(requirement, model_override=None):
             f"{ws_symbols_result['total_symbols']} symbols):\n" + "\n".join(lines)
         )
 
-    sys_prompt = f"{_SOLO_ROLE}{_get_project_rules()}\n\n{symbols_brief}"
+    # 实验1：enforcement==role 时追加「测试优先」强硬段（解法A，概率性约束）
+    _enforce = (_cfg("solo_test_enforcement") or "off").lower()
+    _role = _SOLO_ROLE + (_SOLO_ROLE_TEST_FIRST if _enforce == "role" else "")
+    sys_prompt = f"{_role}{_get_project_rules()}\n\n{symbols_brief}"
     sys_prompt = _append_active_prompts(sys_prompt)
 
     # 任务开始时注入持久环境知识（框架自动维护，跨 run 复用）
@@ -4287,8 +4316,28 @@ def solo(requirement, model_override=None):
             gate_status = "no_command"
             break
         test_result = test(test_cmd, timeout_sec=_timeout_gate)
-        # collected-0 边界：未收集到任何测试 → no_command，不回灌「测试失败」误导 agent
+        # collected-0 边界：未收集到任何测试
         if not judge(test_result) and _no_tests_collected(test_result):
+            # 解法B（enforcement==gate）：改了实现却无正规测试 → 回灌强制补，不放行（确定性拦截，不靠模型自觉）
+            if (_enforce == "gate" and _has_impl_files(modified)
+                    and gate_round < _SOLO_GATE_MAX_ROUNDS
+                    and no_progress_state["total_rounds"] < _SOLO_SOFT_LIMIT):
+                gate_round += 1
+                console.print("[solo gate] 强制测试：改了实现但无正规 tests/，回灌要求补", style="yellow", highlight=False)
+                messages.append({"role": "user", "content": (
+                    "你已改动实现代码，但 tests/ 下没有任何 pytest 能收集的正规测试（collected 0）。"
+                    "本任务强制要求留下可复核的测试：请在 tests/ 目录建正规 pytest 用例（覆盖关键能力路径；"
+                    "若有 CLI 入口另加 tests/test_smoke.py，用 subprocess 跑真实入口断言退出码与输出），"
+                    "把它们跑绿后再 task_complete。根目录 _test_*.py 临时脚本不算正规测试。"
+                )})
+                _remaining = _SOLO_SOFT_LIMIT - no_progress_state["total_rounds"]
+                _prev_gate_modified = set(_task_log_mod.snapshot_files_modified())
+                signal = _solo_drive(messages, tools, compact_state,
+                                     soft_limit=no_progress_state["total_rounds"] + min(_SOLO_GATE_DRIVE_LIMIT, max(1, _remaining)),
+                                     start_tokens=start_tokens, budget_state=budget_state,
+                                     no_progress_state=no_progress_state)
+                agent_completed = bool(signal.get("early_exit") and signal.get("success"))
+                continue
             console.print("[solo gate] 未收集到任何测试（collected 0），判 no_command，不回灌",
                           style="yellow", highlight=False)
             gate_status = "no_command"
