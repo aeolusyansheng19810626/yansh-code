@@ -77,6 +77,47 @@ def test_verdict_full_green_coverage_unknown(monkeypatch):
     assert status == "coverage_unknown"
 
 
+# ── collected-0 边界：pytest 退出码5/no tests → no_command，非 failed ──
+
+def test_no_tests_collected_helper():
+    assert agent._no_tests_collected({"returncode": 5, "stdout": "", "stderr": ""}) is True
+    assert agent._no_tests_collected({"returncode": 1, "stdout": "collected 0 items\n", "stderr": ""}) is True
+    assert agent._no_tests_collected({"returncode": 0, "stdout": "no tests ran in 0.1s", "stderr": ""}) is True
+    assert agent._no_tests_collected({"returncode": 1, "stdout": "1 failed", "stderr": ""}) is False
+    assert agent._no_tests_collected({"returncode": 0, "stdout": "2 passed", "stderr": ""}) is False
+    assert agent._no_tests_collected(None) is False
+
+
+def test_verdict_collected_zero_is_no_command(monkeypatch):
+    """兜底裁定：全量 pytest collected 0（rc=5）→ no_command，而非 failed（R20 即此情形）。"""
+    _setup_verdict_mocks(monkeypatch, modified=["pkg/__main__.py"], scope=[],
+                         targeted_cmd=None, full_cmd="pytest",
+                         returncode=5, entry=True, smoke=False)
+    status, _tr = agent._final_gate_verdict("/ws", 300)
+    assert status == "no_command"
+
+
+def test_normal_gate_collected_zero_is_no_command(tmp_path, monkeypatch):
+    """正常 gate 循环：agent 完成后跑测试 collected 0 → no_command break，不回灌。"""
+    import config
+    config.set_workspace_dir(str(tmp_path))
+    import tools
+    tools._reinit_paths()
+    agent._reinit_paths()
+
+    monkeypatch.setattr(agent, "_dispatch_tool_calls", _stub_dispatch_noop)
+    monkeypatch.setattr(agent, "_infer_test_scope", lambda *a, **k: [])
+    monkeypatch.setattr(agent, "_force_include_smoke", lambda sc, ws: sc)
+    monkeypatch.setattr(agent, "_detect_python_test_cmd", lambda ws, scope=None: "pytest")
+    monkeypatch.setattr(agent, "test",
+                        lambda cmd, timeout_sec=None: {"returncode": 5, "stdout": "collected 0 items", "stderr": ""})
+    monkeypatch.setattr(agent, "call_llm", lambda msgs, **kw: _make_response(
+        "done", [("c1", "task_complete", {"success": True, "summary": "ok"})]))
+
+    res = agent.solo("任务")
+    assert res["task_complete_signal"]["gate_status"] == "no_command"
+
+
 # ── 集成：solo() 轮次耗尽时走兜底，不再无条件 failed ──
 
 def _make_response(content="", tool_calls=None):

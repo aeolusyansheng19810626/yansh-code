@@ -1579,6 +1579,18 @@ def _smoke_exists(ws) -> bool:
     return (Path(ws) / "tests" / "test_smoke.py").is_file()
 
 
+def _no_tests_collected(tr: dict) -> bool:
+    """pytest 退出码 5 或输出含 'no tests ran' / 'collected 0 items' → 没有可收集的测试。
+    这不是测试失败（rc=1），而是没有有效测试可复核——应判 no_command 而非 failed。
+    文本信号为 pytest 专属措辞，node 路径不会误命中。"""
+    if not tr:
+        return False
+    if tr.get("returncode") == 5:
+        return True
+    out = (tr.get("stdout") or "") + (tr.get("stderr") or "")
+    return ("no tests ran" in out) or ("collected 0 items" in out)
+
+
 def _final_gate_verdict(ws_path, timeout_gate):
     """轮次耗尽兜底：烧光 soft_limit ≠ 失败，做一次最终裁定。
     跑一次测试，按与正常 gate pass 分支**完全相同**的语义判 gate_status，
@@ -1602,7 +1614,8 @@ def _final_gate_verdict(ws_path, timeout_gate):
         return "no_command", {"returncode": 0, "stdout": "", "stderr": ""}
     tr = test(test_cmd, timeout_sec=timeout_gate)
     if not judge(tr):
-        return "failed", tr
+        # collected-0 边界：没有可复核的测试 → no_command，非失败
+        return ("no_command" if _no_tests_collected(tr) else "failed"), tr
     # 通过：targeted → passed（但改入口且无 smoke → no_smoke，暴露真实缺陷）；全量兜底 → coverage_unknown
     if coverage == "targeted":
         if _entry_modified(modified) and not _smoke_exists(ws_path):
@@ -4274,6 +4287,12 @@ def solo(requirement, model_override=None):
             gate_status = "no_command"
             break
         test_result = test(test_cmd, timeout_sec=_timeout_gate)
+        # collected-0 边界：未收集到任何测试 → no_command，不回灌「测试失败」误导 agent
+        if not judge(test_result) and _no_tests_collected(test_result):
+            console.print("[solo gate] 未收集到任何测试（collected 0），判 no_command，不回灌",
+                          style="yellow", highlight=False)
+            gate_status = "no_command"
+            break
         if judge(test_result):
             console.print(f"[solo gate] 测试通过（{test_cmd}）", style="green", highlight=False)
             # P0-1：scope 命中得到针对性测试 → passed；全量兜底 → coverage_unknown（不能证明本次改动被覆盖）
