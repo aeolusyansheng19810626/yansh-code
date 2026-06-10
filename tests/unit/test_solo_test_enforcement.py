@@ -144,3 +144,62 @@ def test_gate_enforcement_no_impl_no_refeed(tmp_path, monkeypatch):
                          [{"returncode": 5, "stdout": "collected 0 items", "stderr": ""}])
     assert n == 1
     assert res["task_complete_signal"]["gate_status"] == "no_command"
+
+
+# ── 解法B v2：主动 smoke 硬卡 ──
+
+def test_gate_v2_smoke_hardstop_on_entry_no_smoke(tmp_path, monkeypatch):
+    """gate v2：改了 __main__.py 但无 tests/test_smoke.py → 测试运行前先回灌补 smoke；
+    补完（smoke 第二轮存在）后放行 passed。test 第一轮不被调（前置拦截）。"""
+    _setup_ws(tmp_path)
+    monkeypatch.setitem(config._effective_config, "solo_test_enforcement", "gate")
+    monkeypatch.setattr(agent, "_dispatch_tool_calls", _stub_dispatch)
+    monkeypatch.setattr(agent._task_log_mod, "snapshot_files_modified",
+                        lambda: ["miniql/__main__.py", "miniql/executor.py"])
+    monkeypatch.setattr(agent, "_infer_test_scope", lambda *a, **k: ["tests/test_x.py"])
+    monkeypatch.setattr(agent, "_force_include_smoke", lambda sc, ws: sc)
+    monkeypatch.setattr(agent, "_detect_python_test_cmd", lambda ws, scope=None: "pytest")
+    # smoke：第一次查不存在（触发硬卡）→ drive 后存在（放行）
+    smoke = {"n": 0}
+
+    def fake_smoke(ws):
+        smoke["n"] += 1
+        return smoke["n"] > 1
+
+    monkeypatch.setattr(agent, "_smoke_exists", fake_smoke)
+    tcalls = {"n": 0}
+    monkeypatch.setattr(agent, "test", lambda cmd, timeout_sec=None: (
+        tcalls.__setitem__("n", tcalls["n"] + 1) or {"returncode": 0, "stdout": "1 passed", "stderr": ""}))
+    monkeypatch.setattr(agent, "call_llm", lambda msgs, **kw: _make_response(
+        "done", [("c1", "task_complete", {"success": True, "summary": "ok"})]))
+    res = agent.solo("任务")
+    assert tcalls["n"] == 1, f"前置硬卡应拦掉第一轮测试，test 只在补 smoke 后调 1 次，实际 {tcalls['n']}"
+    assert res["task_complete_signal"]["gate_status"] == "passed"
+
+
+def test_gate_v2_no_smoke_if_never_added(tmp_path, monkeypatch):
+    """gate v2：改入口 + 单测通过但 agent 死活不补 smoke → 最终 no_smoke 不放行（success=False）。"""
+    _setup_ws(tmp_path)
+    monkeypatch.setitem(config._effective_config, "solo_test_enforcement", "gate")
+    monkeypatch.setattr(agent, "_dispatch_tool_calls", _stub_dispatch)
+    monkeypatch.setattr(agent._task_log_mod, "snapshot_files_modified",
+                        lambda: ["miniql/__main__.py", "miniql/executor.py"])
+    monkeypatch.setattr(agent, "_infer_test_scope", lambda *a, **k: ["tests/test_x.py"])
+    monkeypatch.setattr(agent, "_force_include_smoke", lambda sc, ws: sc)
+    monkeypatch.setattr(agent, "_detect_python_test_cmd", lambda ws, scope=None: "pytest")
+    monkeypatch.setattr(agent, "_smoke_exists", lambda ws: False)  # 始终没补
+    monkeypatch.setattr(agent, "test", lambda cmd, timeout_sec=None: {
+        "returncode": 0, "stdout": "1 passed", "stderr": ""})
+    monkeypatch.setattr(agent, "call_llm", lambda msgs, **kw: _make_response(
+        "done", [("c1", "task_complete", {"success": True, "summary": "ok"})]))
+    res = agent.solo("任务")
+    assert res["task_complete_signal"]["gate_status"] == "no_smoke"
+    assert res["success"] is False
+
+
+def test_off_mode_no_v2_smoke_hardstop(tmp_path, monkeypatch):
+    """off 模式：改了入口 + collected-0 也不触发 v2 硬卡 → 直接 no_command。"""
+    res, n = _run_gate_b(tmp_path, monkeypatch, "off", ["miniql/__main__.py"],
+                         [{"returncode": 5, "stdout": "collected 0 items", "stderr": ""}])
+    assert n == 1
+    assert res["task_complete_signal"]["gate_status"] == "no_command"

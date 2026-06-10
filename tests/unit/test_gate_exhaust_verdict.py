@@ -89,12 +89,21 @@ def test_no_tests_collected_helper():
 
 
 def test_verdict_collected_zero_is_no_command(monkeypatch):
-    """兜底裁定：全量 pytest collected 0（rc=5）→ no_command，而非 failed（R20 即此情形）。"""
+    """兜底裁定：非入口实现 + 全量 pytest collected 0（rc=5）→ no_command，而非 failed（R20 即此情形）。"""
+    _setup_verdict_mocks(monkeypatch, modified=["pkg/core.py"], scope=[],
+                         targeted_cmd=None, full_cmd="pytest",
+                         returncode=5, entry=False, smoke=False)
+    status, _tr = agent._final_gate_verdict("/ws", 300)
+    assert status == "no_command"
+
+
+def test_verdict_collected_zero_entry_no_smoke(monkeypatch):
+    """解法B v2：兜底裁定 collected 0 但改了入口且无 smoke → no_smoke（缺关键端到端测试，非「没命令」）。"""
     _setup_verdict_mocks(monkeypatch, modified=["pkg/__main__.py"], scope=[],
                          targeted_cmd=None, full_cmd="pytest",
                          returncode=5, entry=True, smoke=False)
     status, _tr = agent._final_gate_verdict("/ws", 300)
-    assert status == "no_command"
+    assert status == "no_smoke"
 
 
 def test_normal_gate_collected_zero_is_no_command(tmp_path, monkeypatch):

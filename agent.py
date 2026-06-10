@@ -1631,7 +1631,12 @@ def _final_gate_verdict(ws_path, timeout_gate):
     tr = test(test_cmd, timeout_sec=timeout_gate)
     if not judge(tr):
         # collected-0 边界：没有可复核的测试 → no_command，非失败
-        return ("no_command" if _no_tests_collected(tr) else "failed"), tr
+        if _no_tests_collected(tr):
+            # 解法B v2：有 CLI 入口却没 smoke → 不算「没测试命令」，是缺关键端到端测试
+            if _entry_modified(modified) and not _smoke_exists(ws_path):
+                return "no_smoke", tr
+            return "no_command", tr
+        return "failed", tr
     # 通过：targeted → passed（但改入口且无 smoke → no_smoke，暴露真实缺陷）；全量兜底 → coverage_unknown
     if coverage == "targeted":
         if _entry_modified(modified) and not _smoke_exists(ws_path):
@@ -4267,6 +4272,8 @@ def solo(requirement, model_override=None):
 
     # P0-1：agent 自述完成 = agent 主动 task_complete(success=true)
     agent_completed = bool(signal.get("early_exit") and signal.get("success"))
+    # 发现6：是否「曾经」宣告完成（跨 gate 轮累积，含初始 drive）
+    _ever_completed = agent_completed
 
     # P0-1：gate_status ∈ {"passed", "failed", "no_command", "coverage_unknown"}
     gate_status = "failed"
@@ -4285,14 +4292,45 @@ def solo(requirement, model_override=None):
     _smoke_demanded = False
 
     while gate_round < _SOLO_GATE_MAX_ROUNDS:
+        # 发现6：累积「是否曾宣告完成」（含初始 drive 与上一 gate 轮 drive 的结果）
+        _ever_completed = _ever_completed or agent_completed
         # P1-11 / R19 兜底：轮次耗尽不直接判失败，做一次最终裁定（不再回灌）
         if no_progress_state["total_rounds"] >= _SOLO_SOFT_LIMIT:
             console.print("[solo gate] 主 loop 轮次已耗尽，做一次最终裁定（不再回灌）", style="yellow", highlight=False)
             gate_status, test_result = _final_gate_verdict(Path(_get_workspace()), _timeout_gate)
             console.print(f"[solo gate] 最终裁定：{gate_status}", style="yellow", highlight=False)
+            # 发现6：兜底裁定通过但 agent 烧满轮次未重宣告——若此前曾宣告完成则认可，避免假阴性
+            if gate_status == "passed" and not agent_completed and _ever_completed:
+                agent_completed = True
+                console.print("[solo gate] 兜底通过且此前曾宣告完成，认可 agent_completed", style="green", highlight=False)
             break
         modified = _task_log_mod.snapshot_files_modified()
         _ws_path = Path(_get_workspace())
+        # 解法B v2：主动 smoke 硬卡——改了 CLI 入口(__main__.py/cli.py)却无 tests/test_smoke.py，
+        # 在任何测试运行/no_command 判定之前强制回灌补 smoke（端到端，随手单测糊弄不过去）。
+        # 把 #6（原仅 passed 分支）下沉为主动拦截：collected-0、甚至无 test_cmd 时也卡得到。
+        if (_enforce == "gate" and _entry_modified(modified) and not _smoke_exists(_ws_path)
+                and not _smoke_demanded
+                and gate_round < _SOLO_GATE_MAX_ROUNDS
+                and no_progress_state["total_rounds"] < _SOLO_SOFT_LIMIT):
+            _smoke_demanded = True
+            gate_round += 1
+            console.print("[solo gate] 强制 smoke：改了 CLI 入口但无 tests/test_smoke.py，回灌要求补", style="yellow", highlight=False)
+            messages.append({"role": "user", "content": (
+                "你改动了 CLI 入口文件（__main__.py / cli.py），但 tests/ 下没有 tests/test_smoke.py。"
+                "本任务强制要求端到端 smoke：请新建 tests/test_smoke.py，用 subprocess 调用真实入口"
+                "（如 subprocess.run([sys.executable, '-m', '<pkg>', ...], capture_output=True)），"
+                "断言退出码为 0 且关键输出正确；先把它跑绿，再 task_complete。"
+                "单元测试与实现共享同样的模块假设，测不出跨文件 CLI 调用链断裂，不能替代 smoke。"
+            )})
+            _remaining = _SOLO_SOFT_LIMIT - no_progress_state["total_rounds"]
+            _prev_gate_modified = set(_task_log_mod.snapshot_files_modified())
+            signal = _solo_drive(messages, tools, compact_state,
+                                 soft_limit=no_progress_state["total_rounds"] + min(_SOLO_GATE_DRIVE_LIMIT, max(1, _remaining)),
+                                 start_tokens=start_tokens, budget_state=budget_state,
+                                 no_progress_state=no_progress_state)
+            agent_completed = bool(signal.get("early_exit") and signal.get("success"))
+            continue
         scope = _infer_test_scope([{"filename": f} for f in modified])
         # P0-4：两路共用 smoke 强并入
         scope = _force_include_smoke(scope, _ws_path)
