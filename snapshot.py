@@ -94,6 +94,8 @@ def _backup_file_if_needed(snap_info, filename):
             meta = {}
 
         if src.exists() and src.is_file():
+            if target.exists():
+                return
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(str(src), str(target))
             if filename not in meta.get("files", []):
