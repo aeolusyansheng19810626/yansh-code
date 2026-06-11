@@ -1710,6 +1710,21 @@ def _final_gate_verdict(ws_path, timeout_gate):
     if not judge(tr):
         # collected-0 边界：没有可复核的测试 → no_command，非失败
         if _no_tests_collected(tr):
+            # 修复2（对称化）：_final_gate_verdict 的 targeted collected-0 加与 Fix B 等价的全量回退仲裁
+            # 耗尽兜底路径上「targeted 坏、全量绿」不应被判 no_command，需先尝试全量重测
+            if coverage == "targeted":
+                _fv_full_cmd = _detect_python_test_cmd(ws_path)
+                if _fv_full_cmd and _fv_full_cmd != test_cmd:
+                    _fv_full_result = test(_fv_full_cmd, timeout_sec=timeout_gate)
+                    if not _no_tests_collected(_fv_full_result):
+                        # 全量能收集到测试（无论绿红）→ 改用全量结果再裁定
+                        test_cmd, coverage, tr = _fv_full_cmd, "full", _fv_full_result
+                        # 全量结果落入后续正常判定（绿→coverage_unknown 或 passed，红→failed）
+                        if not judge(tr):
+                            return "failed", tr
+                        # 全量绿 → coverage_unknown（非 targeted，不能证明本次改动被覆盖）
+                        return "coverage_unknown", tr
+                    # else：全量也 collected 0 → 保持原逻辑走下方 no_command/no_smoke
             # 解法B v2：有 CLI 入口却没 smoke → 不算「没测试命令」，是缺关键端到端测试
             if _entry_modified(modified) and not _smoke_exists(ws_path):
                 return "no_smoke", tr
@@ -4475,6 +4490,8 @@ def solo(requirement, model_override=None):
         # Fix B：targeted collected-0 ≠ 项目无测试。agent 自测绿而 gate targeted collected 0
         # 是观测矛盾——先怀疑 gate 自己拼的命令（scope 可能含已删/幻影文件），回退全量重测仲裁，
         # 再下结论，而不是默认 agent 错。
+        # F3：每轮重置，确保上一轮的仲裁结果不泄漏到本轮判定
+        _arbitrated_green = False
         if (coverage == "targeted" and not judge(test_result)
                 and _no_tests_collected(test_result)):
             _full_cmd = _detect_python_test_cmd(_ws_path)
@@ -4484,6 +4501,9 @@ def solo(requirement, model_override=None):
                 # 全量能收集到测试（无论绿红）→ 项目确有正规测试，targeted 命令自身有问题，改用全量结果
                 if not _no_tests_collected(_full_result):
                     test_cmd, coverage, test_result = _full_cmd, "full", _full_result
+                    # F3：全量绿仲裁成功时标记，供下游 gate_status 判定用
+                    if judge(_full_result):
+                        _arbitrated_green = True
                 # else：全量也 collected 0 → 确实无正规测试，保持原 test_result 落到下方 collected-0 分支
         # collected-0 边界：未收集到任何测试
         if not judge(test_result) and _no_tests_collected(test_result):
@@ -4521,7 +4541,8 @@ def solo(requirement, model_override=None):
         if judge(test_result):
             console.print(f"[solo gate] 测试通过（{test_cmd}）", style="green", highlight=False)
             # P0-1：scope 命中得到针对性测试 → passed；全量兜底 → coverage_unknown（不能证明本次改动被覆盖）
-            gate_status = "passed" if coverage == "targeted" else "coverage_unknown"
+            # F3：targeted 命令坏掉但全量仲裁绿 = 改动被项目测试集覆盖，应判 passed
+            gate_status = "passed" if (coverage == "targeted" or _arbitrated_green) else "coverage_unknown"
             # 方案a #6：targeted 绿但改了 CLI 入口却无 tests/test_smoke.py → no_smoke（不放行），回灌一次要求补
             if gate_status == "passed" and _entry_modified(modified) and not _smoke_exists(_ws_path):
                 if (not _smoke_demanded
