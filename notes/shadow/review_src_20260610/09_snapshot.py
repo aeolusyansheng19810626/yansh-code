@@ -1,0 +1,110 @@
+"""任务级快照（方案 A：纯文件复制，不动用户的 git 状态）
+
+任务开始时仅备份计划中已存在的文件作为 baseline；任务过程中由
+_backup_file_if_needed() 在 LLM 写入前增量补充。回滚时按 meta.files
+还原内容；任务期间新增的文件按 workspace_files 差集删除。
+"""
+import os
+import json
+import shutil
+import tempfile
+import threading
+from datetime import datetime
+from pathlib import Path
+
+from console_shared import console
+import config as _cfg_mod
+
+# P1-升级：meta.json 读-改-写原子化，防并发 subagent race
+_SNAPSHOT_META_LOCK = threading.Lock()
+
+
+def _atomic_write(path: Path, content: str):
+    """原子写：先写临时文件再 os.replace（Windows 上也原子）"""
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    os.replace(str(tmp), str(path))
+
+# 快照/回滚时需要跳过的目录
+_SNAPSHOT_IGNORE_DIRS = {".git", ".yansh", "__pycache__", "venv", "node_modules", ".pytest_cache"}
+
+_SNAPSHOT_DIR = Path(_cfg_mod.WORKSPACE_DIR) / ".yansh" / "snapshots"
+
+
+def _reinit_paths():
+    """--cwd 变更后由 agent._reinit_paths() 调用"""
+    global _SNAPSHOT_DIR
+    _SNAPSHOT_DIR = Path(_cfg_mod.WORKSPACE_DIR) / ".yansh" / "snapshots"
+
+
+def _should_skip_dir(root: str) -> bool:
+    parts = set(Path(root).parts)
+    return bool(parts & _SNAPSHOT_IGNORE_DIRS)
+
+
+def create_snapshot(file_list):
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    ws = _cfg_mod.WORKSPACE_DIR
+    snap_dir = _SNAPSHOT_DIR / timestamp
+    snap_dir.mkdir(parents=True, exist_ok=True)
+
+    workspace_files = []
+    for root, dirs, files in os.walk(ws):
+        if _should_skip_dir(root):
+            dirs.clear()
+            continue
+        for filename in files:
+            rel_path = os.path.relpath(os.path.join(root, filename), ws)
+            workspace_files.append(rel_path.replace("\\", "/"))
+
+    backed = []
+    for filename in file_list:
+        src = Path(ws) / filename
+        if src.exists() and src.is_file():
+            dst = snap_dir / filename
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(src), str(dst))
+            backed.append(filename)
+    (snap_dir / "meta.json").write_text(
+        json.dumps({"files": backed, "workspace_files": workspace_files, "timestamp": timestamp, "created": []},
+                   ensure_ascii=False), encoding="utf-8"
+    )
+    console.print(f"[快照] {snap_dir.name} (baseline {len(backed)} 文件)", highlight=False)
+    return {"mode": "file", "path": str(snap_dir), "timestamp": timestamp}
+
+
+def _backup_file_if_needed(snap_info, filename):
+    """LLM 写入前增量备份：若快照中尚无此文件且当前文件存在则备份；
+    若文件原本不存在，仅在 meta.json 中标记，使回滚时能删除这个新文件。"""
+    if not snap_info or not isinstance(snap_info, dict) or snap_info.get("mode") != "file":
+        return
+    if not filename:
+        return
+    snap_dir = Path(snap_info["path"])
+    target = snap_dir / filename
+    if target.exists():
+        return  # 已备份过
+    src = Path(_cfg_mod.WORKSPACE_DIR) / filename
+    meta_file = snap_dir / "meta.json"
+
+    with _SNAPSHOT_META_LOCK:
+        try:
+            meta = json.loads(meta_file.read_text(encoding="utf-8")) if meta_file.exists() else {}
+        except Exception:
+            meta = {}
+
+        if src.exists() and src.is_file():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(src), str(target))
+            if filename not in meta.get("files", []):
+                meta.setdefault("files", []).append(filename)
+                _atomic_write(meta_file, json.dumps(meta, ensure_ascii=False))
+        else:
+            # src 不存在：即将新建的文件，记入 created 以便回滚时删除
+            if filename not in meta.get("created", []):
+                meta.setdefault("created", []).append(filename)
+                _atomic_write(meta_file, json.dumps(meta, ensure_ascii=False))
+
+
+def restore_snapshot(snap_info):
+    """根据快照恢复工作区，返回恢复数量。"""

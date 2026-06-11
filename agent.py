@@ -1554,10 +1554,11 @@ def _infer_test_scope(plan_files, exclude: set | None = None) -> list[str]:
     for fn in filenames:
         bn = Path(fn).name  # e.g. "tools.py", "test_tools.py"
         stem = Path(fn).stem
-        # 1. 已经是测试文件 → 直接加
+        # 1. 已经是测试文件 → 直接加（必须仍存在；台账 append-only，已删的临时草稿
+        #    test_*_quick.py 不能再拼进 gate 命令，否则 pytest collected 0 自造假阴性）
         if bn.startswith("test_") or bn.endswith("_test.py"):
             rel = Path(fn).as_posix()
-            if rel not in seen:
+            if (ws / rel).is_file() and rel not in seen:
                 scope.append(rel)
                 seen.add(rel)
             continue
@@ -4405,6 +4406,8 @@ def solo(requirement, model_override=None):
     _prev_gate_modified: set = set()
     # 方案a #6：改入口文件却无 smoke 时只回灌一次要求补
     _smoke_demanded = False
+    # Fix C：collected-0 强制补测试只回灌一次，第二次命中转 no_command 落定，防 8 轮空转
+    _collected0_demanded = False
 
     while gate_round < _SOLO_GATE_MAX_ROUNDS:
         # 发现6：累积「是否曾宣告完成」（含初始 drive 与上一 gate 轮 drive 的结果）
@@ -4469,19 +4472,39 @@ def solo(requirement, model_override=None):
             gate_status = "no_command"
             break
         test_result = test(test_cmd, timeout_sec=_timeout_gate)
+        # Fix B：targeted collected-0 ≠ 项目无测试。agent 自测绿而 gate targeted collected 0
+        # 是观测矛盾——先怀疑 gate 自己拼的命令（scope 可能含已删/幻影文件），回退全量重测仲裁，
+        # 再下结论，而不是默认 agent 错。
+        if (coverage == "targeted" and not judge(test_result)
+                and _no_tests_collected(test_result)):
+            _full_cmd = _detect_python_test_cmd(_ws_path)
+            if _full_cmd and _full_cmd != test_cmd:
+                console.print("[solo gate] targeted 命令 collected 0，回退全量重测仲裁", style="yellow", highlight=False)
+                _full_result = test(_full_cmd, timeout_sec=_timeout_gate)
+                # 全量能收集到测试（无论绿红）→ 项目确有正规测试，targeted 命令自身有问题，改用全量结果
+                if not _no_tests_collected(_full_result):
+                    test_cmd, coverage, test_result = _full_cmd, "full", _full_result
+                # else：全量也 collected 0 → 确实无正规测试，保持原 test_result 落到下方 collected-0 分支
         # collected-0 边界：未收集到任何测试
         if not judge(test_result) and _no_tests_collected(test_result):
             # 解法B（enforcement==gate）：改了实现却无正规测试 → 回灌强制补，不放行（确定性拦截，不靠模型自觉）
+            # Fix C：只回灌一次（_collected0_demanded 一次性标志），第二次命中转 no_command，防 8 轮空转
             if (_enforce == "gate" and _has_impl_files(modified)
+                    and not _collected0_demanded
                     and gate_round < _SOLO_GATE_MAX_ROUNDS
                     and no_progress_state["total_rounds"] < _SOLO_SOFT_LIMIT):
+                _collected0_demanded = True
                 gate_round += 1
                 console.print("[solo gate] 强制测试：改了实现但无正规 tests/，回灌要求补", style="yellow", highlight=False)
+                # Fix E：带上 gate 实际执行的命令 + 输出节选，agent 看到 "file or directory not found"
+                # 一轮即可自解，不再盲目五重保险（删 __init__/改 pytest.ini/pip install -e）
                 messages.append({"role": "user", "content": (
                     "你已改动实现代码，但 tests/ 下没有任何 pytest 能收集的正规测试（collected 0）。"
                     "本任务强制要求留下可复核的测试：请在 tests/ 目录建正规 pytest 用例（覆盖关键能力路径；"
                     "若有 CLI 入口另加 tests/test_smoke.py，用 subprocess 跑真实入口断言退出码与输出），"
-                    "把它们跑绿后再 task_complete。根目录 _test_*.py 临时脚本不算正规测试。"
+                    "把它们跑绿后再 task_complete。根目录 _test_*.py 临时脚本不算正规测试。\n\n"
+                    f"[gate 实际执行] {test_cmd}\n"
+                    f"[gate 输出节选]\n{_clip((test_result.get('stdout') or '') + (test_result.get('stderr') or ''), 400, 400)}"
                 )})
                 _remaining = _SOLO_SOFT_LIMIT - no_progress_state["total_rounds"]
                 _prev_gate_modified = set(_task_log_mod.snapshot_files_modified())
@@ -4598,8 +4621,14 @@ def solo(requirement, model_override=None):
         # gate 每轮后更新 agent_completed（agent 可能在回灌后放弃）
         agent_completed = bool(signal.get("early_exit") and signal.get("success"))
     else:
-        console.print(f"[solo gate] 回灌已达 {_SOLO_GATE_MAX_ROUNDS} 轮上限", style="yellow", highlight=False)
-        gate_status = "failed"
+        # Fix D：gate 轮耗尽与主 loop 轮次耗尽路径（4413-4421）对称——做一次最终裁定重测，
+        # 而非凭空硬编码 failed（agent 最后一轮 drive 可能已修绿，硬 failed 会假阴性）
+        console.print(f"[solo gate] 回灌已达 {_SOLO_GATE_MAX_ROUNDS} 轮上限，做最终裁定", style="yellow", highlight=False)
+        gate_status, test_result = _final_gate_verdict(Path(_get_workspace()), _timeout_gate)
+        console.print(f"[solo gate] 最终裁定：{gate_status}", style="yellow", highlight=False)
+        if gate_status == "passed" and not agent_completed and _ever_completed:
+            agent_completed = True
+            console.print("[solo gate] 兜底通过且此前曾宣告完成，认可 agent_completed", style="green", highlight=False)
 
     # P0-1：最终成功 = agent 自述成功 AND 针对性测试绿；其余一律 False
     final_success = agent_completed and (gate_status == "passed")
