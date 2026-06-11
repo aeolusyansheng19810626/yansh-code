@@ -25,7 +25,8 @@ def _truncate_cmd_output(text: str) -> str:
             + text[-_CMD_OUTPUT_TAIL:])
 
 
-_STATE_CMD_RE = re.compile(r'^\s*(py\b|python[0-9.]*\b|pytest\b)', re.IGNORECASE)
+# 放宽：也匹配 `cd <path> && python/pytest ...` 复合命令（最有诊断价值的失败命令此前不留痕）
+_STATE_CMD_RE = re.compile(r'^\s*(cd\b.*&&\s*)?(py\b|python[0-9.]*\b|pytest\b)', re.IGNORECASE)
 _STATE_FILE_LOCK = threading.Lock()
 _STATE_SECTION_LIMIT = 20  # 每 section 最多保留 20 条命令记录
 
@@ -55,6 +56,10 @@ def _update_agent_state(command: str, returncode: int) -> None:
     # 跳过多行命令和超长命令（debug 脚本，对跨 run 无复用价值）
     cmd_stripped = command.strip()
     if any(ord(c) < 0x20 for c in cmd_stripped) or len(cmd_stripped) > 160:
+        return
+    # pytest 退出码 5 = no tests collected（没有可收集的测试），不是"命令失败"。
+    # gate 自己跑的 test() 也走这里，collected-0 曾被记成失败命令污染该 ws 下次先验。
+    if returncode == 5 and re.search(r'\bpytest\b', cmd_stripped, re.IGNORECASE):
         return
     try:
         state_dir = Path(_get_workspace()) / ".yansh"
@@ -249,7 +254,8 @@ _DANGEROUS_PATTERNS = [
     (r"\bpowershell\b.*-e(nc)?\b",                               "powershell -enc"),
     (r"\biex\b|\bInvoke-Expression\b",                            "iex/Invoke-Expression"),
     # #39 新增 deny
-    (r"\bpython\s+-c\b",                                          "python -c (内联执行)"),
+    # 一致化：原 `\bpython\s+-c\b` 只拦 python -c 却放行 python3 -c（零安全收益、还把 sonnet 推向草稿脚本流）
+    (r"\bpython[0-9.]*\s+-c\b",                                   "python -c (内联执行)"),
     (r"\bfind\b.*-delete\b",                                      "find -delete"),
     (r"\bgit\s+clean\b.*-f\b",                                    "git clean -f"),
     (r"\brm\s+-r\b",                                              "rm -r"),

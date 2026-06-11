@@ -140,6 +140,11 @@ _SOLO_TOKEN_BUDGET   = 600_000   # token 增量软提醒阈值（超过注入一
 _SOLO_NO_PROGRESS_CAP = 6        # 连续 N 轮无写编辑先注提醒，2N 轮熔断（agent 级，区别于逐文件 no_progress）
 _SOLO_GATE_MAX_ROUNDS = 8        # 外部 test gate 回灌最大轮数
 _SOLO_GATE_DRIVE_LIMIT = 15      # 每次 gate 回灌最多给 agent 15 轮修复机会
+# drive 内里程碑（杀根因④收尾缺失/根因⑤token噪音；enforcement 前移到不依赖 agent 收尾处）
+_SOLO_CHECKPOINT_EVERY  = 30     # 每 N 轮注入一次自检 checkpoint（轮次可见 + 逐项核对）
+_SOLO_ULTIMATUM_ROUND   = 100    # 轮次达此值注入最后通牒（要求尽快收尾）
+_SOLO_SMOKE_DRIVE_ROUND = 40     # 写过 CLI 入口且仍无 smoke、轮次>此值 → drive 内硬要求补 smoke
+_SOLO_BUDGET_ROUND_FRAC = 0.7    # 轮次达全局上限此比例时提醒收敛（替代 O(N²) token 提醒）
 
 # backlog #1: fix loop baseline 失败识别
 # 进入 code() 前跑一次 test_command 捕获 baseline failures
@@ -1340,6 +1345,8 @@ _SUMMARIZE_SYSTEM = (
     "不能泛化为'修改了 X.py 的某些函数'。"
     "**强制项：第 ⑥ 点必须逐字保留已验证成功的 shell 命令原文**（如 `py -3.11 -X utf8 -m pytest`），"
     "不可泛化或省略，这是后续轮次直接复用的关键信息。"
+    "**强制项：第 ⑤ 点必须保留「已排除的 bug 假设」——哪些猜测已被证伪（如『不是 stale .pyc 缓存』『不是编码问题』），"
+    "防止压缩后重新追同一个已排除的幻象。**"
     "控制在 900 字内，重要事实不要丢。不要加客套话，直接给结构化要点。"
 )
 
@@ -1357,7 +1364,8 @@ def _summarize_old_history(text: str) -> str:
     return (resp.choices[0].message.content or "").strip()
 
 
-def _compact_messages(msgs, keep_recent_pairs: int = 2, plan_anchor: str | None = None):
+def _compact_messages(msgs, keep_recent_pairs: int = 2, plan_anchor: str | None = None,
+                      env_anchor: str | None = None):
     """P2 #4-B2：把旧 message 历史压缩成单条 system 摘要，保留最近 N 个 pair 原文。
 
     切分：[system, user_initial] + [old_pairs...] + [recent_N_pairs]
@@ -1431,6 +1439,12 @@ def _compact_messages(msgs, keep_recent_pairs: int = 2, plan_anchor: str | None 
     # P0-3：plan_anchor 非空则在 summary 前插入锚点 system 消息，跨 compact 保持规划零漂移。
     # 用"独立文本重注入"而非 pair 位置 pin——首次 compact 后结构变化，第二次需再注入。
     new_msgs = list(head)
+    # B：环境契约锚点——与 plan_anchor 并列，每次 compact 重注入，防 compact 丢环境事实致二次探路（根因②）
+    if env_anchor:
+        new_msgs.append({
+            "role": "system",
+            "content": f"[环境契约锚点 — 不可丢弃，每次压缩后仍有效]\n{env_anchor}",
+        })
     if plan_anchor:
         new_msgs.append({
             "role": "system",
@@ -1447,12 +1461,15 @@ def _make_compact_state() -> dict:
     code() 与 fix() 各自的 LLM loop 共用，避免重复内联逻辑。
     P0-3：新增 plan_anchor 字段，solo 首轮捕获开场规划，跨 compact 持久保留。"""
     return {
-        "threshold": int(_cfg("compact_threshold_tokens") or 40_000),
-        "keep_pairs": int(_cfg("compact_keep_recent_pairs") or 2),
+        # B：40k 对 solo 长任务过激（run.log 实测 40510 触发→丢88%→二次探路）。
+        # 默认提到 60k、keep_pairs 提到 3，环境契约靠 env_anchor 重注入保底。
+        "threshold": int(_cfg("compact_threshold_tokens") or 60_000),
+        "keep_pairs": int(_cfg("compact_keep_recent_pairs") or 3),
         "consecutive_over": 0,
         "max_consecutive": int(_cfg("compact_max_consecutive_over") or 4),
         "disabled": False,
         "plan_anchor": None,   # P0-3：solo 首个 assistant 规划，compact 时重注入
+        "env_anchor": None,    # B：环境契约，compact 时重注入，杀根因②
     }
 
 
@@ -1467,7 +1484,8 @@ def _maybe_compact_messages(msgs, state: dict, label: str = "auto-compact"):
         return msgs
     console.print(f"[{label}] msgs ~{_est} tokens > {state['threshold']}，触发压缩...", style="cyan")
     _new_msgs = _compact_messages(msgs, keep_recent_pairs=state["keep_pairs"],
-                                  plan_anchor=state.get("plan_anchor"))
+                                  plan_anchor=state.get("plan_anchor"),
+                                  env_anchor=state.get("env_anchor"))
     _new_est = _estimate_messages_tokens(_new_msgs)
     if _new_est < _est:
         msgs = _new_msgs
@@ -1577,6 +1595,65 @@ def _entry_modified(modified) -> bool:
 def _smoke_exists(ws) -> bool:
     """方案a #6：ws 是否存在 tests/test_smoke.py。"""
     return (Path(ws) / "tests" / "test_smoke.py").is_file()
+
+
+def _detect_interpreter() -> tuple[str, str]:
+    """A 启动环境卡：探测 ws 内实际可用的 python 解释器，返回 (命令名, 版本串)。
+    失败回退 ('python', '')。探测命令成功会被 _update_agent_state 自动记进已验证命令段。"""
+    for cand in ("python", "py -3"):
+        try:
+            r = _tools_mod.execute_command(f"{cand} --version", _timeout_sec=15)
+            if isinstance(r, dict) and r.get("returncode") == 0:
+                ver = ((r.get("stdout") or "") + (r.get("stderr") or "")).strip()
+                return cand, ver
+        except Exception:
+            continue
+    return "python", ""
+
+
+def _build_env_contract() -> str:
+    """A 启动环境卡：框架自探 shell / cwd / 解释器 / 编码，组装确定性环境契约。
+    杀根因①（环境契约缺失 + shell 身份矛盾）：sonnet 50/120 轮烧在环境探路，opus ≈ 0。"""
+    ws = _get_workspace()
+    interp, ver = _detect_interpreter()
+    ver_s = f"（实测版本 {ver}）" if ver else ""
+    if os.name == "nt":
+        shell_line = (
+            "- 命令执行环境：**cmd.exe（不是 bash）**。即使 PATH 上有 Git 的 unix 工具、"
+            "`pwd`/`which` 返回 /c/... 这类路径，真实 shell 仍是 cmd.exe。"
+            "禁用 bash 专属语法：heredoc（`<< 'EOF'`）、`VAR=x 命令` 前缀、`$?`、`2>/dev/null`、单引号包裹。"
+        )
+    else:
+        shell_line = "- 命令执行环境：POSIX shell。"
+    return (
+        "[环境契约 — 框架实测，必须遵守，不要再花轮次探测环境]\n"
+        f"{shell_line}\n"
+        f"- 工作目录恒为：`{ws}`。execute_command 已自动 cwd 到此，**永远不需要 cd**；直接用相对路径。\n"
+        f"- Python 解释器统一用 `{interp}`{ver_s}，**不要用 python3**（cmd 上行为异常）。\n"
+        "- 字符编码：框架已设 PYTHONUTF8=1 / PYTHONIOENCODING=utf-8，**无需处理编码**，不要加 chcp 或 PYTHONUTF8 前缀。\n"
+        "- 运行 pytest 默认加 `-q`。"
+    )
+
+
+def _seed_env_state(contract: str) -> None:
+    """A：把环境契约幂等写进 .yansh/agent_state.md（无 '## 环境契约' 段才写），
+    解决干净 ws 首跑 agent_state 为空、无任何环境先验的问题。compact 注入时一并带上。"""
+    try:
+        sd = Path(_get_workspace()) / ".yansh"
+        sd.mkdir(parents=True, exist_ok=True)
+        sp = sd / "agent_state.md"
+        existing = sp.read_text(encoding="utf-8") if sp.exists() else ""
+        if "## 环境契约" in existing:
+            return
+        if not existing:
+            existing = "# 框架自动维护 — 环境知识（跨 run 复用）\n"
+        block = "## 环境契约（框架实测）\n" + contract + "\n"
+        new = existing.rstrip("\n") + "\n\n" + block
+        _tmp = sp.with_suffix(".md.tmp")
+        _tmp.write_text(new, encoding="utf-8")
+        os.replace(str(_tmp), str(sp))
+    except Exception:
+        pass
 
 
 def _no_tests_collected(tr: dict) -> bool:
@@ -4106,21 +4183,49 @@ def _solo_drive(messages, tools, compact_state, *, soft_limit, start_tokens,
         # 每轮 call_llm 前 auto-compact，防连续 context O(N²) 膨胀全量重发
         messages[:] = _maybe_compact_messages(messages, compact_state, label="solo-compact")
 
-        # token 预算软提醒（只一次）
-        if not budget_state["warned"]:
-            used = get_session_total_tokens() - start_tokens
-            if used > _SOLO_TOKEN_BUDGET:
-                console.print(f"[预算] solo token 增量 {used} > {_SOLO_TOKEN_BUDGET}，提醒 LLM 收敛",
+        _tr = no_progress_state["total_rounds"]
+        _ms = no_progress_state.setdefault("milestones", set())
+
+        # 收敛提醒改按轮次（替代 O(N²) token 提醒——轮28 即误报的根因⑤）：达全局上限 ~70% 提醒一次
+        if not budget_state["warned"] and _tr >= int(_SOLO_SOFT_LIMIT * _SOLO_BUDGET_ROUND_FRAC):
+            budget_state["warned"] = True
+            console.print(f"[预算] solo 轮次 {_tr}/{_SOLO_SOFT_LIMIT}，提醒 LLM 收敛", style="yellow", highlight=False)
+            messages.append({"role": "system", "content": (
+                f"已用 {_tr}/{_SOLO_SOFT_LIMIT} 轮。请收敛：完成剩余文件与测试、跑绿、然后 task_complete。"
+                "不要再开新的大规模探索。"
+            )})
+
+        # drive 内里程碑（杀根因④收尾缺失，enforcement 前移）：轮次可见 + 周期自检
+        if _tr > 0 and _tr % _SOLO_CHECKPOINT_EVERY == 0 and _tr not in _ms:
+            _ms.add(_tr)
+            messages.append({"role": "system", "content": (
+                f"[自检 checkpoint] 当前第 {_tr}/{_SOLO_SOFT_LIMIT} 轮。逐项核对："
+                "①tests/ 下是否已有 pytest 能收集的正规测试？②跑 pytest -q 是否全绿？"
+                "③requirement 的每条能力是否都实现并验证？缺什么现在补，别拖到轮次耗尽。"
+            )})
+
+        # 最后通牒：把事后裁定提前为回灌，给一次明确的收尾信号
+        if _tr >= _SOLO_ULTIMATUM_ROUND and "ultimatum" not in _ms:
+            _ms.add("ultimatum")
+            messages.append({"role": "system", "content": (
+                f"[最后通牒] 仅剩约 {_SOLO_SOFT_LIMIT - _tr} 轮。立即停止探索/调试支线，"
+                "把当前能跑绿的测试跑一遍，然后 task_complete(success=...)。再不收尾将被强制终止。"
+            )})
+
+        # smoke 硬卡前移进 drive（解决实验1 v2「硬卡在 gate 够不到」——sonnet 从不走出第一个 drive）
+        if ("smoke_drive" not in _ms and _tr >= _SOLO_SMOKE_DRIVE_ROUND
+                and (_cfg("solo_test_enforcement") or "off").lower() == "gate"):
+            _ws_d = Path(_get_workspace())
+            if _entry_modified(_task_log_mod.snapshot_files_modified()) and not _smoke_exists(_ws_d):
+                _ms.add("smoke_drive")
+                console.print("[solo drive] 强制 smoke 前移：改了 CLI 入口但无 tests/test_smoke.py，回灌要求补",
                               style="yellow", highlight=False)
-                messages.append({
-                    "role": "system",
-                    "content": (
-                        f"You have used {used} tokens (budget {_SOLO_TOKEN_BUDGET}). "
-                        "Converge: finish remaining files and tests, run them, then task_complete. "
-                        "Do not start large new explorations."
-                    ),
-                })
-                budget_state["warned"] = True
+                messages.append({"role": "user", "content": (
+                    "你已改动 CLI 入口文件（__main__.py / cli.py），但 tests/ 下仍无 tests/test_smoke.py。"
+                    "本任务强制端到端 smoke：新建 tests/test_smoke.py，用 subprocess 调真实入口"
+                    "（subprocess.run([sys.executable, '-m', '<pkg>', ...], capture_output=True)），"
+                    "断言退出码为 0 且关键输出正确，先跑绿再继续。单元测试与实现共享模块假设，测不出跨文件 CLI 调用链断裂。"
+                )})
 
         response = call_llm(messages, tools=tools, tool_choice="auto")
         msg = response.choices[0].message
@@ -4237,6 +4342,11 @@ def solo(requirement, model_override=None):
     sys_prompt = f"{_role}{_get_project_rules()}\n\n{symbols_brief}"
     sys_prompt = _append_active_prompts(sys_prompt)
 
+    # A 启动环境卡（确定性，杀根因①）：框架自探 shell/cwd/解释器/编码，注入环境契约。
+    # 探测命令（python --version）会被 _update_agent_state 自动记进已验证命令段，干净 ws 首跑不再为空。
+    _env_contract = _build_env_contract()
+    sys_prompt += f"\n\n{_env_contract}"
+
     # 任务开始时注入持久环境知识（框架自动维护，跨 run 复用）
     _state_path = Path(_get_workspace()) / ".yansh" / "agent_state.md"
     try:
@@ -4248,6 +4358,9 @@ def solo(requirement, model_override=None):
             sys_prompt += f"\n\n[持久环境知识 .yansh/agent_state.md — 框架自动维护，跨 run 有效]\n{_state_content}"
     except Exception:
         pass
+
+    # A：环境契约写进 agent_state（在上面 read 之后，避免首跑 sys_prompt 重复），供跨 run / compact 持久带上
+    _seed_env_state(_env_contract)
 
     messages = [
         {"role": "system", "content": sys_prompt},
@@ -4262,6 +4375,8 @@ def solo(requirement, model_override=None):
     _CURRENT_SNAPSHOT = create_snapshot([])
 
     compact_state = _make_compact_state()
+    # B：环境契约作为 env_anchor，每次 compact 前重注入（照 plan_anchor 机制），杀根因②（compact 丢环境事实→二次探路）
+    compact_state["env_anchor"] = _env_contract
     start_tokens = get_session_total_tokens()
     budget_state = {"warned": False}
     no_progress_state = {"streak": 0, "total_rounds": 0}
