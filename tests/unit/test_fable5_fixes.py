@@ -93,7 +93,6 @@ def test_fable5_1_gate_drive_does_not_capture_anchor(tmp_path, monkeypatch):
         agent._solo_tools(),
         compact_state,
         soft_limit=10,
-        start_tokens=0,
         budget_state=budget_state,
         no_progress_state=no_progress_state,
         # capture_anchor=False（默认）
@@ -132,7 +131,6 @@ def test_fable5_1_initial_drive_captures_anchor_on_second_round(tmp_path, monkey
         agent._solo_tools(),
         compact_state,
         soft_limit=10,
-        start_tokens=0,
         budget_state=budget_state,
         no_progress_state=no_progress_state,
         capture_anchor=True,

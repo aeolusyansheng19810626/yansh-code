@@ -754,3 +754,41 @@ def test_p216_trim_section_helper():
         if in_sec and line.strip().startswith("- `"):
             count += 1
     assert count == 20
+
+
+# ── C2：replace_in_file replace_all 参数 ──────────────────────────────────────
+
+def test_replace_in_file_replace_all_true():
+    """replace_all=True 时全量替换所有匹配，并报告替换数量。"""
+    write_file("ra_test.txt", "foo bar foo baz foo")
+    result = replace_in_file("ra_test.txt", "foo", "qux", replace_all=True)
+    assert "success" in result
+    assert result.get("replaced_count") == 3
+    content = read_file("ra_test.txt")["content"]
+    assert content == "qux bar qux baz qux"
+    assert "foo" not in content
+
+
+def test_replace_in_file_replace_all_false_unique():
+    """replace_all=False（默认）+ 唯一匹配：正常替换，报告 1 处。"""
+    write_file("ra_test2.txt", "hello world")
+    result = replace_in_file("ra_test2.txt", "hello", "hi", replace_all=False)
+    assert "success" in result
+    assert result.get("replaced_count") == 1
+    content = read_file("ra_test2.txt")["content"]
+    assert content == "hi world"
+
+
+def test_replace_in_file_replace_all_false_multiple_errors():
+    """replace_all=False（默认）+ 多处匹配：返回错误，行为与原来一致。"""
+    write_file("ra_test3.txt", "aaa aaa aaa")
+    result = replace_in_file("ra_test3.txt", "aaa", "bbb")
+    assert "error" in result
+    assert result["error_kind"] == "invalid_args"
+
+
+def test_replace_in_file_replace_all_true_reports_count():
+    """replace_all=True 时 result 里含 replaced_count 且值正确。"""
+    write_file("ra_test4.txt", "x x x x")
+    result = replace_in_file("ra_test4.txt", "x", "y", replace_all=True)
+    assert result.get("replaced_count") == 4

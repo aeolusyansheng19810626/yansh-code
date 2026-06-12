@@ -395,17 +395,17 @@ def main():
                 current_mode = parts[1]
                 console.print(f"已切换到 {current_mode} 模式")
             else:
-                console.print(f"用法：/mode [plan|code|auto|audit]  (audit = 只读审计现有代码，输出 markdown 报告)")
+                console.print(f"用法：/mode [plan|code|auto|audit|solo]  (solo = 默认单 context 端到端 agent；audit = 只读审计现有代码，输出 markdown 报告)")
             continue
 
         if user_input == "/model":
             MODEL_MENU = [
-                ("1", "DeepSeek V4 Flash",  "deepseek/deepseek-v4-flash"),
-                ("2", "Claude Opus 4.7",    CLAUDE_OPUS),
-                ("3", "Claude Sonnet 4.6",  CLAUDE_SONNET),
-                ("4", "Claude Haiku 4.5",   CLAUDE_HAIKU),
-                ("5", "Gemini 2.5 Flash",    GEMINI_3_FLASH),
-                ("6", "Gemini 2.5 Pro",     GEMINI_31_PRO),
+                # m1: deepseek/deepseek-v4-flash 已弃用（ICA 不认该 id），已移除
+                ("1", "Claude Opus 4.8",    CLAUDE_OPUS),
+                ("2", "Claude Sonnet 4.6",  CLAUDE_SONNET),
+                ("3", "Claude Haiku 4.5",   CLAUDE_HAIKU),
+                ("4", "Gemini 2.5 Flash",   GEMINI_3_FLASH),
+                ("5", "Gemini 2.5 Pro",     GEMINI_31_PRO),
             ]
             import agent as _am
             current_code_model = get_config()["model"]
@@ -424,7 +424,7 @@ def main():
             for num, label, mid in MODEL_MENU:
                 console.print(f"  {num}. {label}  ({mid})", highlight=False)
             try:
-                choice = _read_input("请输入数字 (1-6): ").strip()
+                choice = _read_input("请输入数字 (1-5): ").strip()
             except (EOFError, KeyboardInterrupt):
                 choice = ""
             matched = next((m for n, _, m in MODEL_MENU if n == choice), None)
@@ -696,9 +696,13 @@ def main():
                 continue
             enriched = agent.approve_plan()
             console.print("[Plan Mode] 已批准草稿，进入实施流程...", highlight=False)
+            interrupt.reset()  # C1: approve 路径也需要 reset
             agent.run(enriched, mode=current_mode if current_mode != "plan" else "auto")
             agent.show_stats()
             continue
+
+        # C1: 每次进入 dispatch 前清除上一轮 ESC 中断状态，防止 session 永久卡死
+        interrupt.reset()
 
         # Plan Mode 下的普通输入：走 plan_chat（多轮探索 + 草稿迭代）
         if agent.is_plan_mode():

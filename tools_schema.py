@@ -59,13 +59,14 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "replace_in_file",
-            "description": "在workspace文件中精确替换字符串。old_str必须唯一匹配，否则返回错误",
+            "description": "在workspace文件中精确替换字符串。默认要求old_str唯一匹配；传replace_all=true时全量替换所有匹配",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "filename": {"type": "string", "description": "文件名（相对于workspace）"},
-                    "old_str": {"type": "string", "description": "要替换的旧字符串（必须唯一匹配）"},
-                    "new_str": {"type": "string", "description": "替换后的新字符串"}
+                    "old_str": {"type": "string", "description": "要替换的旧字符串"},
+                    "new_str": {"type": "string", "description": "替换后的新字符串"},
+                    "replace_all": {"type": "boolean", "description": "为true时替换文件中所有匹配（如批量修改变量名/导入路径）；默认false（要求唯一匹配）"}
                 },
                 "required": ["filename", "old_str", "new_str"]
             }

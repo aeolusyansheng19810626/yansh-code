@@ -74,7 +74,8 @@ def wrap_command(command: str, workspace_dir: str) -> str:
     ws_abs = os.path.abspath(workspace_dir)
     # docker run 单行：用 sh -c '<cmd>'，对内部用户命令 shlex.quote 防注入
     inner = command
-    extra = " ".join(cfg.extra_args)
+    # M2: extra_args 逐项 quote，防未来 CLI 暴露 extra_args 时命令注入
+    extra = " ".join(shlex.quote(a) for a in cfg.extra_args)
     return (
         f"docker run --rm -i "
         f"-v {shlex.quote(ws_abs)}:/ws "

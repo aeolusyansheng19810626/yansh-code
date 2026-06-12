@@ -136,7 +136,6 @@ _AUDIT_TOKEN_BUDGET = 120_000  # audit loop token 增量预算
 # solo mode：单一连续 context 端到端 agent（自主规划→读写跑修→自测）
 # 与逐文件 code() 并存，验证「架构 vs 模型」命题。详见 plan / notes shadow R9。
 _SOLO_SOFT_LIMIT     = 120       # 主 loop 工具调用轮次上限（连续 context，复杂多文件任务需大轮数）
-_SOLO_TOKEN_BUDGET   = 600_000   # token 增量软提醒阈值（超过注入一次收敛提示；硬熔断交给 --max-cost）
 _SOLO_NO_PROGRESS_CAP = 6        # 连续 N 轮无写编辑先注提醒，2N 轮熔断（agent 级，区别于逐文件 no_progress）
 _SOLO_GATE_MAX_ROUNDS = 8        # 外部 test gate 回灌最大轮数
 _SOLO_GATE_DRIVE_LIMIT = 15      # 每次 gate 回灌最多给 agent 15 轮修复机会
@@ -1696,7 +1695,8 @@ _PRETOOL_WRITE_TOOLS: dict[str, str] = {
     "replace_in_file": "filename",
     "apply_patch": "file_path",   # 可能缺省，由 _pretool_resolve_path 从 patch_text 补解析
     "replace_symbol": "file_path",
-    "move_file": "dst",           # dst 是写入目的端，src 只是读
+    # move_file 不在此列：纯重命名（src 已有实现，dst 只是改名）不应被 test-first 拦截。
+    # 若用 dst 判定会误拦合法重命名，烧 max_block 轮次才放行（M5）。
 }
 # 豁免的包/脚手架文件（无需测试骨架）
 _PRETOOL_EXEMPT_NAMES = {"__init__.py", "setup.py", "conftest.py", "__main__.py", "cli.py"}
@@ -3107,8 +3107,9 @@ Note: you must use write_file to write the file; the filename must be exactly `{
     # pyproject.toml 有变更时自动重装包，确保新增模块立即可用
     if any("pyproject.toml" in (f or "") for f in _task_log_mod.snapshot_files_modified()):
         import subprocess as _sp
+        _ws_for_pip = _get_workspace()
         console.print("[自动] 检测到 pyproject.toml 变更，执行 pip install -e . ...", highlight=False)
-        r = _sp.run(["pip", "install", "-e", "."], capture_output=True, text=True)
+        r = _sp.run(["pip", "install", "-e", "."], capture_output=True, text=True, cwd=_ws_for_pip)
         if r.returncode == 0:
             console.print("[自动] pip install -e . 完成", highlight=False)
         else:
@@ -4275,7 +4276,7 @@ def _get_out_result(outs: list, tc) -> dict:
     return {}
 
 
-def _solo_drive(messages, tools, compact_state, *, soft_limit, start_tokens,
+def _solo_drive(messages, tools, compact_state, *, soft_limit,
                 budget_state, no_progress_state, capture_anchor: bool = False):
     """solo 主驱动循环。原地 append messages；budget_state / no_progress_state 跨 gate 回灌持续累积。
     返回 {"early_exit", "success", "summary", "rounds_used"}.
@@ -4496,7 +4497,7 @@ def solo(requirement, model_override=None):
     _pretool_block_counts.clear()
 
     signal = _solo_drive(messages, tools, compact_state, soft_limit=_SOLO_SOFT_LIMIT,
-                         start_tokens=start_tokens, budget_state=budget_state,
+                         budget_state=budget_state,
                          no_progress_state=no_progress_state, capture_anchor=True)
 
     # P0-1：agent 自述完成 = agent 主动 task_complete(success=true)
@@ -4558,7 +4559,7 @@ def solo(requirement, model_override=None):
             _prev_gate_modified = set(_task_log_mod.snapshot_files_modified())
             signal = _solo_drive(messages, tools, compact_state,
                                  soft_limit=no_progress_state["total_rounds"] + min(_SOLO_GATE_DRIVE_LIMIT, max(1, _remaining)),
-                                 start_tokens=start_tokens, budget_state=budget_state,
+                                 budget_state=budget_state,
                                  no_progress_state=no_progress_state)
             agent_completed = bool(signal.get("early_exit") and signal.get("success"))
             continue
@@ -4628,7 +4629,7 @@ def solo(requirement, model_override=None):
                 _prev_gate_modified = set(_task_log_mod.snapshot_files_modified())
                 signal = _solo_drive(messages, tools, compact_state,
                                      soft_limit=no_progress_state["total_rounds"] + min(_SOLO_GATE_DRIVE_LIMIT, max(1, _remaining)),
-                                     start_tokens=start_tokens, budget_state=budget_state,
+                                     budget_state=budget_state,
                                      no_progress_state=no_progress_state)
                 agent_completed = bool(signal.get("early_exit") and signal.get("success"))
                 continue
@@ -4662,7 +4663,7 @@ def solo(requirement, model_override=None):
                     _prev_gate_modified = set(_task_log_mod.snapshot_files_modified())
                     signal = _solo_drive(messages, tools, compact_state,
                                          soft_limit=no_progress_state["total_rounds"] + min(_SOLO_GATE_DRIVE_LIMIT, max(1, _remaining)),
-                                         start_tokens=start_tokens, budget_state=budget_state,
+                                         budget_state=budget_state,
                                          no_progress_state=no_progress_state)
                     agent_completed = bool(signal.get("early_exit") and signal.get("success"))
                     continue  # 回去重跑测试（agent 应已补 smoke，_force_include_smoke 会纳入）
@@ -4677,7 +4678,7 @@ def solo(requirement, model_override=None):
                     _confirm_signal = _solo_drive(
                         messages, tools, compact_state,
                         soft_limit=no_progress_state["total_rounds"] + 2,
-                        start_tokens=start_tokens, budget_state=budget_state,
+                        budget_state=budget_state,
                         no_progress_state=no_progress_state,
                     )
                     agent_completed = bool(_confirm_signal.get("early_exit") and _confirm_signal.get("success"))
@@ -4735,7 +4736,7 @@ def solo(requirement, model_override=None):
         _prev_gate_modified = set(_task_log_mod.snapshot_files_modified())
         signal = _solo_drive(messages, tools, compact_state,
                              soft_limit=no_progress_state["total_rounds"] + _drive_limit,
-                             start_tokens=start_tokens, budget_state=budget_state,
+                             budget_state=budget_state,
                              no_progress_state=no_progress_state)
         # gate 每轮后更新 agent_completed（agent 可能在回灌后放弃）
         agent_completed = bool(signal.get("early_exit") and signal.get("success"))

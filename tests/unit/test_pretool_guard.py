@@ -231,20 +231,30 @@ def test_apply_patch_no_path_infer_allows(tmp_path, monkeypatch):
     assert r is None
 
 
-# ── P2：move_file dst 覆盖 ──
+# ── M5：move_file 不被 test-first 拦截（纯重命名不应触发 test-first）──
 
-def test_move_file_dst_impl_blocks(tmp_path, monkeypatch):
-    """move_file 目的端是实现文件时应 block。"""
+def test_move_file_not_blocked(tmp_path, monkeypatch):
+    """M5 修复：move_file 已从 _PRETOOL_WRITE_TOOLS 移除，任何情况下都不拦截。
+    纯重命名（src 已有实现 → dst 改名）不是新建实现，不应触发 test-first。"""
     _setup_pre(tmp_path, monkeypatch)
+    # 目的端是实现文件，也不应被拦截
     r = agent._pretool_test_first_guard("move_file", {"src": "tmp_lexer.py", "dst": "lexer.py"})
-    assert r is not None
+    assert r is None
 
 
-def test_move_file_dst_test_allows(tmp_path, monkeypatch):
-    """move_file 目的端是测试文件应放行。"""
+def test_move_file_dst_test_also_allowed(tmp_path, monkeypatch):
+    """move_file 目的端是测试文件同样放行（前提已成立）。"""
     _setup_pre(tmp_path, monkeypatch)
     r = agent._pretool_test_first_guard("move_file", {"src": "tmp.py", "dst": "tests/test_lexer.py"})
     assert r is None
+
+
+def test_write_file_new_impl_still_blocked(tmp_path, monkeypatch):
+    """M5 不影响 write_file：新建实现文件仍被拦截。"""
+    _setup_pre(tmp_path, monkeypatch)
+    r = agent._pretool_test_first_guard("write_file", {"filename": "new_module.py"})
+    assert r is not None
+    assert "_pretool_block" in r
 
 
 # ── 豁免补全：conftest.py 和嵌套路径 ──

@@ -646,7 +646,6 @@ def test_p215_failed_write_increments_streak(tmp_path, monkeypatch):
         tools=[],
         compact_state=compact_state,
         soft_limit=5,
-        start_tokens=0,
         budget_state=budget_state,
         no_progress_state=no_progress_state,
     )

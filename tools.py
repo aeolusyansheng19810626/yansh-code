@@ -256,6 +256,7 @@ _DANGEROUS_PATTERNS = [
     # #39 新增 deny
     # 一致化：原 `\bpython\s+-c\b` 只拦 python -c 却放行 python3 -c（零安全收益、还把 sonnet 推向草稿脚本流）
     (r"\bpython[0-9.]*\s+-c\b",                                   "python -c (内联执行)"),
+    (r"\bbash\s+-c\b",                                            "bash -c (内联执行)"),  # M1: 与 sh -c 对称
     (r"\bfind\b.*-delete\b",                                      "find -delete"),
     (r"\bgit\s+clean\b.*-f\b",                                    "git clean -f"),
     (r"\brm\s+-r\b",                                              "rm -r"),
@@ -504,8 +505,10 @@ def delete_file(filename):
     except Exception as e:
         return _err("internal", str(e))
 
-def replace_in_file(filename, old_str, new_str):
-    """在workspace文件中精确替换字符串。old_str必须唯一匹配，否则返回错误"""
+def replace_in_file(filename, old_str, new_str, replace_all: bool = False):
+    """在workspace文件中精确替换字符串。
+    replace_all=False（默认）：old_str 必须唯一匹配，否则返回错误。
+    replace_all=True：全量替换所有匹配，并报告替换数量。"""
     resolved, err = _validate_path(filename)
     if err:
         return err
@@ -520,22 +523,25 @@ def replace_in_file(filename, old_str, new_str):
     count = content.count(old_str)
     if count == 0:
         return _err("not_found", f"在 {filename} 中未找到要替换的字符串")
-    if count > 1:
+    if count > 1 and not replace_all:
         return _err("invalid_args", (
             f"在 {filename} 中找到 {count} 处匹配，需唯一匹配。"
             "请在 old_str 中增加上下文行（前后多带几行代码）以确保唯一；"
-            "或改用 replace_symbol 按函数/类名整体替换。"
+            "或改用 replace_symbol 按函数/类名整体替换；"
+            "或传 replace_all=true 全量替换所有匹配。"
         ))
 
-    content = content.replace(old_str, new_str, 1)
+    new_content = content.replace(old_str, new_str) if replace_all else content.replace(old_str, new_str, 1)
     try:
-        resolved.write_text(content, encoding='utf-8')
+        resolved.write_text(new_content, encoding='utf-8')
         _invalidate_ast_cache(resolved)
+        replaced_count = count if replace_all else 1
         return {
-            "success": f"文件 {filename} 替换成功",
+            "success": f"文件 {filename} 替换成功（共替换 {replaced_count} 处）",
             "filename": filename,
             "old_str": old_str,
-            "new_str": new_str
+            "new_str": new_str,
+            "replaced_count": replaced_count,
         }
     except Exception as e:
         return _err("internal", str(e))
