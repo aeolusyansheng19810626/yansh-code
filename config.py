@@ -119,8 +119,10 @@ _DEFAULTS = {
     "fix_soft_limit": 12,                  # fix loop 单次 attempt 工具轮次上限（基线）
     "fix_mechanical_error_bonus": 12,      # 检测到机械错（同类 TypeError 缺参等）时再追加的轮次
     "test_gate_timeout_sec": 300,          # solo gate 外部测试超时（秒）；普通 execute_command 仍用 30s
-    # 实验1：solo 强制 agent 留下正规测试的策略。off=现状；role=强化提示词（概率）；gate=硬判定拦截（确定性）
+    # 实验1：solo 强制 agent 留下正规测试的策略。off=现状；role=强化提示词（概率）；gate=硬判定拦截（确定性）；pre=写实现前内建 PreToolUse 拦截（最前移，不依赖 agent 收尾）
     "solo_test_enforcement": os.getenv("SOLO_TEST_ENFORCEMENT", "off"),
+    # pre 模式：同一实现文件连续被拦截 N 次仍不补测试时放行兜底，防死循环烧轮次
+    "solo_pretool_max_block": int(os.getenv("SOLO_PRETOOL_MAX_BLOCK", "3")),
 }
 
 _effective_config: dict = dict(_DEFAULTS)

@@ -1685,6 +1685,94 @@ def _has_impl_files(modified) -> bool:
     return False
 
 
+# pre 模式：同一实现文件连续被拦截的次数（key=rel path）。
+# 注意：模块级全局，solo() 入口处重置（_pretool_block_counts.clear()），防跨 task 泄漏。
+_pretool_block_counts: dict[str, int] = {}
+
+# pre 模式支持的写文件类工具，及其主路径参数字段名
+_PRETOOL_WRITE_TOOLS: dict[str, str] = {
+    "write_file": "filename",
+    "append_to_file": "filename",
+    "replace_in_file": "filename",
+    "apply_patch": "file_path",   # 可能缺省，由 _pretool_resolve_path 从 patch_text 补解析
+    "replace_symbol": "file_path",
+    "move_file": "dst",           # dst 是写入目的端，src 只是读
+}
+# 豁免的包/脚手架文件（无需测试骨架）
+_PRETOOL_EXEMPT_NAMES = {"__init__.py", "setup.py", "conftest.py"}
+
+
+def _pretool_resolve_path(name: str, args: dict) -> str:
+    """从工具参数里取目标文件路径；apply_patch 缺 file_path 时从 patch_text 推断。"""
+    field = _PRETOOL_WRITE_TOOLS.get(name, "")
+    fname = args.get(field, "")
+    if fname:
+        return fname
+    if name == "apply_patch":
+        # 同 tools.py:apply_patch 的推断逻辑：取 "+++ b/<path>" 行
+        for line in (args.get("patch_text") or "").splitlines():
+            if line.startswith("+++ "):
+                path = line[4:].strip()
+                if path.startswith("b/"):
+                    path = path[2:]
+                return path
+    return ""
+
+
+def _pretool_test_first_guard(name: str, args: dict) -> "dict | None":
+    """PreToolUse 内建 test-first 拦截（enforcement==pre）。
+
+    agent 写实现文件前，若 ws 内不存在对应的测试骨架（test_<stem>.py 或 <stem>_test.py）
+    则 block 回灌，要求先建测试。连续同一文件达 solo_pretool_max_block 次后放行兜底。
+
+    返回 block result dict 或 None（放行）。独立于外部 hooks，不受 --json set_disabled 影响。
+    """
+    if (_cfg("solo_test_enforcement") or "off").lower() != "pre":
+        return None
+    if name not in _PRETOOL_WRITE_TOOLS:
+        return None
+
+    fname = _pretool_resolve_path(name, args)
+    if not fname:
+        return None
+    # 豁免：非 .py 文件、tests/ 下、测试文件本身、包/脚手架文件
+    if not fname.endswith(".py"):
+        return None
+    parts = Path(fname).parts
+    if "tests" in parts:
+        return None
+    bn = Path(fname).name
+    if (bn.startswith("test_") or bn.endswith("_test.py")
+            or bn.startswith("_test") or bn in _PRETOOL_EXEMPT_NAMES):
+        return None
+
+    ws = Path(_get_workspace())
+    stem = Path(fname).stem
+    # 测试骨架存在（ws 内任意层级）即放行
+    if any(ws.rglob(f"test_{stem}.py")) or any(ws.rglob(f"{stem}_test.py")):
+        return None
+
+    rel = Path(fname).as_posix()
+    max_block = int(_cfg("solo_pretool_max_block") or 3)
+    count = _pretool_block_counts.get(rel, 0)
+    if count >= max_block:
+        console.print(
+            f"[pretool] {rel} 连续 {count} 次未补测试，放行兜底",
+            style="yellow", highlight=False,
+        )
+        return None
+
+    _pretool_block_counts[rel] = count + 1
+    reason = (
+        f"test-first 拦截：你正要写实现 {rel}，"
+        f"但 ws 内没有对应测试骨架（test_{stem}.py 或 {stem}_test.py）。"
+        f"请先在 tests/ 建 test_{stem}.py（可先写占位/骨架用例）再写实现。"
+        f"（第 {count + 1}/{max_block} 次拦截，达到上限后自动放行。）"
+    )
+    console.print(f"[pretool] 拦截 {name}({rel})：缺测试骨架", style="yellow", highlight=False)
+    return {"error": reason, "_pretool_block": True}
+
+
 def _final_gate_verdict(ws_path, timeout_gate):
     """轮次耗尽兜底：烧光 soft_limit ≠ 失败，做一次最终裁定。
     跑一次测试，按与正常 gate pass 分支**完全相同**的语义判 gate_status，
@@ -1788,6 +1876,12 @@ def _dispatch_tool_call_with_hooks(tool_call, *, mode="auto", allow_hil=True,
     except json.JSONDecodeError as e:
         return {"name": name, "args": {}, "id": tool_call.id,
                 "result": {"error": f"Invalid JSON in arguments: {e}"}}
+
+    # 内建 test-first 拦截：独立于外部 hooks，不受 --json set_disabled 影响
+    if not _is_in_subagent():
+        _g = _pretool_test_first_guard(name, args_initial)
+        if _g is not None:
+            return {"name": name, "args": args_initial, "id": tool_call.id, "result": _g}
 
     # PreToolUse hook（子 agent 内 / 全局禁用时跳过）
     skip_hooks = _is_in_subagent() or _hooks_mod.is_disabled()
@@ -4276,8 +4370,10 @@ def _solo_drive(messages, tools, compact_state, *, soft_limit, start_tokens,
             # 端到端模式下，跑真实入口验证（execute_command）也是进展，不算空转——
             # R10 实测：写完全部模块后用 execute_command 连跑验证 12 轮被误熔断。
             # 真正的空转 = 纯 read/search/list/git 多轮无写无跑（R9 的探索死循环）。
+            # pretool block 不算空转：agent 在响应有意的 test-first 拦截（不是探索死循环）。
             productive = any(
-                (tc.function.name in _WRITE_TOOLS and _get_out_result(outs, tc).get("success"))
+                _get_out_result(outs, tc).get("_pretool_block")
+                or (tc.function.name in _WRITE_TOOLS and _get_out_result(outs, tc).get("success"))
                 or (tc.function.name == "execute_command"
                     and _get_out_result(outs, tc).get("returncode") not in (-1, None))
                 for tc in msg.tool_calls
@@ -4354,7 +4450,7 @@ def solo(requirement, model_override=None):
 
     # 实验1：enforcement==role 时追加「测试优先」强硬段（解法A，概率性约束）
     _enforce = (_cfg("solo_test_enforcement") or "off").lower()
-    _role = _SOLO_ROLE + (_SOLO_ROLE_TEST_FIRST if _enforce == "role" else "")
+    _role = _SOLO_ROLE + (_SOLO_ROLE_TEST_FIRST if _enforce in ("role", "pre") else "")
     sys_prompt = f"{_role}{_get_project_rules()}\n\n{symbols_brief}"
     sys_prompt = _append_active_prompts(sys_prompt)
 
@@ -4396,6 +4492,8 @@ def solo(requirement, model_override=None):
     start_tokens = get_session_total_tokens()
     budget_state = {"warned": False}
     no_progress_state = {"streak": 0, "total_rounds": 0}
+    # P3：重置 pretool block 计数，防同进程跨 task 泄漏
+    _pretool_block_counts.clear()
 
     signal = _solo_drive(messages, tools, compact_state, soft_limit=_SOLO_SOFT_LIMIT,
                          start_tokens=start_tokens, budget_state=budget_state,
