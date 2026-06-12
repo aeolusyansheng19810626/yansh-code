@@ -11,6 +11,7 @@
 - [安装](#安装)
 - [快速开始](#快速开始)
 - [运行模式](#运行模式)
+- [solo 模式](#solo-模式)
 - [配置](#配置)
 - [工具集概览](#工具集概览)
 - [子 agent 派发](#子-agent-派发)
@@ -42,9 +43,13 @@ yansh-code 是一个本地运行的命令行编程助手 CLI。用户输入自�
 - fix 循环进入前自动识别 baseline 失败（pre-existing），只对增量失败修复
 - 自动检测 ruff lint 错误并并入 fix 循环
 
-**4 种运行模式**
+**5 种运行模式**
 
-auto / code / plan / audit，可在命令行或交互中动态切换（见[运行模式](#运行模式)）
+auto / code / plan / audit / solo，可在命令行或交互中动态切换（见[运行模式](#运行模式)）
+
+**solo 单一连续 context 模式**
+
+强耦合多文件任务专用：整个任务在单一连续 messages 中运行，agent 跨文件读写时保持完整上下文，无需静态接口契约；内置 gate 复核、测试骨架强制（enforcement）、环境感知卡（见 [solo 模式](#solo-模式)）
 
 **5 种 agent 角色**
 
@@ -144,7 +149,7 @@ yansh --mode plan "重构 agent.py 的错误处理"
 yansh --cwd /path/to/project --mode audit "审计 src/ 目录，找潜在安全问题"
 
 # 指定模型
-yansh --model claude-opus-4-7 "优化 llm_client.py 的重试逻辑"
+yansh --model claude-opus-4-8 "优化 llm_client.py 的重试逻辑"
 ```
 
 **3. 交互模式下的典型对话**
@@ -166,7 +171,7 @@ yansh --model claude-opus-4-7 "优化 llm_client.py 的重试逻辑"
 
 ## 运行模式
 
-通过 `--mode` 参数或交互内 `/mode <name>` 切换，四种模式互斥：
+通过 `--mode` 参数或交互内 `/mode <name>` 切换，五种模式互斥：
 
 | 模式 | 说明 | 适用场景 |
 |---|---|---|
@@ -174,8 +179,46 @@ yansh --model claude-opus-4-7 "优化 llm_client.py 的重试逻辑"
 | `code` | 跳过人工确认，直接执行 plan → code → test → fix | 批处理、CI、受信任任务 |
 | `plan` | 只生成计划，不写代码，不执行测试 | 快速预览 LLM 拆解思路 |
 | `audit` | 只读审计——不写文件、不执行命令，输出 markdown 报告 | 接手老项目、PR 前体检 |
+| `solo` | 单一连续 context agent，内置 gate 复核 + enforcement | 强耦合多文件新建任务 |
 
 audit 模式的工具白名单仅包含只读工具，分发层同时拒绝任何写/执行调用（双重防护）。
+
+---
+
+## solo 模式
+
+solo 是专为**强耦合多文件新建任务**设计的模式，与 auto/code 的逐文件 context 割裂方式根本不同：整个任务运行在单一连续 messages 中，agent 写完 A 模块后写 B 模块时可直接 read 自己刚写的真实代码，跨文件一致性天然成立。
+
+```bash
+yansh --mode solo --cwd /path/to/project "实现 miniQL 内存查询引擎，支持 SELECT/JOIN/GROUP BY"
+# 批处理
+yansh --mode solo --json "$(cat PROMPT.md)"
+```
+
+**内置机制**
+
+| 机制 | 说明 |
+|---|---|
+| gate 复核 | task_complete 后自动跑 pytest，失败则回灌继续修（最多 8 轮） |
+| 环境感知卡 | 首轮探测 shell/python/编码环境，写入 agent_state.md，后续跑零探路 |
+| compact 保底 | 超阈值自动压缩，pin 开场规划 + 环境契约，防多次 compact 后二次探路 |
+| 收尾机制 | 70% 轮次提醒收敛，100 轮最后通牒，轮次耗尽做最终裁定不硬判失败 |
+
+**测试骨架强制（enforcement）**
+
+通过环境变量或配置控制：
+
+```bash
+SOLO_TEST_ENFORCEMENT=pre yansh --mode solo --json "..."   # 写实现前必须先建测试骨架
+SOLO_TEST_ENFORCEMENT=gate yansh --mode solo --json "..."  # gate 层强制回灌要求补测试
+```
+
+| 值 | 行为 |
+|---|---|
+| `off` | 不干预（默认） |
+| `role` | system prompt 追加测试优先说明（概率性） |
+| `gate` | gate 层发现 collected-0 + 有实现改动 → 回灌要求补测试（确定性） |
+| `pre` | PreToolUse 内建拦截：写实现文件前若无测试骨架则 block（最前移，不依赖收尾） |
 
 ---
 
@@ -202,7 +245,7 @@ audit 模式的工具白名单仅包含只读工具，分发层同时拒绝任�
 | 键 | 默认值 | 说明 |
 |---|---|---|
 | `model` | `claude-sonnet-4-6` | 默认 LLM 模型 |
-| `mode` | `auto` | 默认运行模式 |
+| `mode` | `solo` | 默认运行模式 |
 | `max_attempts` | `3` | fix 循环最多重试次数 |
 | `test_command` | `null` | 覆盖自动检测的测试命令 |
 | `safe_mode` | `true` | 危险命令拦截开关 |
@@ -213,6 +256,9 @@ audit 模式的工具白名单仅包含只读工具，分发层同时拒绝任�
 | `coder_edits_per_round` | `3` | 每轮预估 edit 数（用于 expected_edits 动态调整轮次） |
 | `fix_soft_limit` | `12` | fix loop 单次 attempt 工具轮次上限 |
 | `fix_mechanical_error_bonus` | `12` | 检测到机械错误时追加的额外轮次 |
+| `test_gate_timeout_sec` | `300` | solo gate 外部测试超时（秒） |
+| `solo_test_enforcement` | `off` | 测试骨架强制策略：off / role / gate / pre |
+| `solo_pretool_max_block` | `3` | pre 模式：同一文件连续拦截 N 次后放行兜底 |
 
 ### 优先级
 
@@ -522,28 +568,23 @@ yansh-code/
 
 ## 开发状态
 
-当前代码状态（截至 2026-05-23）：
+当前代码状态（截至 2026-06-12）：
 
-- 22 个单元测试全绿，ubuntu + windows CI 通过
-- 全 ROADMAP P0-P4 已完成
-- 5 场 yansh vs Claude Code 子 agent AB 测试已完成
+- 单元测试 27+ 模块全绿，ubuntu + windows CI 通过
+- solo 模式端到端验证完成（minire / miniQL 系列，sonnet + opus 双模型）
 
-**已知 backlog（按优先级）**
+**已验证的能力边界**
 
-P1（每项预计 < 2h）：
-1. plan prompt 注入实际 `WORKSPACE_DIR`，解决 LLM 假设 `/workspace` docker-style 路径问题
-2. coder "用尽轮次"假警告——已 `task_complete` 时不报 warning
-3. Detector 扩展 `NameError` / `AttributeError` 模式识别
+| 场景 | sonnet | opus |
+|---|---|---|
+| 强耦合多文件新建（miniQL/minire 级别） | ✅ 可靠（enforcement 后 4/4 满分） | ✅ 自然满分 |
+| 单文件 bug 修复 / 新增功能 | ✅ 稳定 | ✅ |
+| 重构 / 全局重命名 / 深改签名 | ✅ 稳定 | ✅ |
+| 只读分析 | ⚠️ token 偏贵 | ⚠️ |
+| 已实现检测（trick 任务） | ❌ 会重复实现 | 未测 |
 
-P3（体验优化，半天能清）：
-4. read_cache 命中率度量（加一行 log）
+**模型选型建议**
 
-P2（需 1-2 天）：
-5. Coder 单文件循环历史压缩——当前每轮重发完整 messages，是 token 暴涨的主要原因；难点是 tool_use/tool_result 配对合法性
-
-**性能参考**
-
-与 Claude Code 子 agent 的 5 场对比结论（同等任务）：
-- token 消耗约为 CC 的 4-25×（主因：无 prompt cache + 每轮重发完整历史）
-- 写代码场景慢于 CC；纯探索任务和论证任务差距收窄
-- 跨文件密集重构（56 处调用）在 v4 修复后首次 pass（baseline 误识别问题已解决）
+- 强耦合任务要确定性结果 → **opus**（$36 一把过，无返工）
+- 强耦合任务要控成本 → **sonnet + enforcement=pre**（$7-12，pre 逼先建测试）
+- 简单单文件任务 → **sonnet**（code/auto 模式）
