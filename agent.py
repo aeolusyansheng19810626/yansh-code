@@ -1699,7 +1699,7 @@ _PRETOOL_WRITE_TOOLS: dict[str, str] = {
     "move_file": "dst",           # dst 是写入目的端，src 只是读
 }
 # 豁免的包/脚手架文件（无需测试骨架）
-_PRETOOL_EXEMPT_NAMES = {"__init__.py", "setup.py", "conftest.py"}
+_PRETOOL_EXEMPT_NAMES = {"__init__.py", "setup.py", "conftest.py", "__main__.py", "cli.py"}
 
 
 def _pretool_resolve_path(name: str, args: dict) -> str:

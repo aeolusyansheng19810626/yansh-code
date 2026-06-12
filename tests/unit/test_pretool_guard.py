@@ -256,6 +256,20 @@ def test_conftest_py_allows(tmp_path, monkeypatch):
     assert r is None
 
 
+def test_main_py_allows(tmp_path, monkeypatch):
+    """__main__.py 是 CLI 入口，由 test_smoke.py 覆盖，应豁免。"""
+    _setup_pre(tmp_path, monkeypatch)
+    r = agent._pretool_test_first_guard("write_file", {"filename": "pkg/__main__.py"})
+    assert r is None
+
+
+def test_cli_py_allows(tmp_path, monkeypatch):
+    """cli.py 是 CLI 入口，同理豁免。"""
+    _setup_pre(tmp_path, monkeypatch)
+    r = agent._pretool_test_first_guard("write_file", {"filename": "cli.py"})
+    assert r is None
+
+
 def test_nested_impl_file_blocks(tmp_path, monkeypatch):
     """src/pkg/lexer.py 这类嵌套路径的实现文件应 block。"""
     _setup_pre(tmp_path, monkeypatch)
