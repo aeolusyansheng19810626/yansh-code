@@ -2443,6 +2443,120 @@ def test_maybe_compact_thrashing_disables(monkeypatch):
     assert out is msgs
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# _scan_function_arity_mismatches 单测（Batch B）
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_scan_func_arity_cross_file_wrong_count(tmp_path):
+    """跨文件：def f(a, b) 被调用为 f(x) — 少一个参数，应报告。"""
+    import agent as _a
+    (tmp_path / "utils.py").write_text("def process(a, b):\n    return a + b\n")
+    (tmp_path / "caller.py").write_text(
+        "from .utils import process\n"
+        "result = process(1)\n"   # 少传 b
+    )
+    plan = {"files": [{"filename": "utils.py"}, {"filename": "caller.py"}]}
+    result = _a._scan_function_arity_mismatches(plan, str(tmp_path))
+    assert len(result) == 1
+    fname, lineno, expr, diag = result[0]
+    assert "caller.py" in fname
+    assert "process" in expr
+    assert "2" in diag   # 应提示需要 2 个参数
+
+
+def test_scan_func_arity_correct_count_no_report(tmp_path):
+    """调用参数数量与定义匹配 — 不报告。"""
+    import agent as _a
+    (tmp_path / "utils.py").write_text("def process(a, b):\n    return a + b\n")
+    (tmp_path / "caller.py").write_text(
+        "from .utils import process\n"
+        "result = process(1, 2)\n"   # 正确
+    )
+    plan = {"files": [{"filename": "utils.py"}, {"filename": "caller.py"}]}
+    result = _a._scan_function_arity_mismatches(plan, str(tmp_path))
+    assert result == []
+
+
+def test_scan_func_arity_variadic_skipped(tmp_path):
+    """含 *args 的变参函数 — 任何调用数都合法，不报告。"""
+    import agent as _a
+    (tmp_path / "utils.py").write_text("def log(msg, *args):\n    pass\n")
+    (tmp_path / "caller.py").write_text(
+        "from .utils import log\n"
+        "log('hello')\n"
+        "log('hello', 1, 2, 3)\n"
+    )
+    plan = {"files": [{"filename": "utils.py"}, {"filename": "caller.py"}]}
+    result = _a._scan_function_arity_mismatches(plan, str(tmp_path))
+    assert result == []
+
+
+def test_scan_func_arity_defaults_allow_fewer_args(tmp_path):
+    """含默认值的参数：def f(a, b=1) 调用 f(x) 满足 min=1 — 不报告。"""
+    import agent as _a
+    (tmp_path / "utils.py").write_text("def compute(a, b=1):\n    return a + b\n")
+    (tmp_path / "caller.py").write_text(
+        "from .utils import compute\n"
+        "compute(5)\n"    # min=1, max=2, 传 1 个 → OK
+    )
+    plan = {"files": [{"filename": "utils.py"}, {"filename": "caller.py"}]}
+    result = _a._scan_function_arity_mismatches(plan, str(tmp_path))
+    assert result == []
+
+
+def test_scan_func_arity_star_call_skipped(tmp_path):
+    """调用含 *args 展开 — 无法静态计数，跳过，不报告。"""
+    import agent as _a
+    (tmp_path / "utils.py").write_text("def process(a, b):\n    return a + b\n")
+    (tmp_path / "caller.py").write_text(
+        "from .utils import process\n"
+        "items = [1, 2]\n"
+        "process(*items)\n"  # *args 展开 → 跳过
+    )
+    plan = {"files": [{"filename": "utils.py"}, {"filename": "caller.py"}]}
+    result = _a._scan_function_arity_mismatches(plan, str(tmp_path))
+    assert result == []
+
+
+def test_scan_func_arity_parse_error_safe(tmp_path):
+    """目标文件语法错误 — 安全返回空列表，不抛异常。"""
+    import agent as _a
+    (tmp_path / "utils.py").write_text("def process(a, b\n")   # SyntaxError
+    (tmp_path / "caller.py").write_text(
+        "from .utils import process\n"
+        "process(1)\n"
+    )
+    plan = {"files": [{"filename": "utils.py"}, {"filename": "caller.py"}]}
+    result = _a._scan_function_arity_mismatches(plan, str(tmp_path))
+    assert result == []   # 解析失败应安全退出
+
+
+def test_scan_func_arity_kwonly_skipped(tmp_path):
+    """含 keyword-only 参数的函数跳过（避免 f(a, *, b) + f(1, b=2) 误报）。"""
+    import agent as _a
+    (tmp_path / "utils.py").write_text("def send(msg, *, timeout):\n    pass\n")
+    (tmp_path / "caller.py").write_text(
+        "from .utils import send\n"
+        "send('hello', timeout=5)\n"  # 正确调用
+    )
+    plan = {"files": [{"filename": "utils.py"}, {"filename": "caller.py"}]}
+    result = _a._scan_function_arity_mismatches(plan, str(tmp_path))
+    assert result == [], "kwonly 函数应跳过，不报误报"
+
+
+def test_scan_func_arity_kwargs_skipped(tmp_path):
+    """含 **kwargs 的函数跳过（避免 f(a, **kw) 调用被误报）。"""
+    import agent as _a
+    (tmp_path / "utils.py").write_text("def render(tmpl, **ctx):\n    pass\n")
+    (tmp_path / "caller.py").write_text(
+        "from .utils import render\n"
+        "render('t', x=1, y=2)\n"  # 正确调用
+    )
+    plan = {"files": [{"filename": "utils.py"}, {"filename": "caller.py"}]}
+    result = _a._scan_function_arity_mismatches(plan, str(tmp_path))
+    assert result == [], "**kwargs 函数应跳过，不报误报"
+
+
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, "-v"])

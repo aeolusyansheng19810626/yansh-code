@@ -3848,6 +3848,151 @@ def _render_contract(contract):
     return "\n".join(lines)
 
 
+def _scan_function_arity_mismatches(plan, workspace):
+    """扫描 plan 内跨文件函数调用的参数数量不对齐问题。
+
+    不依赖 symbol_contract，直接从源文件 AST 提取模块级函数签名，再扫描调用端。
+    只检查通过显式 `from .mod import func` 可追溯来源的跨文件调用，避免同名变量误报。
+
+    返回格式：[(caller_file, lineno, call_expr_str, diagnosis_str), ...]
+    解析失败安全返回空列表。
+    """
+    import ast as _ast_mod
+
+    plan_items = plan.get("files", []) if isinstance(plan, dict) else (plan or [])
+    plan_files = [
+        os.path.normpath(p.get("filename", ""))
+        for p in plan_items
+        if isinstance(p, dict) and p.get("filename", "").endswith(".py")
+    ]
+    plan_files_set = set(plan_files)
+
+    # ── 预先解析所有文件（各步共用，避免三遍重复 parse）──────────────────────
+    file_trees: dict = {}   # rel_path → ast.Module
+    for fname in plan_files:
+        fpath = os.path.join(workspace, fname)
+        if not os.path.exists(fpath):
+            continue
+        try:
+            with open(fpath, encoding="utf-8", errors="replace") as _fh:
+                file_trees[fname] = _ast_mod.parse(_fh.read())
+        except Exception:
+            pass   # 解析失败的文件直接跳过，三步均不使用
+
+    # ── Step A：提取各文件模块级函数签名 ──────────────────────────────────────
+    # {rel_path: {func_name: (min_pos, max_pos) or None}}
+    # None = 变参/keyword-only/posonly 情况，任何调用数无法可靠静态断言，跳过检查
+    def _get_func_arity(funcdef):
+        args = funcdef.args
+        # 含 *args / **kwargs / keyword-only 参数 → 无法可靠计数位置参数，保守跳过
+        if args.vararg or args.kwarg or args.kwonlyargs:
+            return None
+        # positional = posonly（/ 前）+ 普通位置参数；defaults 从右端覆盖两者
+        positional = list(getattr(args, "posonlyargs", [])) + list(args.args)
+        # 剥掉 self / cls（模块级函数偶有此命名，保守处理）
+        if positional and positional[0].arg in ("self", "cls"):
+            positional = positional[1:]
+        total = len(positional)
+        n_defaults = len(args.defaults)
+        min_pos = total - n_defaults
+        return (min_pos, total)
+
+    file_funcs: dict = {}   # rel_path → {func_name: (min, max) | None}
+    for fname, tree in file_trees.items():
+        funcs = {}
+        for node in tree.body:   # 只扫模块顶层
+            if isinstance(node, (_ast_mod.FunctionDef, _ast_mod.AsyncFunctionDef)):
+                funcs[node.name] = _get_func_arity(node)
+        if funcs:
+            file_funcs[fname] = funcs
+
+    if not file_funcs:
+        return []
+
+    # ── Step B：建立各文件的局部名 → 来源文件映射 ─────────────────────────────
+    # {caller_file: {local_name: (source_file, orig_func_name)}}
+    def _resolve_target(importer_fname, level, module):
+        if level == 0:
+            parts = (module or "").split(".")
+            candidates = [os.path.normpath(os.sep.join(parts) + ".py")]
+            if len(parts) > 1:
+                candidates.append(os.path.normpath(os.sep.join(parts[1:]) + ".py"))
+            for cand in candidates:
+                if cand in plan_files_set:
+                    return cand
+            return None
+        base_dir = os.path.dirname(importer_fname)
+        for _ in range(level - 1):
+            base_dir = os.path.dirname(base_dir) or ""
+        mod_path = (module or "").replace(".", os.sep) if module else ""
+        if not mod_path:
+            return None
+        return os.path.normpath(os.path.join(base_dir, mod_path) + ".py")
+
+    import_map: dict = {}   # caller_file → {local_name: (source_file, orig_name)}
+    for fname, tree in file_trees.items():
+        local: dict = {}
+        for node in _ast_mod.walk(tree):
+            if not (isinstance(node, _ast_mod.ImportFrom) and node.module is not None):
+                continue
+            target = _resolve_target(fname, node.level, node.module)
+            if target is None or target not in plan_files_set:
+                continue
+            if target not in file_funcs:
+                continue
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                orig = alias.name
+                local_name = alias.asname if alias.asname else orig
+                if orig in file_funcs.get(target, {}):
+                    local[local_name] = (target, orig)
+        if local:
+            import_map[fname] = local
+
+    if not import_map:
+        return []
+
+    # ── Step C：扫描调用点 ────────────────────────────────────────────────────
+    missing = []
+    for fname, tree in file_trees.items():
+        local = import_map.get(fname)
+        if not local:
+            continue
+        for node in _ast_mod.walk(tree):
+            if not isinstance(node, _ast_mod.Call):
+                continue
+            if not isinstance(node.func, _ast_mod.Name):
+                continue
+            fn_local = node.func.id
+            if fn_local not in local:
+                continue
+            source_file, orig_name = local[fn_local]
+            arity = file_funcs[source_file].get(orig_name)
+            if arity is None:   # 变参函数，跳过
+                continue
+            min_pos, max_pos = arity
+            # 调用含 *args 或 **kwargs → 无法静态计数，跳过
+            if any(isinstance(a, _ast_mod.Starred) for a in node.args):
+                continue
+            if any(k.arg is None for k in node.keywords):
+                continue
+            n_call = len(node.args) + len(node.keywords)
+            if n_call < min_pos or n_call > max_pos:
+                lineno = getattr(node.func, "lineno", 0)
+                sig_str = f"{orig_name}({', '.join(['...'] * max_pos)})"
+                if min_pos == max_pos:
+                    expected_str = f"{max_pos} 个"
+                else:
+                    expected_str = f"{min_pos}~{max_pos} 个"
+                diag = (
+                    f"[arity] 定义于 {source_file}，签名 `{sig_str}` 需要 {expected_str}参数，"
+                    f"此处传了 {n_call} 个 — 把所有调用点统一到定义签名，勿改定义迁就单点"
+                )
+                missing.append((fname, lineno, f"{fn_local}({n_call} args)", diag))
+    return missing
+
+
 def _scan_member_mismatches(plan, workspace, error_info=""):
     """扫描 plan 中各文件对枚举成员/dataclass 字段的引用，与 symbol_contract 对比，
     返回不匹配列表：[(file, lineno, access_expr, authority_name), ...]
@@ -4110,6 +4255,22 @@ def fix(test_result, plan, reason="test_failure", baseline_failures=None,
                 error_info += _ce_block
         except Exception as _ce_err:
             console.print(f"[debug] _scan_contract_export_mismatches 失败（不影响修复）：{_ce_err}", style="dim", highlight=False)
+
+        # 函数参数数量不对齐专项：AST 提取，不依赖契约
+        try:
+            _arity_issues = _scan_function_arity_mismatches(plan, _get_workspace())
+            if _arity_issues:
+                _arity_block = (
+                    "\n\n**[函数参数数量不对齐 — 以下调用端传参数与定义不符，本轮一次性全部修正]**\n"
+                    "⚠ 以函数**定义端**参数数量为准，把所有调用端改成匹配定义签名，"
+                    "勿改定义去迁就单个调用点（否则其他调用点又挂）：\n"
+                )
+                for _f, _ln, _expr, _diag in _arity_issues:
+                    _arity_block += f"  - {_f}:{_ln}  `{_expr}`  → {_diag}\n"
+                error_info += _arity_block
+        except Exception as _arity_err:
+            console.print(f"[debug] _scan_function_arity_mismatches 失败（不影响修复）：{_arity_err}",
+                          style="dim", highlight=False)
 
     if reason == "review_rejection":
         content = f"Code review failed. Fix the code item-by-item per the review comments below:\n\n{error_info}\n\nPlan: {json.dumps(plan)}"
