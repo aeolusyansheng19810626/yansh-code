@@ -361,3 +361,80 @@ def test_verdict_targeted_col0_same_full_cmd_no_command(monkeypatch):
     )
     status, _tr = agent._final_gate_verdict("/ws", 300)
     assert status == "no_command"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P0-1 修复：coverage_unknown + agent_completed → final_success
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_coverage_unknown_with_agent_completed_gives_success(tmp_path, monkeypatch):
+    """coverage_unknown（全量绿）+ agent 宣告成功 → final_success=True。"""
+    _setup_solo_env(tmp_path, monkeypatch)
+    # 空 scope → targeted_cmd=None → coverage="full" → gate_status=coverage_unknown
+    monkeypatch.setattr(agent, "_infer_test_scope", lambda *a, **k: [])
+    monkeypatch.setattr(agent, "_detect_python_test_cmd",
+                        lambda ws, scope=None: "pytest -q")
+    monkeypatch.setattr(agent, "test", lambda cmd, timeout_sec=None: _ok("5 passed"))
+    monkeypatch.setattr(agent, "_dispatch_tool_calls", _stub_dispatch_with_task_complete)
+    monkeypatch.setattr(agent, "call_llm",
+                        lambda msgs, **kw: _make_response(
+                            "done", [("c1", "task_complete", {"success": True, "summary": "ok"})]))
+
+    res = agent.solo("任务")
+    assert res["task_complete_signal"]["gate_status"] == "coverage_unknown", (
+        f"期望 coverage_unknown，实际 {res['task_complete_signal']['gate_status']}"
+    )
+    assert res["success"] is True, "coverage_unknown + agent 成功 → 应判 success=True"
+
+
+def test_coverage_unknown_without_agent_completed_still_fails(tmp_path, monkeypatch):
+    """coverage_unknown + agent 宣告失败(success=False) → final_success=False。"""
+    _setup_solo_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(agent, "_infer_test_scope", lambda *a, **k: [])
+    monkeypatch.setattr(agent, "_detect_python_test_cmd",
+                        lambda ws, scope=None: "pytest -q")
+    monkeypatch.setattr(agent, "test", lambda cmd, timeout_sec=None: _ok("5 passed"))
+    monkeypatch.setattr(agent, "_dispatch_tool_calls", _stub_dispatch_with_task_complete)
+    # agent 调 task_complete(success=False) → agent_completed=False
+    monkeypatch.setattr(agent, "call_llm",
+                        lambda msgs, **kw: _make_response(
+                            "done", [("c1", "task_complete", {"success": False, "summary": "fail"})]))
+
+    res = agent.solo("任务")
+    assert res["task_complete_signal"]["gate_status"] == "coverage_unknown"
+    assert res["success"] is False, "coverage_unknown + agent 失败 → 应判 success=False"
+
+
+def test_coverage_unknown_via_final_gate_verdict_path(tmp_path, monkeypatch):
+    """M2 补充：gate 轮耗尽 → _final_gate_verdict 返回 coverage_unknown + agent 成功 → success=True。"""
+    _setup_solo_env(tmp_path, monkeypatch)
+    # SOLO_GATE_MAX_ROUNDS=0 → for 循环体不执行，直接走 else/_final_gate_verdict
+    monkeypatch.setattr(agent, "_SOLO_GATE_MAX_ROUNDS", 0, raising=False)
+    monkeypatch.setattr(agent, "_final_gate_verdict",
+                        lambda ws, timeout: ("coverage_unknown", _ok("3 passed")))
+    monkeypatch.setattr(agent, "_dispatch_tool_calls", _stub_dispatch_with_task_complete)
+    monkeypatch.setattr(agent, "call_llm",
+                        lambda msgs, **kw: _make_response(
+                            "done", [("c1", "task_complete", {"success": True, "summary": "ok"})]))
+
+    res = agent.solo("任务")
+    assert res["task_complete_signal"]["gate_status"] == "coverage_unknown"
+    assert res["success"] is True, "_final_gate_verdict 返回 coverage_unknown + agent 成功 → success=True"
+
+
+def test_full_test_fails_gives_failed_not_coverage_unknown(tmp_path, monkeypatch):
+    """M3 防回归：全量测试失败时 gate_status 应为 failed，不能被误判为 coverage_unknown。"""
+    _setup_solo_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(agent, "_infer_test_scope", lambda *a, **k: [])
+    monkeypatch.setattr(agent, "_detect_python_test_cmd",
+                        lambda ws, scope=None: "pytest -q")
+    monkeypatch.setattr(agent, "test", lambda cmd, timeout_sec=None: _red("1 failed"))
+    monkeypatch.setattr(agent, "_dispatch_tool_calls", _stub_dispatch_with_task_complete)
+    monkeypatch.setattr(agent, "call_llm",
+                        lambda msgs, **kw: _make_response(
+                            "done", [("c1", "task_complete", {"success": True, "summary": "ok"})]))
+
+    res = agent.solo("任务")
+    # 测试失败 → 不能是 coverage_unknown（coverage_unknown 要求测试通过）
+    assert res["task_complete_signal"]["gate_status"] != "coverage_unknown"
+    assert res["success"] is False, "测试失败时 success 必须为 False，不受 coverage_unknown 放宽影响"

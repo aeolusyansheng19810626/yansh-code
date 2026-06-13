@@ -2433,6 +2433,16 @@ Task pattern recognition (identify which category before acting, follow the matc
    - ❌ 真实翻车：prompt 写"在 calc.py 新增 sub(a,b)，不要新建测试文件"，coder 仍建了 `tests/test_calc.py` → 违反否定约束，且自建测试失败会拖累整体 success 判定。
    - task_complete 的 summary 里复述你遵守了哪些否定约束。
 
+15. **写测试文件前必须先 read 被测模块，验证真实 API**
+   - 在 write_file / replace_in_file 任何 `test_*.py` 或 `*_test.py` **之前**，
+     先对被测模块调用一次 read_file（或 get_symbol_definition），确认你要测试的
+     函数名、类名、方法签名在实现中真实存在，而不是凭 plan 里的假设名。
+   - ❌ 真实翻车：plan 写"用 Agent 类"，coder 未 read 实现，直接写 `from pkg import Agent`，
+     实际入口是模块级函数 `run()`，测试全部 ImportError/AttributeError 失败。
+   - ✅ 正确：写测试前 read 被测文件 → 看到入口是 `def run(...)` → 测试写 `from pkg import run`。
+   - 对每一个被测模块只需 read 一次，不要反复读。
+   - 例外：若被测符号**尚不存在**但 plan 明确要求新建（TDD 红色起点），按 plan 写测试，不因 read 不到就改测试的符号名。
+
 Test file rule: a test file (test_*.py / *_test.py) located in a subdirectory (e.g. tests/) must include these two lines at the very top to import parent modules:
 import sys
 import os
@@ -2488,7 +2498,17 @@ Investigation order:
 2. **Read the test code first**: find the failing assert and understand what it expected
 3. **Then read the code under test**: locate where actual behavior deviates from expectation
 4. **Don't change production code first**: confirm whether it's a product bug or a test bug — the test expectation itself might be wrong
-5. When reporting, cite file:line; don't speculate "it must be X that's wrong"
+5. **AttributeError / ImportError 时，优先检查测试 API 假设是否正确**
+   - 失败信息含 `AttributeError: type object 'X' has no attribute 'Y'` 或
+     `ImportError: cannot import name 'Y' from 'X'` 时：
+     先 search_in_files("Y") / get_symbol_definition("Y") 确认 Y 在实现里存在不存在。
+   - **Y 不存在 + 测试调用 Y**：测试在凭空假设一个 API，应**修测试**（改成实现里真实存在的符号），
+     而不是给实现加 alias 来迁就测试。
+   - **Y 不存在 + plan 明确要求新建 Y**：实现未完成，应**修实现**。
+   - ❌ 真实翻车：测试写 `obj.run_agent()` 但实现是 `obj.run()`，fixer 加 `run_agent = run` alias
+     → 把测试 API 错误藏进了实现，下次重构埋雷。
+   - ✅ 正确：确认实现只有 `run()`，把测试改成 `obj.run()`。
+6. When reporting, cite file:line; don't speculate "it must be X that's wrong"
 Error-info usage rules:
 - The `error_kind` field is only an error **classification tag** (so you can decide retry vs give up),
   **not a reason to change a test expectation** — when a pre-existing test expected "超时" but the tool returned security,
@@ -4759,8 +4779,13 @@ def solo(requirement, model_override=None):
             agent_completed = True
             console.print("[solo gate] 兜底通过且此前曾宣告完成，认可 agent_completed", style="green", highlight=False)
 
-    # P0-1：最终成功 = agent 自述成功 AND 针对性测试绿；其余一律 False
-    final_success = agent_completed and (gate_status == "passed")
+    # P0-1：最终成功 = agent 自述成功 AND 测试绿
+    # coverage_unknown（全量绿但 scope 不确定）与 passed 同等接受——coverage_unknown 只在
+    # judge(test_result)=True 时赋值，测试必然通过；MCP 任务改实现/预存测试场景必然落此分支。
+    final_success = agent_completed and gate_status in ("passed", "coverage_unknown")
+    if final_success and gate_status == "coverage_unknown":
+        console.print("[solo gate] coverage_unknown + agent 宣告成功，接受（全量测试通过）",
+                      style="green", highlight=False)
     return {
         "success": final_success,
         "test_result": test_result,
