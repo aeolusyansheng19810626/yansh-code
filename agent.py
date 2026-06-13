@@ -108,6 +108,7 @@ from subagent import (
     _SUBAGENT_CONCURRENCY_CAP,
     _is_in_subagent,
     _set_in_subagent,
+    is_mcp_write as _is_mcp_write,
 )
 
 # 对话历史管理
@@ -2168,6 +2169,13 @@ def _dispatch_tool_call_inner(tool_call, args, *, mode="auto", allow_hil=True,
             result = _mcp_mod.call_tool(name, args)
         except Exception as e:
             result = _tools_mod._err("internal", f"MCP 工具调用异常: {e}", name)
+        # 修复：MCP 写工具成功后登记改动文件，喂给 snapshot_files_modified()
+        # 下游（scope 推断/计划落地比对/churn 检测/linter）才能感知 MCP 写的文件
+        if _is_mcp_write(name, result):
+            for _key in ("path", "destination", "source"):
+                _fn = args.get(_key)
+                if _fn:
+                    _task_log_mod.record_file_modified(_fn)
         return {"name": name, "args": args, "id": tool_call.id, "result": result}
 
     return {"name": name, "args": args, "id": tool_call.id,
@@ -4281,7 +4289,7 @@ def _solo_drive(messages, tools, compact_state, *, soft_limit,
     """solo 主驱动循环。原地 append messages；budget_state / no_progress_state 跨 gate 回灌持续累积。
     返回 {"early_exit", "success", "summary", "rounds_used"}.
     """
-    from subagent import _WRITE_TOOLS
+    from subagent import _WRITE_TOOLS, is_mcp_write
     rounds_used = 0
     silent_prompted = False  # 沉默退出兜底：本次 drive 内只追问一次
 
@@ -4375,6 +4383,7 @@ def _solo_drive(messages, tools, compact_state, *, soft_limit,
             productive = any(
                 _get_out_result(outs, tc).get("_pretool_block")
                 or (tc.function.name in _WRITE_TOOLS and _get_out_result(outs, tc).get("success"))
+                or is_mcp_write(tc.function.name, _get_out_result(outs, tc))
                 or (tc.function.name == "execute_command"
                     and _get_out_result(outs, tc).get("returncode") not in (-1, None))
                 for tc in msg.tool_calls

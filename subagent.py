@@ -152,6 +152,27 @@ _WRITE_TOOLS = {
     "move_file",
 }
 
+# MCP 写工具名语义词——MCP result 只有 {content,isError}，无 success 字段，
+# 且工具名不在 _WRITE_TOOLS，必须按名称模式识别写语义。
+_MCP_WRITE_HINTS: tuple = ("write", "edit", "create", "move", "delete",
+                           "patch", "append", "insert", "mkdir", "rename")
+
+
+def is_mcp_write(name: str, result: dict | None) -> bool:
+    """工具名是 mcp__ 写工具且本次调用成功（有结果、无 error、isError 为假）。
+
+    只对 tool 段（最后一个 __ 之后的部分）做 hint 匹配，
+    避免 server 名含写语义词时误判只读工具（如 mcp__editor__read_file）。
+    """
+    if not name.startswith("mcp__"):
+        return False
+    if not result:   # None 或空 dict → 无成功证据
+        return False
+    if result.get("error") or result.get("isError"):
+        return False
+    tool_seg = name.split("__", 2)[-1].lower()   # 取 mcp__<server>__<tool> 的 tool 段
+    return any(h in tool_seg for h in _MCP_WRITE_HINTS)
+
 
 # P2.2：按 role 切便宜模型
 # explorer/auditor 跑只读探索，sonnet 4.6 是浪费 → haiku 4.5（价格 ~1/3）
@@ -265,6 +286,13 @@ def _run_subagent(task: str, role: str = "explorer", max_steps: int = 8,
                         # 真写成功才记
                         a = out.get("args") or {}
                         fn = a.get("filename") or a.get("file_path") or a.get("dst") or ""
+                        if fn and fn not in files_modified_locally:
+                            files_modified_locally.append(fn)
+                    elif is_mcp_write(out["name"], out.get("result")):
+                        # MCP 写工具成功——文件名参数通常是 "path"；move_file 用 "destination"
+                        a = out.get("args") or {}
+                        fn = (a.get("path") or a.get("destination") or a.get("file_path")
+                              or a.get("filename") or a.get("dst") or "")
                         if fn and fn not in files_modified_locally:
                             files_modified_locally.append(fn)
                 if done:

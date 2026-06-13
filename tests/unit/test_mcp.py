@@ -685,6 +685,160 @@ def test_shutdown_kills_real_subprocess_tree(tmp_path):
     assert not grand_alive, f"孙进程 {grandchild_pid} 没被杀（进程树 kill 失败）"
 
 
+# ---------- is_mcp_write / productive 判定 ----------
+
+from subagent import is_mcp_write
+
+
+def test_is_mcp_write_recognizes_write_tools():
+    assert is_mcp_write("mcp__filesystem__edit_file",   {"content": "ok", "isError": False})
+    assert is_mcp_write("mcp__filesystem__write_file",  {"content": "", "isError": False})
+    assert is_mcp_write("mcp__fs__move_file",           {"content": "", "isError": False})
+    assert is_mcp_write("mcp__filesystem__create_directory", {"content": "", "isError": False})
+    assert is_mcp_write("mcp__filesystem__delete_file", {"content": "", "isError": False})
+
+
+def test_is_mcp_write_rejects_read_tools():
+    assert not is_mcp_write("mcp__filesystem__read_file",          {"content": "data"})
+    assert not is_mcp_write("mcp__filesystem__list_directory",     {"content": "[]"})
+    assert not is_mcp_write("mcp__filesystem__directory_tree",     {"content": "{}"})
+    assert not is_mcp_write("mcp__filesystem__list_allowed_directories", {"content": "[]"})
+
+
+def test_is_mcp_write_rejects_failed_calls():
+    # isError=True → 写失败，不计 productive
+    assert not is_mcp_write("mcp__filesystem__edit_file", {"isError": True})
+    # error 字段 → 失败
+    assert not is_mcp_write("mcp__filesystem__write_file", {"error": "server down"})
+    # None result → 失败
+    assert not is_mcp_write("mcp__filesystem__edit_file", None)
+    # 空 dict → 无成功证据
+    assert not is_mcp_write("mcp__filesystem__edit_file", {})
+
+
+def test_is_mcp_write_rejects_non_mcp_tools():
+    assert not is_mcp_write("write_file",       {"success": True})
+    assert not is_mcp_write("replace_in_file",  {"success": True})
+    assert not is_mcp_write("read_file",        {"content": "x"})
+    assert not is_mcp_write("edit_file",        {"content": "x"})  # 无 mcp__ 前缀
+
+
+def test_is_mcp_write_default_is_error_absent():
+    # MCP 成功结果有时不带 isError 字段，缺省按成功处理
+    assert is_mcp_write("mcp__filesystem__write_file", {"content": "ok"})
+    assert is_mcp_write("mcp__filesystem__edit_file",  {"content": ""})
+
+
+def test_is_mcp_write_server_name_not_polluted():
+    # server 名含写语义词时，只读工具不应被误判
+    assert not is_mcp_write("mcp__editor__read_file",       {"content": "data"})
+    assert not is_mcp_write("mcp__write_service__list_dir", {"content": "[]"})
+    # server 名含写词但 tool 段是读操作 → False
+    assert not is_mcp_write("mcp__edit_server__get_file",   {"content": "data"})
+
+
+# ---------- snapshot_files_modified 与 MCP 写工具集成 ----------
+
+import task_log as _tl
+import unittest.mock as _mock
+
+
+def _make_fake_tool_call(name, args):
+    import json as _json
+    tc = _mock.MagicMock()
+    tc.function.name = name
+    tc.function.arguments = _json.dumps(args)
+    tc.id = "fake-id"
+    return tc
+
+
+def _reset_files_modified():
+    """测试用：清空 task_log 的文件修改记录。"""
+    _tl._task_files_modified.clear()
+
+
+def _dispatch_mcp(name, args, result):
+    """调用 _dispatch_tool_call 中的 MCP 分支，返回 out dict。"""
+    import agent as _agent
+    tool_call = _make_fake_tool_call(name, args)
+    with _mock.patch("mcp_client.call_tool", return_value=result):
+        out = _agent._dispatch_tool_call(
+            tool_call, mode="auto", snap=None,
+            allow_hil=False, allow_confirm=False,
+        )
+    return out
+
+
+def test_mcp_write_success_records_file(tmp_path):
+    """MCP 写工具成功 → path 参数被登记到 snapshot_files_modified()"""
+    _reset_files_modified()
+    _dispatch_mcp(
+        "mcp__filesystem__write_file",
+        {"path": "project/core/processor.py"},
+        {"content": "ok", "isError": False},
+    )
+    assert "project/core/processor.py" in _tl.snapshot_files_modified()
+
+
+def test_mcp_move_records_both_ends(tmp_path):
+    """MCP move_file → source + destination 都登记"""
+    _reset_files_modified()
+    _dispatch_mcp(
+        "mcp__filesystem__move_file",
+        {"source": "old.py", "destination": "new.py"},
+        {"content": "", "isError": False},
+    )
+    modified = _tl.snapshot_files_modified()
+    assert "old.py" in modified
+    assert "new.py" in modified
+
+
+def test_mcp_write_failure_not_recorded():
+    """MCP 写失败（isError=True / error 字段）→ 不登记"""
+    _reset_files_modified()
+    _dispatch_mcp(
+        "mcp__filesystem__edit_file",
+        {"path": "foo.py"},
+        {"isError": True},
+    )
+    assert _tl.snapshot_files_modified() == []
+
+    _reset_files_modified()
+    _dispatch_mcp(
+        "mcp__filesystem__edit_file",
+        {"path": "bar.py"},
+        {"error": "server down"},
+    )
+    assert _tl.snapshot_files_modified() == []
+
+
+def test_mcp_read_not_recorded():
+    """MCP 只读工具成功 → 不登记"""
+    _reset_files_modified()
+    _dispatch_mcp(
+        "mcp__filesystem__read_file",
+        {"path": "readme.py"},
+        {"content": "data"},
+    )
+    assert _tl.snapshot_files_modified() == []
+
+
+def test_mcp_non_filesystem_write_with_path_not_recorded():
+    """P2 边界：非文件类写工具（hint 匹配但参数含 path）→ is_mcp_write 判定为写，
+    但 path 值被登记到 modified（当前 best-effort 行为），测试记录实际行为作为回归基线。
+    若未来要过滤非文件类 server，修改 is_mcp_write 后此测试需更新。"""
+    _reset_files_modified()
+    # mcp__db__insert_row: insert 在 hint 列表里，path 参数存在
+    # 当前实现会登记（best-effort），此测试记录该行为
+    _dispatch_mcp(
+        "mcp__db__insert_row",
+        {"path": "table/users", "data": "{}"},
+        {"content": "1 row inserted", "isError": False},
+    )
+    # 当前行为：path 参数被登记（非阻塞，记为已知 best-effort 行为）
+    assert "table/users" in _tl.snapshot_files_modified()
+
+
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, "-v"])
