@@ -1886,6 +1886,7 @@ def _dispatch_tool_call_with_hooks(tool_call, *, mode="auto", allow_hil=True,
 
     # PreToolUse hook（子 agent 内 / 全局禁用时跳过）
     skip_hooks = _is_in_subagent() or _hooks_mod.is_disabled()
+    _hook_sys_msgs: list = []   # 累积 Pre/Post 的 system_messages，函数尾挂到 out 顶层
     if not skip_hooks:
         try:
             ws = _get_workspace()
@@ -1910,6 +1911,7 @@ def _dispatch_tool_call_with_hooks(tool_call, *, mode="auto", allow_hil=True,
                 # hook 错误打印一次（不阻断）
                 for err in hr.get("errors", []):
                     console.print(f"[hook] {err}", style="yellow", highlight=False)
+                _hook_sys_msgs.extend(hr.get("system_messages", []))
         except Exception as e:
             console.print(f"[hook] PreToolUse 异常忽略：{e}", style="yellow", highlight=False)
 
@@ -1937,9 +1939,12 @@ def _dispatch_tool_call_with_hooks(tool_call, *, mode="auto", allow_hil=True,
                     console.print(f"[hook] PostToolUse 修改 {out['name']} 输出", highlight=False)
                 for err in hr.get("errors", []):
                     console.print(f"[hook] {err}", style="yellow", highlight=False)
+                _hook_sys_msgs.extend(hr.get("system_messages", []))
         except Exception as e:
             console.print(f"[hook] PostToolUse 异常忽略：{e}", style="yellow", highlight=False)
 
+    if _hook_sys_msgs:
+        out["_hook_system_messages"] = _hook_sys_msgs
     return out
 
 
@@ -2264,6 +2269,18 @@ def _dispatch_tool_calls(tool_calls, *, mode, allow_hil, allow_confirm, snap, me
     # 按原顺序拼回 messages（OpenAI 协议要求 tool_call_id 与顺序一致）
     for out in outs:
         _record_dispatch(out, messages)
+
+    # hook system_message 必须在所有 tool result 之后统一追加，
+    # 不能插在 tool result 之间（否则破坏 assistant.tool_calls 与 tool result 的连续配对）
+    _hook_msgs: list = []
+    for out in outs:
+        if isinstance(out, dict):
+            _hook_msgs.extend(out.get("_hook_system_messages", []))
+    if _hook_msgs:
+        messages.append({
+            "role": "system",
+            "content": "\n".join(f"[hook 注入] {m}" for m in _hook_msgs),
+        })
 
     return outs
 
